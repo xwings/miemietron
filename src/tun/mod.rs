@@ -228,7 +228,7 @@ fn recvmsg_orig_dst(
     msg.msg_iov = &mut iov;
     msg.msg_iovlen = 1;
     msg.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
-    msg.msg_controllen = cmsg_buf.len();
+    msg.msg_controllen = cmsg_buf.len() as _;
 
     let n = unsafe { libc::recvmsg(fd, &mut msg, 0) };
     if n < 0 {
