@@ -12,17 +12,7 @@ Pushing a `v*` tag triggers `.github/workflows/release.yml` which automatically:
    - `miemietron-v{VERSION}-aarch64-unknown-linux-musl`
    - `miemietron-v{VERSION}-armv7-unknown-linux-musleabihf`
 
-## First Release
-
-```bash
-git add -A
-git commit -m "v0.1.0: initial release"
-git tag v0.1.0
-git push origin main
-git push origin v0.1.0
-```
-
-## Subsequent Releases
+## Release
 
 ```bash
 # 1. Bump version in Cargo.toml
