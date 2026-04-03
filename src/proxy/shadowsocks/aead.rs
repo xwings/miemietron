@@ -69,7 +69,7 @@ impl AeadCipher {
 /// key = d[0] || d[1] || ... truncated to key_len
 pub fn evp_bytes_to_key(password: &[u8], key_len: usize) -> Vec<u8> {
     const MD5_LEN: usize = 16;
-    let count = (key_len + MD5_LEN - 1) / MD5_LEN;
+    let count = key_len.div_ceil(MD5_LEN);
     let mut result = Vec::with_capacity(count * MD5_LEN);
     let mut prev = Vec::new();
 
@@ -166,24 +166,21 @@ impl CipherCore {
         match self.cipher {
             AeadCipher::Aes128Gcm => {
                 let cipher = Aes128Gcm::new(GenericArray::from_slice(&self.key));
-                cipher.encrypt_in_place(nonce_ga, b"", data).map_err(|e| {
-                    io::Error::new(io::ErrorKind::Other, format!("aes-128-gcm encrypt: {}", e))
-                })
+                cipher
+                    .encrypt_in_place(nonce_ga, b"", data)
+                    .map_err(|e| io::Error::other(format!("aes-128-gcm encrypt: {}", e)))
             }
             AeadCipher::Aes256Gcm => {
                 let cipher = Aes256Gcm::new(GenericArray::from_slice(&self.key));
-                cipher.encrypt_in_place(nonce_ga, b"", data).map_err(|e| {
-                    io::Error::new(io::ErrorKind::Other, format!("aes-256-gcm encrypt: {}", e))
-                })
+                cipher
+                    .encrypt_in_place(nonce_ga, b"", data)
+                    .map_err(|e| io::Error::other(format!("aes-256-gcm encrypt: {}", e)))
             }
             AeadCipher::ChaCha20Poly1305 => {
                 let cipher = ChaCha20Poly1305::new(GenericArray::from_slice(&self.key));
-                cipher.encrypt_in_place(nonce_ga, b"", data).map_err(|e| {
-                    io::Error::new(
-                        io::ErrorKind::Other,
-                        format!("chacha20-poly1305 encrypt: {}", e),
-                    )
-                })
+                cipher
+                    .encrypt_in_place(nonce_ga, b"", data)
+                    .map_err(|e| io::Error::other(format!("chacha20-poly1305 encrypt: {}", e)))
             }
         }
     }
@@ -591,9 +588,10 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncRead for SsStream<T> {
                     }
 
                     // Decrypt the length field
-                    let dec = me.dec_cipher.as_ref().ok_or_else(|| {
-                        io::Error::new(io::ErrorKind::Other, "decryption cipher not initialized")
-                    })?;
+                    let dec = me
+                        .dec_cipher
+                        .as_ref()
+                        .ok_or_else(|| io::Error::other("decryption cipher not initialized"))?;
                     dec.decrypt_in_place(me.dec_nonce.current(), len_buf)?;
                     me.dec_nonce.increment();
 
@@ -642,9 +640,10 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncRead for SsStream<T> {
                     }
 
                     // Decrypt payload
-                    let dec = me.dec_cipher.as_ref().ok_or_else(|| {
-                        io::Error::new(io::ErrorKind::Other, "decryption cipher not initialized")
-                    })?;
+                    let dec = me
+                        .dec_cipher
+                        .as_ref()
+                        .ok_or_else(|| io::Error::other("decryption cipher not initialized"))?;
                     dec.decrypt_in_place(me.dec_nonce.current(), payload_buf)?;
                     me.dec_nonce.increment();
 
@@ -684,34 +683,30 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncWrite for SsStream<T> {
         let mut me = self.project();
 
         // First, flush any pending data
-        loop {
-            match me.write_state {
-                WriteState::Flushing {
-                    ref buf,
-                    ref mut pos,
-                } => {
-                    if *pos < buf.len() {
-                        match me.inner.as_mut().poll_write(cx, &buf[*pos..]) {
-                            Poll::Ready(Ok(n)) => {
-                                if n == 0 {
-                                    return Poll::Ready(Err(io::Error::new(
-                                        io::ErrorKind::WriteZero,
-                                        "write zero",
-                                    )));
-                                }
-                                *pos += n;
-                                if *pos < buf.len() {
-                                    continue;
-                                }
-                            }
-                            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                            Poll::Pending => return Poll::Pending,
+        while let WriteState::Flushing {
+            ref buf,
+            ref mut pos,
+        } = me.write_state
+        {
+            if *pos < buf.len() {
+                match me.inner.as_mut().poll_write(cx, &buf[*pos..]) {
+                    Poll::Ready(Ok(n)) => {
+                        if n == 0 {
+                            return Poll::Ready(Err(io::Error::new(
+                                io::ErrorKind::WriteZero,
+                                "write zero",
+                            )));
+                        }
+                        *pos += n;
+                        if *pos < buf.len() {
+                            continue;
                         }
                     }
-                    *me.write_state = WriteState::Ready;
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                    Poll::Pending => return Poll::Pending,
                 }
-                WriteState::Ready => break,
             }
+            *me.write_state = WriteState::Ready;
         }
 
         // Now encrypt the new data
@@ -719,9 +714,10 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncWrite for SsStream<T> {
             return Poll::Ready(Ok(0));
         }
 
-        let enc = me.enc_cipher.as_ref().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::Other, "encryption cipher not initialized")
-        })?;
+        let enc = me
+            .enc_cipher
+            .as_ref()
+            .ok_or_else(|| io::Error::other("encryption cipher not initialized"))?;
 
         // Take at most MAX_PAYLOAD_SIZE bytes
         let chunk_len = std::cmp::min(MAX_PAYLOAD_SIZE, data.len());

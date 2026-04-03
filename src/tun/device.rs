@@ -28,12 +28,7 @@ impl AsRawFd for RawFdWrapper {
 impl TunDevice {
     pub fn open(config: &TunConfig) -> Result<Self> {
         // Open /dev/net/tun
-        let fd = unsafe {
-            libc::open(
-                b"/dev/net/tun\0".as_ptr() as *const libc::c_char,
-                libc::O_RDWR | libc::O_NONBLOCK,
-            )
-        };
+        let fd = unsafe { libc::open(c"/dev/net/tun".as_ptr(), libc::O_RDWR | libc::O_NONBLOCK) };
         if fd < 0 {
             return Err(anyhow::anyhow!(
                 "failed to open /dev/net/tun: {}",

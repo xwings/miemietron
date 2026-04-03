@@ -4,22 +4,12 @@ use std::net::SocketAddr;
 use tokio::net::TcpStream;
 
 /// Connect options for outbound TCP connections.
+#[derive(Default)]
 pub struct ConnectOpts {
     pub interface: Option<String>,
     pub routing_mark: Option<u32>,
     pub tfo: bool,
     pub mptcp: bool,
-}
-
-impl Default for ConnectOpts {
-    fn default() -> Self {
-        Self {
-            interface: None,
-            routing_mark: None,
-            tfo: false,
-            mptcp: false,
-        }
-    }
 }
 
 /// Create a TCP connection with the given options.

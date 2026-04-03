@@ -227,9 +227,7 @@ where
                     }
                     Poll::Ready(Ok(()))
                 }
-                Poll::Ready(Some(Err(e))) => {
-                    Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, e)))
-                }
+                Poll::Ready(Some(Err(e))) => Poll::Ready(Err(io::Error::other(e))),
                 Poll::Ready(None) => {
                     // Underlying stream ended => EOF.
                     Poll::Ready(Ok(()))
@@ -261,7 +259,7 @@ where
         match Pin::new(&mut this.sink).poll_ready(cx) {
             Poll::Ready(Ok(())) => {}
             Poll::Ready(Err(e)) => {
-                return Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, e)));
+                return Poll::Ready(Err(io::Error::other(e)));
             }
             Poll::Pending => return Poll::Pending,
         }
@@ -269,7 +267,7 @@ where
         let msg = Message::Binary(Bytes::copy_from_slice(buf));
         match Pin::new(&mut this.sink).start_send(msg) {
             Ok(()) => Poll::Ready(Ok(buf.len())),
-            Err(e) => Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, e))),
+            Err(e) => Poll::Ready(Err(io::Error::other(e))),
         }
     }
 
@@ -277,7 +275,7 @@ where
         let this = self.get_mut();
         Pin::new(&mut this.sink)
             .poll_flush(cx)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+            .map_err(io::Error::other)
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -285,6 +283,6 @@ where
         this.write_closed = true;
         Pin::new(&mut this.sink)
             .poll_close(cx)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+            .map_err(io::Error::other)
     }
 }

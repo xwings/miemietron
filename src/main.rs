@@ -168,7 +168,7 @@ impl Engine {
 
     async fn run(self) -> Result<()> {
         let config = std::sync::Arc::new(self.config);
-        let home_dir = self.home_dir;
+        let _home_dir = self.home_dir;
 
         // Start DNS resolver
         let dns_resolver = std::sync::Arc::new(dns::DnsResolver::new(&config.dns).await?);

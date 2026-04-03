@@ -100,8 +100,7 @@ impl FakeIpPool {
             if f.starts_with("*.") {
                 let suffix = &f[1..]; // ".example.com"
                 domain.ends_with(suffix) || domain == &f[2..]
-            } else if f.starts_with('+') {
-                let suffix = &f[1..];
+            } else if let Some(suffix) = f.strip_prefix('+') {
                 domain.ends_with(suffix)
             } else {
                 domain == f

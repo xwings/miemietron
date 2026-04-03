@@ -21,7 +21,7 @@ pub fn get_interface_ip(iface: &str) -> Result<IpAddr> {
         if addr.interface_name == iface {
             if let Some(address) = addr.address {
                 if let Some(sockaddr) = address.as_sockaddr_in() {
-                    return Ok(IpAddr::V4(std::net::Ipv4Addr::from(sockaddr.ip())));
+                    return Ok(IpAddr::V4(sockaddr.ip()));
                 }
             }
         }
