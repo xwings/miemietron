@@ -1,6 +1,6 @@
 [package]
 name = "miemietron"
-version = "0.1.4"
+version = "0.1.6"
 edition = "2021"
 description = "High-performance proxy kernel for low-powered routers"
 license = "MIT"
