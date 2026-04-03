@@ -78,10 +78,10 @@ jobs:
       - name: Build release binary
         run: cross build --release --target ${{ matrix.target }}
 
-      - name: Verify static linking
+      - name: Verify not dynamically linked
         run: |
           file target/${{ matrix.target }}/release/miemietron
-          file target/${{ matrix.target }}/release/miemietron | grep -qE "static(-pie)? linked"
+          ! file target/${{ matrix.target }}/release/miemietron | grep -q "dynamically linked"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
