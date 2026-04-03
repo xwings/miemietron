@@ -1,5 +1,107 @@
-// Protocol sniffer - extract domain from TLS ClientHello SNI.
-// Phase 2+: TLS SNI sniffer, HTTP Host header sniffer.
+// Protocol sniffer - extract domain from TLS ClientHello SNI and HTTP Host header.
+
+/// Sniff the domain from a connection's initial bytes.
+///
+/// Tries TLS SNI first (if the data starts with 0x16), then HTTP Host header
+/// (if it looks like an HTTP request). Returns `None` if no domain can be
+/// extracted.
+pub fn sniff_domain(data: &[u8]) -> Option<String> {
+    if data.is_empty() {
+        return None;
+    }
+
+    // TLS handshake starts with 0x16
+    if data[0] == 0x16 {
+        return extract_tls_sni(data);
+    }
+
+    // Try HTTP Host header
+    extract_http_host(data)
+}
+
+/// Extract the Host header from an HTTP request.
+///
+/// Recognises requests starting with common HTTP methods:
+/// GET, POST, PUT, DELETE, HEAD, CONNECT, OPTIONS, PATCH, TRACE.
+pub fn extract_http_host(data: &[u8]) -> Option<String> {
+    // Quick check: is this an HTTP request?
+    let http_methods: &[&[u8]] = &[
+        b"GET ",
+        b"POST ",
+        b"PUT ",
+        b"DELETE ",
+        b"HEAD ",
+        b"CONNECT ",
+        b"OPTIONS ",
+        b"PATCH ",
+        b"TRACE ",
+    ];
+
+    let is_http = http_methods.iter().any(|m| data.starts_with(m));
+    if !is_http {
+        return None;
+    }
+
+    // Scan for "Host:" header (case-insensitive).
+    // HTTP headers are separated by \r\n. We search for \r\nHost: or
+    // check if it's the first header after the request line.
+    let text = match std::str::from_utf8(data) {
+        Ok(s) => s,
+        Err(_) => {
+            // Try partial — headers should be ASCII
+            let valid_len = data.iter().position(|&b| b > 0x7F).unwrap_or(data.len());
+            if valid_len == 0 {
+                return None;
+            }
+            std::str::from_utf8(&data[..valid_len]).ok()?
+        }
+    };
+
+    // Look for the Host header
+    for line in text.split("\r\n").skip(1) {
+        if line.is_empty() {
+            // End of headers
+            break;
+        }
+        if let Some(rest) = line
+            .strip_prefix("Host:")
+            .or_else(|| line.strip_prefix("host:"))
+        {
+            let host = rest.trim();
+            // Strip port suffix if present (e.g., "example.com:443")
+            let domain = if let Some(bracket_end) = host.find(']') {
+                // IPv6 literal like [::1]:80 — not a domain
+                let _ = bracket_end;
+                return None;
+            } else if let Some(colon) = host.rfind(':') {
+                &host[..colon]
+            } else {
+                host
+            };
+            if !domain.is_empty() {
+                return Some(domain.to_string());
+            }
+        }
+        // Also handle mixed case (e.g., "HOST:", "Host:")
+        let lower = line.to_ascii_lowercase();
+        if lower.starts_with("host:") && !line.starts_with("Host:") && !line.starts_with("host:") {
+            let rest = &line[5..];
+            let host = rest.trim();
+            let domain = if host.find(']').is_some() {
+                return None;
+            } else if let Some(colon) = host.rfind(':') {
+                &host[..colon]
+            } else {
+                host
+            };
+            if !domain.is_empty() {
+                return Some(domain.to_string());
+            }
+        }
+    }
+
+    None
+}
 
 /// Extract SNI from a TLS ClientHello message.
 pub fn extract_tls_sni(data: &[u8]) -> Option<String> {
@@ -206,5 +308,62 @@ mod tests {
     fn returns_none_for_short_data() {
         let data = &[0x16, 0x03];
         assert_eq!(extract_tls_sni(data), None);
+    }
+
+    // --- HTTP Host header extraction tests ---
+
+    #[test]
+    fn extract_http_host_get() {
+        let data = b"GET / HTTP/1.1\r\nHost: example.com\r\nAccept: */*\r\n\r\n";
+        assert_eq!(extract_http_host(data), Some("example.com".to_string()));
+    }
+
+    #[test]
+    fn extract_http_host_post() {
+        let data = b"POST /api HTTP/1.1\r\nHost: api.example.com\r\nContent-Length: 0\r\n\r\n";
+        assert_eq!(extract_http_host(data), Some("api.example.com".to_string()));
+    }
+
+    #[test]
+    fn extract_http_host_with_port() {
+        let data = b"GET / HTTP/1.1\r\nHost: example.com:8080\r\n\r\n";
+        assert_eq!(extract_http_host(data), Some("example.com".to_string()));
+    }
+
+    #[test]
+    fn extract_http_host_lowercase() {
+        let data = b"GET / HTTP/1.1\r\nhost: lowercase.com\r\n\r\n";
+        assert_eq!(extract_http_host(data), Some("lowercase.com".to_string()));
+    }
+
+    #[test]
+    fn extract_http_host_none_for_binary() {
+        let data = &[0x00, 0x01, 0x02, 0x03];
+        assert_eq!(extract_http_host(data), None);
+    }
+
+    #[test]
+    fn extract_http_host_connect() {
+        let data = b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n";
+        assert_eq!(extract_http_host(data), Some("example.com".to_string()));
+    }
+
+    // --- sniff_domain dispatch tests ---
+
+    #[test]
+    fn sniff_domain_tls() {
+        let packet = build_client_hello("tls.example.com");
+        assert_eq!(sniff_domain(&packet), Some("tls.example.com".to_string()));
+    }
+
+    #[test]
+    fn sniff_domain_http() {
+        let data = b"GET / HTTP/1.1\r\nHost: http.example.com\r\n\r\n";
+        assert_eq!(sniff_domain(data), Some("http.example.com".to_string()));
+    }
+
+    #[test]
+    fn sniff_domain_empty() {
+        assert_eq!(sniff_domain(&[]), None);
     }
 }

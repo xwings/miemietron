@@ -59,7 +59,7 @@ pub fn encode_address(addr: &Address) -> Vec<u8> {
     buf
 }
 
-/// Encode a VLESS request header.
+/// Encode a VLESS request header (without flow addon).
 ///
 /// Format:
 /// ```text
@@ -67,15 +67,53 @@ pub fn encode_address(addr: &Address) -> Vec<u8> {
 /// [command: 1]  [address: variable]
 /// ```
 pub fn encode_request(uuid: &[u8; 16], cmd: u8, addr: &Address) -> Vec<u8> {
+    encode_request_with_flow(uuid, cmd, addr, None)
+}
+
+/// Encode a VLESS request header with an optional flow addon.
+///
+/// When `flow` is `Some("xtls-rprx-vision")`, the addon is encoded as a
+/// minimal protobuf message:
+///
+/// ```text
+/// field 2 (string): tag = (2 << 3) | 2 = 0x12
+///   length: len(flow)
+///   value:  flow bytes
+/// ```
+///
+/// The addon length byte encodes the total size of the protobuf payload.
+pub fn encode_request_with_flow(
+    uuid: &[u8; 16],
+    cmd: u8,
+    addr: &Address,
+    flow: Option<&str>,
+) -> Vec<u8> {
     let addr_bytes = encode_address(addr);
-    let mut buf = Vec::with_capacity(1 + 16 + 1 + 1 + addr_bytes.len());
+
+    // Build the addon bytes (protobuf-encoded flow string).
+    let addon_bytes: Vec<u8> = match flow {
+        Some(f) if !f.is_empty() => {
+            // Protobuf: field 2, wire type 2 (length-delimited) = tag 0x12
+            let flow_bytes = f.as_bytes();
+            let mut addon = Vec::with_capacity(2 + flow_bytes.len());
+            addon.push(0x12); // tag: field 2, wire type 2
+            addon.push(flow_bytes.len() as u8); // varint length (flow < 128 bytes)
+            addon.extend_from_slice(flow_bytes);
+            addon
+        }
+        _ => Vec::new(),
+    };
+
+    let mut buf = Vec::with_capacity(1 + 16 + 1 + addon_bytes.len() + 1 + addr_bytes.len());
 
     // Version
     buf.push(VLESS_VERSION);
     // UUID
     buf.extend_from_slice(uuid);
-    // Addon length (0 = no addons)
-    buf.push(0x00);
+    // Addon length
+    buf.push(addon_bytes.len() as u8);
+    // Addon payload
+    buf.extend_from_slice(&addon_bytes);
     // Command
     buf.push(cmd);
     // Address
@@ -174,6 +212,44 @@ mod tests {
 
         assert_eq!(header[18], CMD_UDP);
         assert_eq!(header[19], ATYP_IPV4);
+    }
+
+    #[test]
+    fn encode_request_with_vision_flow() {
+        let uuid = parse_uuid("11111111-2222-3333-4444-555555555555").unwrap();
+        let addr = Address::Domain("example.com".to_string(), 443);
+        let flow = "xtls-rprx-vision";
+        let header = encode_request_with_flow(&uuid, CMD_TCP, &addr, Some(flow));
+
+        // Version
+        assert_eq!(header[0], VLESS_VERSION);
+        // UUID (bytes 1..17)
+        assert_eq!(&header[1..17], &uuid);
+        // Addon length: 2 (tag + len) + 16 (flow string) = 18
+        assert_eq!(header[17], 18);
+        // Addon: protobuf tag for field 2, wire type 2
+        assert_eq!(header[18], 0x12);
+        // Addon: length of flow string
+        assert_eq!(header[19], 16);
+        // Addon: flow string
+        assert_eq!(&header[20..36], flow.as_bytes());
+        // Command (after addon)
+        assert_eq!(header[36], CMD_TCP);
+        // Address starts after command
+        assert_eq!(header[37], ATYP_DOMAIN);
+    }
+
+    #[test]
+    fn encode_request_no_flow_matches_original() {
+        let uuid = parse_uuid("11111111-2222-3333-4444-555555555555").unwrap();
+        let addr = Address::Domain("example.com".to_string(), 443);
+
+        let h1 = encode_request(&uuid, CMD_TCP, &addr);
+        let h2 = encode_request_with_flow(&uuid, CMD_TCP, &addr, None);
+        let h3 = encode_request_with_flow(&uuid, CMD_TCP, &addr, Some(""));
+
+        assert_eq!(h1, h2);
+        assert_eq!(h1, h3);
     }
 }
 

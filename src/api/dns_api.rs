@@ -24,7 +24,8 @@ pub async fn get_dns_query(
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    match state.dns_resolver.resolve(&name).await {
+    let dns_resolver = state.app.dns_resolver();
+    match dns_resolver.resolve(&name).await {
         Ok(ip) => Ok(Json(json!({
             "Status": 0,
             "Question": [{
@@ -50,11 +51,11 @@ pub async fn get_dns_query(
 }
 
 pub async fn post_dns_flush(State(state): State<ApiState>) -> StatusCode {
-    state.dns_resolver.flush_cache();
+    state.app.dns_resolver().flush_cache();
     StatusCode::NO_CONTENT
 }
 
 pub async fn post_fakeip_flush(State(state): State<ApiState>) -> StatusCode {
-    state.dns_resolver.flush_fakeip();
+    state.app.dns_resolver().flush_fakeip();
     StatusCode::NO_CONTENT
 }

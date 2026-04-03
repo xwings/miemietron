@@ -1,12 +1,38 @@
 use anyhow::Result;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use tokio::net::UdpSocket;
+use std::sync::Arc;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpStream, UdpSocket};
+use tokio::sync::Mutex;
+use tracing::debug;
 
 use crate::config::DnsConfig;
+use crate::rules::geoip::GeoIpMatcher;
+use crate::transport::tls::{wrap_tls, TlsOptions};
+
+/// Global lazy GeoIP matcher for DNS fallback filtering.
+///
+/// Loaded once from the home directory on first access. The home dir is resolved
+/// using the same logic as `main.rs` (CLASH_HOME_DIR env or ~/.config/mihomo).
+static DNS_GEOIP: std::sync::LazyLock<GeoIpMatcher> = std::sync::LazyLock::new(|| {
+    let home_dir = if let Ok(dir) = std::env::var("CLASH_HOME_DIR") {
+        std::path::PathBuf::from(dir)
+    } else {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+        std::path::PathBuf::from(home)
+            .join(".config")
+            .join("mihomo")
+    };
+    GeoIpMatcher::new(&home_dir)
+});
 
 /// Resolve a domain by querying upstream DNS servers.
+///
+/// Implements fallback logic: queries primary nameservers first, and if the
+/// response looks suspicious (private IP for a public domain, or an IP in the
+/// fake-ip range), re-queries using fallback nameservers.
 pub async fn resolve(domain: &str, config: &DnsConfig) -> Result<IpAddr> {
-    // Try nameservers first, then fallback
+    // Determine primary nameserver list
     let servers = if !config.nameserver.is_empty() {
         &config.nameserver
     } else if !config.default_nameserver.is_empty() {
@@ -16,34 +42,207 @@ pub async fn resolve(domain: &str, config: &DnsConfig) -> Result<IpAddr> {
         return resolve_udp(domain, "8.8.8.8:53").await;
     };
 
+    // Try primary nameservers
+    let mut primary_result: Option<IpAddr> = None;
     for server in servers {
-        let result = if server.starts_with("https://") {
-            resolve_doh(domain, server).await
-        } else if server.starts_with("tls://") {
-            // DoT - fallback to UDP for now, DoT in Phase 2
-            let addr = server.trim_start_matches("tls://");
-            let addr = if addr.contains(':') {
-                addr.to_string()
-            } else {
-                format!("{}:853", addr)
-            };
-            resolve_udp(domain, &addr.replace(":853", ":53")).await
-        } else {
-            let addr = if server.contains(':') {
-                server.clone()
-            } else {
-                format!("{}:53", server)
-            };
-            resolve_udp(domain, &addr).await
-        };
-
+        let result = query_server(domain, server).await;
         if let Ok(ip) = result {
+            primary_result = Some(ip);
+            break;
+        }
+    }
+
+    // If we got a result, check if it needs fallback
+    if let Some(ip) = primary_result {
+        if should_use_fallback(&ip, domain, config) && !config.fallback.is_empty() {
+            debug!(
+                "DNS primary returned {} for {}, trying fallback servers",
+                ip, domain
+            );
+            // Try fallback nameservers
+            for server in &config.fallback {
+                let result = query_server(domain, server).await;
+                if let Ok(fallback_ip) = result {
+                    debug!(
+                        "DNS fallback returned {} for {} (primary was {})",
+                        fallback_ip, domain, ip
+                    );
+                    return Ok(fallback_ip);
+                }
+            }
+            // All fallbacks failed, return the primary result anyway
             return Ok(ip);
+        }
+        return Ok(ip);
+    }
+
+    // Primary failed entirely, try fallback servers
+    if !config.fallback.is_empty() {
+        for server in &config.fallback {
+            let result = query_server(domain, server).await;
+            if let Ok(ip) = result {
+                return Ok(ip);
+            }
         }
     }
 
     Err(anyhow::anyhow!("all DNS servers failed for {}", domain))
 }
+
+/// Check whether the primary DNS result looks suspicious and fallback should
+/// be used.
+///
+/// The response is considered suspicious if:
+/// - The IP is a private/reserved address for what appears to be a public domain.
+/// - The IP falls within the fake-ip CIDR range.
+/// - The fallback-filter config rules trigger (geoip, ipcidr, domain).
+fn should_use_fallback(ip: &IpAddr, domain: &str, config: &DnsConfig) -> bool {
+    // Never fallback for local-looking domains
+    if domain.ends_with(".local")
+        || domain.ends_with(".lan")
+        || domain.ends_with(".internal")
+        || domain == "localhost"
+    {
+        return false;
+    }
+
+    // Check if the IP is in the fake-ip range
+    if let IpAddr::V4(v4) = ip {
+        let fake_range = &config.fake_ip_range;
+        if !fake_range.is_empty() {
+            if let Ok((base, prefix_len)) = parse_cidr_simple(fake_range) {
+                let mask = if prefix_len >= 32 {
+                    0xFFFF_FFFFu32
+                } else {
+                    !((1u32 << (32 - prefix_len)) - 1)
+                };
+                let ip_u32 = u32::from(*v4);
+                if ip_u32 & mask == base & mask {
+                    return true;
+                }
+            }
+        }
+    }
+
+    // Check if the IP is a private/reserved address
+    if is_private_ip(ip) {
+        return true;
+    }
+
+    // Check fallback-filter rules if present
+    if let Some(ref filter) = config.fallback_filter {
+        // GeoIP filter: if the resolved IP's country matches geoip_code,
+        // the domain is likely being DNS-poisoned to a domestic IP.
+        // Use fallback to get the real (overseas) answer.
+        if filter.geoip && !filter.geoip_code.is_empty() {
+            if let Some(country) = DNS_GEOIP.lookup_country(ip) {
+                if country.eq_ignore_ascii_case(&filter.geoip_code) {
+                    debug!(
+                        "DNS fallback triggered: {} resolved to {} (country {}), matches geoip filter {}",
+                        domain, ip, country, filter.geoip_code
+                    );
+                    return true;
+                }
+            }
+        }
+
+        // IP CIDR filter
+        for cidr_str in &filter.ipcidr {
+            if let Ok((base, prefix_len)) = parse_cidr_simple(cidr_str) {
+                if let IpAddr::V4(v4) = ip {
+                    let mask = if prefix_len >= 32 {
+                        0xFFFF_FFFFu32
+                    } else {
+                        !((1u32 << (32 - prefix_len)) - 1)
+                    };
+                    let ip_u32 = u32::from(*v4);
+                    if ip_u32 & mask == base & mask {
+                        return true;
+                    }
+                }
+            }
+        }
+
+        // Domain filter
+        for d in &filter.domain {
+            if let Some(suffix) = d.strip_prefix('+') {
+                if domain.ends_with(suffix) {
+                    return true;
+                }
+            } else if domain == d || domain.ends_with(&format!(".{}", d)) {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+/// Check whether an IP is in a private/reserved range.
+fn is_private_ip(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            let octets = v4.octets();
+            // 10.0.0.0/8
+            if octets[0] == 10 {
+                return true;
+            }
+            // 172.16.0.0/12
+            if octets[0] == 172 && (16..=31).contains(&octets[1]) {
+                return true;
+            }
+            // 192.168.0.0/16
+            if octets[0] == 192 && octets[1] == 168 {
+                return true;
+            }
+            // 127.0.0.0/8
+            if octets[0] == 127 {
+                return true;
+            }
+            // 0.0.0.0/8
+            if octets[0] == 0 {
+                return true;
+            }
+            // 169.254.0.0/16 (link-local)
+            if octets[0] == 169 && octets[1] == 254 {
+                return true;
+            }
+            false
+        }
+        IpAddr::V6(v6) => v6.is_loopback(),
+    }
+}
+
+/// Simple CIDR parser returning (base_u32, prefix_len).
+fn parse_cidr_simple(cidr: &str) -> Result<(u32, u32)> {
+    let parts: Vec<&str> = cidr.split('/').collect();
+    if parts.len() != 2 {
+        return Err(anyhow::anyhow!("invalid CIDR: {}", cidr));
+    }
+    let ip: Ipv4Addr = parts[0].parse()?;
+    let prefix_len: u32 = parts[1].parse()?;
+    Ok((u32::from(ip), prefix_len))
+}
+
+/// Route a DNS query to the appropriate upstream based on the server URL scheme.
+async fn query_server(domain: &str, server: &str) -> Result<IpAddr> {
+    if server.starts_with("https://") {
+        resolve_doh(domain, server).await
+    } else if server.starts_with("tls://") {
+        resolve_dot(domain, server).await
+    } else {
+        let addr = if server.contains(':') {
+            server.to_string()
+        } else {
+            format!("{}:53", server)
+        };
+        resolve_udp(domain, &addr).await
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Plain UDP DNS
+// ---------------------------------------------------------------------------
 
 /// Resolve via plain UDP DNS.
 async fn resolve_udp(domain: &str, server: &str) -> Result<IpAddr> {
@@ -54,11 +253,10 @@ async fn resolve_udp(domain: &str, server: &str) -> Result<IpAddr> {
     let socket = UdpSocket::bind("0.0.0.0:0").await?;
     socket.connect(addr).await?;
 
-    // Build DNS query
     let query = build_dns_query(domain, 1); // Type A = 1
     socket.send(&query).await?;
 
-    let mut buf = vec![0u8; 512];
+    let mut buf = vec![0u8; 4096];
     let timeout = tokio::time::timeout(std::time::Duration::from_secs(5), socket.recv(&mut buf));
 
     let n = timeout.await??;
@@ -67,7 +265,11 @@ async fn resolve_udp(domain: &str, server: &str) -> Result<IpAddr> {
     parse_dns_response(response)
 }
 
-/// Resolve via DNS-over-HTTPS.
+// ---------------------------------------------------------------------------
+// DNS-over-HTTPS
+// ---------------------------------------------------------------------------
+
+/// Resolve via DNS-over-HTTPS (RFC 8484).
 async fn resolve_doh(domain: &str, url: &str) -> Result<IpAddr> {
     let query = build_dns_query(domain, 1);
     let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&query);
@@ -89,6 +291,141 @@ async fn resolve_doh(domain: &str, url: &str) -> Result<IpAddr> {
 }
 
 use base64::Engine;
+
+// ---------------------------------------------------------------------------
+// DNS-over-TLS (DoT)
+// ---------------------------------------------------------------------------
+
+/// Global connection pool for DoT servers.
+/// Maps server address to a pooled TLS connection.
+type DotPool = Mutex<
+    std::collections::HashMap<
+        String,
+        Arc<Mutex<Option<tokio_rustls::client::TlsStream<TcpStream>>>>,
+    >,
+>;
+static DOT_POOL: std::sync::LazyLock<DotPool> =
+    std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+/// Resolve via DNS-over-TLS (RFC 7858).
+///
+/// Connects to the server on port 853, wraps the TCP connection in TLS,
+/// and sends/receives DNS messages with 2-byte length prefix framing.
+/// Connections are pooled for reuse.
+async fn resolve_dot(domain: &str, server: &str) -> Result<IpAddr> {
+    let addr_str = server.trim_start_matches("tls://");
+    let (host, port_str) = if let Some(idx) = addr_str.rfind(':') {
+        // Check if this is an IPv6 address in brackets
+        if addr_str.starts_with('[') {
+            if let Some(bracket_end) = addr_str.find(']') {
+                if idx > bracket_end {
+                    (&addr_str[..idx], &addr_str[idx + 1..])
+                } else {
+                    (addr_str, "853")
+                }
+            } else {
+                (addr_str, "853")
+            }
+        } else {
+            (&addr_str[..idx], &addr_str[idx + 1..])
+        }
+    } else {
+        (addr_str, "853")
+    };
+
+    let port: u16 = port_str.parse().unwrap_or(853);
+    let sock_addr = format!("{}:{}", host, port);
+    let sni = host.to_string();
+
+    // Try to reuse a pooled connection
+    let pool_key = sock_addr.clone();
+    let conn_slot = {
+        let mut pool = DOT_POOL.lock().await;
+        pool.entry(pool_key.clone())
+            .or_insert_with(|| Arc::new(Mutex::new(None)))
+            .clone()
+    };
+
+    // Try the pooled connection first
+    {
+        let mut slot = conn_slot.lock().await;
+        if let Some(ref mut tls_stream) = *slot {
+            match dot_query_on_stream(tls_stream, domain).await {
+                Ok(ip) => return Ok(ip),
+                Err(_) => {
+                    // Connection is stale, drop it and create a new one
+                    *slot = None;
+                }
+            }
+        }
+    }
+
+    // No pooled connection, create a new one
+    let tcp_stream = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        TcpStream::connect(&sock_addr),
+    )
+    .await??;
+
+    let tls_opts = TlsOptions {
+        sni: sni.clone(),
+        skip_cert_verify: false,
+        alpn: vec![],
+        fingerprint: None,
+    };
+
+    let mut tls_stream = wrap_tls(tcp_stream, &tls_opts).await?;
+    let ip = dot_query_on_stream(&mut tls_stream, domain).await?;
+
+    // Pool the connection for reuse
+    {
+        let mut slot = conn_slot.lock().await;
+        *slot = Some(tls_stream);
+    }
+
+    Ok(ip)
+}
+
+/// Send a DNS query on an existing DoT TLS stream and read the response.
+async fn dot_query_on_stream(
+    stream: &mut tokio_rustls::client::TlsStream<TcpStream>,
+    domain: &str,
+) -> Result<IpAddr> {
+    let query = build_dns_query(domain, 1);
+
+    // Write 2-byte length prefix + query
+    let len_prefix = (query.len() as u16).to_be_bytes();
+    stream.write_all(&len_prefix).await?;
+    stream.write_all(&query).await?;
+    stream.flush().await?;
+
+    // Read 2-byte length prefix
+    let mut resp_len_buf = [0u8; 2];
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        stream.read_exact(&mut resp_len_buf),
+    )
+    .await??;
+
+    let resp_len = u16::from_be_bytes(resp_len_buf) as usize;
+    if resp_len == 0 || resp_len > 65535 {
+        return Err(anyhow::anyhow!("invalid DoT response length: {}", resp_len));
+    }
+
+    // Read the DNS response
+    let mut resp_buf = vec![0u8; resp_len];
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        stream.read_exact(&mut resp_buf),
+    )
+    .await??;
+
+    parse_dns_response(&resp_buf)
+}
+
+// ---------------------------------------------------------------------------
+// DNS wire format helpers
+// ---------------------------------------------------------------------------
 
 /// Build a DNS query packet for the given domain and record type.
 fn build_dns_query(domain: &str, qtype: u16) -> Vec<u8> {

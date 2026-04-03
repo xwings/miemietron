@@ -8,8 +8,8 @@ use serde_json::{json, Value};
 use super::ApiState;
 
 pub async fn get_rules(State(state): State<ApiState>) -> Json<Value> {
-    let rules: Vec<Value> = state
-        .rule_engine
+    let rule_engine = state.app.rule_engine();
+    let rules: Vec<Value> = rule_engine
         .rules()
         .iter()
         .enumerate()
@@ -36,5 +36,14 @@ pub async fn put_rule_provider(
     Path(_name): Path<String>,
 ) -> StatusCode {
     // TODO: trigger rule provider update
+    StatusCode::NO_CONTENT
+}
+
+/// PATCH /rules/disable — enable/disable specific rules by index.
+pub async fn patch_rules_disable(
+    State(_state): State<ApiState>,
+    Json(_body): Json<Value>,
+) -> StatusCode {
+    // TODO: implement rule disabling
     StatusCode::NO_CONTENT
 }

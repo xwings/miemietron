@@ -129,7 +129,8 @@ fn detect_common_prefix(archive: &mut zip::ZipArchive<std::io::Cursor<&[u8]>>) -
 
 /// POST /upgrade/ui — download and extract the latest UI.
 pub async fn post_upgrade_ui(State(state): State<ApiState>) -> (StatusCode, Json<Value>) {
-    let ui_dir = match resolve_ui_dir(&state.config) {
+    let config = state.app.config();
+    let ui_dir = match resolve_ui_dir(&config) {
         Some(dir) => dir,
         None => {
             return (
@@ -139,11 +140,7 @@ pub async fn post_upgrade_ui(State(state): State<ApiState>) -> (StatusCode, Json
         }
     };
 
-    let url = state
-        .config
-        .external_ui_url
-        .as_deref()
-        .unwrap_or(DEFAULT_UI_URL);
+    let url = config.external_ui_url.as_deref().unwrap_or(DEFAULT_UI_URL);
 
     match download_ui(&ui_dir, Some(url)).await {
         Ok(()) => (StatusCode::OK, Json(json!({"status": "ok"}))),

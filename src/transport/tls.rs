@@ -8,6 +8,8 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_rustls::client::TlsStream;
 use tracing::debug;
 
+use super::fingerprint::{self, TlsFingerprint};
+
 // ---------------------------------------------------------------------------
 // Options struct (used by proxy adapters)
 // ---------------------------------------------------------------------------
@@ -56,34 +58,53 @@ impl TlsConnector {
     /// * `sni` -- Server Name Indication hostname.
     /// * `skip_cert_verify` -- Accept any server certificate (insecure).
     /// * `alpn` -- ALPN protocol strings (e.g. `["h2", "http/1.1"]`).
-    /// * `_fingerprint` -- Reserved for future TLS fingerprint spoofing.
+    /// * `fingerprint_str` -- Browser fingerprint name (e.g. `"chrome"`).
     pub fn new(
         sni: String,
         skip_cert_verify: bool,
         alpn: Vec<String>,
-        _fingerprint: Option<String>,
+        fingerprint_str: Option<String>,
     ) -> Result<Self> {
         let server_name: ServerName<'static> = ServerName::try_from(sni.clone())
             .map_err(|e| anyhow::anyhow!("invalid SNI '{}': {}", sni, e))?
             .to_owned();
 
+        // Parse the fingerprint and build a customised CryptoProvider.
+        let fp = TlsFingerprint::from_str_opt(fingerprint_str.as_deref());
+        let provider = fingerprint::make_crypto_provider(fp);
+
         let mut config = if skip_cert_verify {
-            debug!("TLS: skip_cert_verify enabled for {}", sni);
-            ClientConfig::builder()
+            debug!(
+                "TLS: skip_cert_verify enabled for {}, fingerprint={}",
+                sni, fp
+            );
+            ClientConfig::builder_with_provider(Arc::new(provider))
+                .with_safe_default_protocol_versions()
+                .map_err(|e| anyhow::anyhow!("TLS protocol version error: {}", e))?
                 .dangerous()
                 .with_custom_certificate_verifier(Arc::new(NoVerifier::new()))
                 .with_no_client_auth()
         } else {
+            debug!("TLS: fingerprint={} for {}", fp, sni);
             let mut root_store = RootCertStore::empty();
             root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-            ClientConfig::builder()
+            ClientConfig::builder_with_provider(Arc::new(provider))
+                .with_safe_default_protocol_versions()
+                .map_err(|e| anyhow::anyhow!("TLS protocol version error: {}", e))?
                 .with_root_certificates(root_store)
                 .with_no_client_auth()
         };
 
-        // Configure ALPN protocols.
-        if !alpn.is_empty() {
-            config.alpn_protocols = alpn.into_iter().map(|s| s.into_bytes()).collect();
+        // Use browser-matching ALPN if configured fingerprint provides
+        // defaults and the caller didn't specify any.
+        let effective_alpn = if alpn.is_empty() {
+            fingerprint::default_alpn_for(fp)
+        } else {
+            alpn
+        };
+
+        if !effective_alpn.is_empty() {
+            config.alpn_protocols = effective_alpn.into_iter().map(|s| s.into_bytes()).collect();
         }
 
         let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
@@ -115,16 +136,17 @@ impl TlsConnector {
 /// A `ServerCertVerifier` that blindly accepts any certificate chain.
 ///
 /// This is intentionally insecure and exists only because some proxy
-/// configurations (e.g. self-signed certs behind a CDN) require it.
+/// configurations (e.g. self-signed certs behind a CDN, Reality transport)
+/// require it.
 #[derive(Debug)]
-struct NoVerifier {
+pub(crate) struct NoVerifier {
     /// Signature schemes derived from the ring crypto provider so the list
     /// stays in sync with what rustls can actually negotiate.
     schemes: Vec<SignatureScheme>,
 }
 
 impl NoVerifier {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let schemes = default_provider()
             .signature_verification_algorithms
             .supported_schemes();

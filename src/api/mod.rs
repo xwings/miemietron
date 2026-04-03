@@ -5,6 +5,7 @@ pub mod dns_api;
 pub mod logs;
 pub mod proxies;
 pub mod rules_api;
+pub mod traffic;
 pub mod ui;
 pub mod version;
 
@@ -18,21 +19,23 @@ use tower_http::cors::{Any, CorsLayer};
 use tower_http::services::ServeDir;
 use tracing::{info, warn};
 
-use crate::config::MiemieConfig;
-use crate::conn::{ConnectionManager, StatsManager};
-use crate::dns::DnsResolver;
-use crate::proxy::ProxyManager;
-use crate::rules::RuleEngine;
+use crate::conn::ConnectionManager;
+use crate::AppState;
+
+/// Mutable runtime configuration that can be changed via PATCH /configs.
+pub struct RuntimeConfig {
+    pub mode: String,
+    pub log_level: String,
+}
 
 /// Shared state for all API handlers.
+///
+/// Holds a reference to the shared `AppState` (which supports hot-reload)
+/// and the connection manager.
 #[derive(Clone)]
 pub struct ApiState {
-    pub config: Arc<MiemieConfig>,
-    pub proxy_manager: Arc<ProxyManager>,
-    pub rule_engine: Arc<RuleEngine>,
+    pub app: Arc<AppState>,
     pub conn_manager: Arc<ConnectionManager>,
-    pub stats: Arc<StatsManager>,
-    pub dns_resolver: Arc<DnsResolver>,
 }
 
 pub async fn start_server(addr: &str, secret: Option<String>, state: ApiState) -> Result<()> {
@@ -42,7 +45,8 @@ pub async fn start_server(addr: &str, secret: Option<String>, state: ApiState) -
         .allow_headers(Any);
 
     // Auto-download UI if external-ui is configured but directory is empty/missing
-    if let Some(ui_dir) = ui::resolve_ui_dir(&state.config) {
+    let config = state.app.config();
+    if let Some(ui_dir) = ui::resolve_ui_dir(&config) {
         let needs_download = !ui_dir.exists()
             || ui_dir
                 .read_dir()
@@ -50,7 +54,7 @@ pub async fn start_server(addr: &str, secret: Option<String>, state: ApiState) -
                 .unwrap_or(true);
 
         if needs_download {
-            let url = state.config.external_ui_url.as_deref();
+            let url = config.external_ui_url.as_deref();
             info!("UI directory empty, downloading metacubexd...");
             match ui::download_ui(&ui_dir, url).await {
                 Ok(()) => info!("UI downloaded to {}", ui_dir.display()),
@@ -63,40 +67,68 @@ pub async fn start_server(addr: &str, secret: Option<String>, state: ApiState) -
     }
 
     let mut app = Router::new()
-        // Version / system
+        // Root — mihomo serves version at both / and /version
+        .route("/", get(version::get_version))
         .route("/version", get(version::get_version))
+        // System
         .route("/memory", get(version::get_memory))
-        .route("/gc", get(version::get_gc))
+        .route("/traffic", get(traffic::get_traffic))
+        .route("/logs", get(logs::get_logs))
+        // Restart / upgrade
         .route("/restart", post(version::post_restart))
+        .route("/upgrade", post(version::post_upgrade_stub))
         .route("/upgrade/ui", post(ui::post_upgrade_ui))
+        .route("/upgrade/geo", post(configs::post_configs_geo))
+        // Debug
+        .route("/debug/gc", put(version::put_debug_gc))
         // Configs
-        .route("/configs", get(configs::get_configs))
-        .route("/configs", put(configs::put_configs))
-        .route("/configs", patch(configs::patch_configs))
+        .route(
+            "/configs",
+            get(configs::get_configs)
+                .put(configs::put_configs)
+                .patch(configs::patch_configs),
+        )
         .route("/configs/geo", post(configs::post_configs_geo))
         // Proxies
         .route("/proxies", get(proxies::get_proxies))
-        .route("/proxies/{name}", get(proxies::get_proxy))
-        .route("/proxies/{name}", put(proxies::put_proxy))
-        .route("/proxies/{name}", delete(proxies::delete_proxy))
+        .route(
+            "/proxies/{name}",
+            get(proxies::get_proxy)
+                .put(proxies::put_proxy)
+                .delete(proxies::delete_proxy),
+        )
         .route("/proxies/{name}/delay", get(proxies::get_proxy_delay))
-        // Groups — OpenClash uses both /group and /groups
+        // Groups — mihomo uses /group (singular), OpenClash also hits /groups
         .route("/group", get(proxies::get_groups))
         .route("/groups", get(proxies::get_groups))
+        .route("/group/{name}", get(proxies::get_group))
         .route("/groups/{name}", get(proxies::get_group))
+        .route("/group/{name}/delay", get(proxies::get_group_delay))
         .route("/groups/{name}/delay", get(proxies::get_group_delay))
-        // Providers
+        // Proxy providers
         .route("/providers/proxies", get(proxies::get_providers))
-        .route("/providers/proxies/{name}", get(proxies::get_provider))
-        .route("/providers/proxies/{name}", put(proxies::put_provider))
+        .route(
+            "/providers/proxies/{name}",
+            get(proxies::get_provider).put(proxies::put_provider),
+        )
         .route(
             "/providers/proxies/{name}/healthcheck",
             get(proxies::get_provider_healthcheck),
         )
+        .route(
+            "/providers/proxies/{provider}/{name}",
+            get(proxies::get_provider_proxy),
+        )
+        .route(
+            "/providers/proxies/{provider}/{name}/healthcheck",
+            get(proxies::get_provider_proxy_healthcheck),
+        )
+        // Rule providers
         .route("/providers/rules", get(rules_api::get_rule_providers))
         .route("/providers/rules/{name}", put(rules_api::put_rule_provider))
         // Rules
         .route("/rules", get(rules_api::get_rules))
+        .route("/rules/disable", patch(rules_api::patch_rules_disable))
         // Connections
         .route(
             "/connections",
@@ -109,12 +141,10 @@ pub async fn start_server(addr: &str, secret: Option<String>, state: ApiState) -
         .route("/dns/fakeip/flush", post(dns_api::post_fakeip_flush))
         // Cache
         .route("/cache/fakeip/flush", post(dns_api::post_fakeip_flush))
-        .route("/cache/dns/flush", post(dns_api::post_dns_flush))
-        // Logs
-        .route("/logs", get(logs::get_logs));
+        .route("/cache/dns/flush", post(dns_api::post_dns_flush));
 
     // Serve external UI as static files at /ui/
-    if let Some(ui_dir) = ui::resolve_ui_dir(&state.config) {
+    if let Some(ui_dir) = ui::resolve_ui_dir(&config) {
         if ui_dir.exists() {
             info!("Serving UI from {} at /ui/", ui_dir.display());
             app = app.nest_service("/ui", ServeDir::new(&ui_dir));

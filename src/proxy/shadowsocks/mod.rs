@@ -1,4 +1,5 @@
 pub mod aead;
+pub mod plugin;
 pub mod udp;
 
 use anyhow::{anyhow, Result};
@@ -13,6 +14,7 @@ use crate::proxy::{OutboundHandler, ProxyStream};
 use crate::transport::tcp::{connect, ConnectOpts};
 
 use aead::{encode_address, evp_bytes_to_key, AeadCipher, SsStream};
+use plugin::{ObfsStream, PluginOpts};
 
 /// Shadowsocks outbound handler implementing the AEAD protocol.
 pub struct ShadowsocksOutbound {
@@ -23,6 +25,7 @@ pub struct ShadowsocksOutbound {
     master_key: Vec<u8>,
     udp: bool,
     plugin: Option<String>,
+    plugin_opts: PluginOpts,
     connect_opts: ConnectOpts,
 }
 
@@ -70,6 +73,11 @@ impl ShadowsocksOutbound {
 
         let udp = config.udp.unwrap_or(false);
         let plugin = config.plugin.clone();
+        let plugin_opts = config
+            .plugin_opts
+            .as_ref()
+            .map(PluginOpts::from_map)
+            .unwrap_or_default();
 
         let connect_opts = ConnectOpts {
             interface: config.interface_name.clone(),
@@ -91,6 +99,7 @@ impl ShadowsocksOutbound {
             master_key,
             udp,
             plugin,
+            plugin_opts,
             connect_opts,
         })
     }
@@ -143,12 +152,7 @@ impl OutboundHandler for ShadowsocksOutbound {
         // The SS server will parse this header and connect to the target on our behalf.
         let addr_header = encode_address(target);
 
-        // Decide transport based on plugin field:
-        //   None        -> direct TCP
-        //   "obfs-local" / other -> not yet supported, fall through to direct TCP
-        //
-        // TLS and WebSocket transports are configured via the network/tls fields
-        // on ProxyConfig and will be added in future transport layer phases.
+        // Decide transport based on plugin field.
         match self.plugin.as_deref() {
             None | Some("") => {
                 // Direct TCP - wrap in AEAD encrypted stream
@@ -160,10 +164,64 @@ impl OutboundHandler for ShadowsocksOutbound {
                 );
                 Ok(Box::new(ss))
             }
+
+            Some("obfs-local") | Some("obfs") | Some("simple-obfs") => {
+                // simple-obfs: wrap TCP in HTTP or TLS obfuscation, then AEAD
+                let mode = self.plugin_opts.mode.as_deref().unwrap_or("http");
+                let host = self.plugin_opts.host.as_deref().unwrap_or(&self.server);
+
+                debug!("ss: using simple-obfs mode={} host={}", mode, host);
+
+                let obfs_stream = match mode {
+                    "tls" => ObfsStream::new_tls(tcp_stream, host.to_string()),
+                    _ => ObfsStream::new_http(tcp_stream, host.to_string()),
+                };
+
+                let ss = SsStream::new(
+                    obfs_stream,
+                    self.cipher,
+                    self.master_key.clone(),
+                    addr_header,
+                );
+                Ok(Box::new(ss))
+            }
+
+            Some("v2ray-plugin") => {
+                // v2ray-plugin: wrap TCP in (optional TLS +) WebSocket, then AEAD
+                debug!("ss: using v2ray-plugin");
+
+                let transport =
+                    plugin::connect_v2ray_plugin(tcp_stream, &self.plugin_opts, &self.server)
+                        .await
+                        .map_err(|e| anyhow!("ss: v2ray-plugin setup failed: {}", e))?;
+
+                let ss =
+                    SsStream::new(transport, self.cipher, self.master_key.clone(), addr_header);
+                Ok(Box::new(ss))
+            }
+
+            Some("shadow-tls") | Some("shadowtls") | Some("shadow-tls-v2") => {
+                // shadow-tls: TLS handshake + HMAC-authenticated data, then AEAD
+                debug!("ss: using shadow-tls");
+
+                let stls_stream =
+                    plugin::connect_shadow_tls(tcp_stream, &self.plugin_opts, &self.server)
+                        .await
+                        .map_err(|e| anyhow!("ss: shadow-tls setup failed: {}", e))?;
+
+                let ss = SsStream::new(
+                    stls_stream,
+                    self.cipher,
+                    self.master_key.clone(),
+                    addr_header,
+                );
+                Ok(Box::new(ss))
+            }
+
             Some(plugin_name) => {
-                // For now, unsupported plugins fall back to direct TCP with a warning.
+                // Unknown plugin -- fall back to direct TCP with a warning.
                 tracing::warn!(
-                    "ss: plugin '{}' not yet supported, using direct TCP",
+                    "ss: plugin '{}' not supported, using direct TCP",
                     plugin_name
                 );
                 let ss = SsStream::new(

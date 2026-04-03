@@ -182,7 +182,12 @@ impl MiemieConfig {
     pub fn load(path: &Path) -> Result<Self> {
         let content = std::fs::read_to_string(path)
             .map_err(|e| anyhow::anyhow!("failed to read config {}: {}", path.display(), e))?;
-        let config: Self = serde_yaml::from_str(&content)
+        Self::parse_str(&content)
+    }
+
+    /// Parse a config from a YAML string.
+    pub fn parse_str(yaml: &str) -> Result<Self> {
+        let config: Self = serde_yaml::from_str(yaml)
             .map_err(|e| anyhow::anyhow!("failed to parse config: {}", e))?;
         Ok(config)
     }

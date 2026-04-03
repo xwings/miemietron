@@ -5,7 +5,8 @@ pub mod upstream;
 use anyhow::Result;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
-use tokio::net::UdpSocket;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, UdpSocket};
 use tracing::{debug, error, info};
 
 use crate::config::DnsConfig;
@@ -92,23 +93,47 @@ impl DnsResolver {
             pool.clear();
         }
     }
+
+    /// Save FakeIP mappings to disk.
+    pub fn save_fakeip(&self, path: &std::path::Path) -> Result<()> {
+        if let Some(ref pool) = self.fakeip {
+            pool.save(path)?;
+        }
+        Ok(())
+    }
+
+    /// Load FakeIP mappings from disk.
+    pub fn load_fakeip(&self, path: &std::path::Path) -> Result<()> {
+        if let Some(ref pool) = self.fakeip {
+            pool.load(path)?;
+        }
+        Ok(())
+    }
 }
 
-/// Run a DNS server that listens for queries and responds using the resolver.
+/// Run a DNS server that listens for queries on both UDP and TCP.
 pub async fn run_dns_server(listen: &str, resolver: Arc<DnsResolver>) -> Result<()> {
     let addr: SocketAddr = listen
         .parse()
         .unwrap_or_else(|_| SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 1053));
 
-    let socket = UdpSocket::bind(addr).await?;
-    info!("DNS server listening on {}", addr);
+    let udp_socket = UdpSocket::bind(addr).await?;
+    let tcp_listener = TcpListener::bind(addr).await?;
+    info!("DNS server listening on {} (UDP + TCP)", addr);
 
-    let mut buf = vec![0u8; 512];
+    // Spawn the TCP listener in a background task
+    let tcp_resolver = resolver.clone();
+    tokio::spawn(async move {
+        run_dns_tcp_server(tcp_listener, tcp_resolver).await;
+    });
+
+    // UDP listener (main loop)
+    let mut buf = vec![0u8; 4096];
     loop {
-        let (n, src) = match socket.recv_from(&mut buf).await {
+        let (n, src) = match udp_socket.recv_from(&mut buf).await {
             Ok(v) => v,
             Err(e) => {
-                error!("DNS recv error: {}", e);
+                error!("DNS UDP recv error: {}", e);
                 continue;
             }
         };
@@ -116,29 +141,101 @@ pub async fn run_dns_server(listen: &str, resolver: Arc<DnsResolver>) -> Result<
         let data = buf[..n].to_vec();
         let resolver = resolver.clone();
 
-        // Parse DNS query and respond
-        // For now, we do a basic implementation
-        // Full DNS wire format parsing comes in Phase 2
         match parse_dns_query(&data) {
             Some((id, domain, qtype)) => {
-                debug!("DNS query: {} (type {})", domain, qtype);
+                debug!("DNS query (UDP): {} (type {})", domain, qtype);
                 match resolver.resolve(&domain).await {
                     Ok(ip) => {
                         let response = build_dns_response(id, &domain, ip);
-                        let _ = socket.send_to(&response, src).await;
+                        let _ = udp_socket.send_to(&response, src).await;
                     }
                     Err(e) => {
                         debug!("DNS resolve failed for {}: {}", domain, e);
-                        // Send SERVFAIL
                         let response = build_dns_servfail(id);
-                        let _ = socket.send_to(&response, src).await;
+                        let _ = udp_socket.send_to(&response, src).await;
                     }
                 }
             }
             None => {
-                debug!("Failed to parse DNS query");
+                debug!("Failed to parse DNS query (UDP)");
             }
         }
+    }
+}
+
+/// DNS-over-TCP server: accepts connections and handles DNS queries with
+/// 2-byte length prefix framing (RFC 1035 section 4.2.2).
+async fn run_dns_tcp_server(listener: TcpListener, resolver: Arc<DnsResolver>) {
+    loop {
+        let (stream, peer) = match listener.accept().await {
+            Ok(v) => v,
+            Err(e) => {
+                error!("DNS TCP accept error: {}", e);
+                tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+                continue;
+            }
+        };
+
+        let resolver = resolver.clone();
+        tokio::spawn(async move {
+            if let Err(e) = handle_dns_tcp_connection(stream, &resolver).await {
+                debug!("DNS TCP connection from {} error: {}", peer, e);
+            }
+        });
+    }
+}
+
+/// Handle a single DNS-over-TCP connection.
+///
+/// DNS over TCP uses a 2-byte big-endian length prefix before each message.
+/// A single TCP connection can carry multiple queries (pipelining).
+async fn handle_dns_tcp_connection(
+    mut stream: tokio::net::TcpStream,
+    resolver: &DnsResolver,
+) -> Result<()> {
+    loop {
+        // Read the 2-byte length prefix
+        let mut len_buf = [0u8; 2];
+        match stream.read_exact(&mut len_buf).await {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                // Client closed the connection
+                return Ok(());
+            }
+            Err(e) => return Err(e.into()),
+        }
+
+        let msg_len = u16::from_be_bytes(len_buf) as usize;
+        if msg_len == 0 || msg_len > 65535 {
+            return Ok(()); // Invalid length, close connection
+        }
+
+        // Read the DNS message
+        let mut msg_buf = vec![0u8; msg_len];
+        stream.read_exact(&mut msg_buf).await?;
+
+        // Process the query
+        let response = match parse_dns_query(&msg_buf) {
+            Some((id, domain, qtype)) => {
+                debug!("DNS query (TCP): {} (type {})", domain, qtype);
+                match resolver.resolve(&domain).await {
+                    Ok(ip) => build_dns_response(id, &domain, ip),
+                    Err(e) => {
+                        debug!("DNS resolve failed for {}: {}", domain, e);
+                        build_dns_servfail(id)
+                    }
+                }
+            }
+            None => {
+                debug!("Failed to parse DNS query (TCP)");
+                continue;
+            }
+        };
+
+        // Write 2-byte length prefix + response
+        let resp_len = (response.len() as u16).to_be_bytes();
+        stream.write_all(&resp_len).await?;
+        stream.write_all(&response).await?;
     }
 }
 

@@ -1,6 +1,10 @@
 // Network stack abstraction.
-// Phase 1: stub
-// Phase 2+: system stack (kernel TCP/IP) and smoltcp userspace stack.
+//
+// The "system" stack uses the kernel's TCP/IP via iptables REDIRECT + SO_ORIGINAL_DST.
+// This avoids the complexity of a full userspace TCP stack while still processing
+// all traffic through the TUN device.
+
+pub mod system;
 
 use anyhow::Result;
 use std::net::SocketAddr;

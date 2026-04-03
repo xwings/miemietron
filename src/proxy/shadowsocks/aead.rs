@@ -77,7 +77,7 @@ impl AeadCipher {
 
     /// Derive a subkey from the master key and salt.
     /// SS2022 uses BLAKE3; legacy uses HKDF-SHA1.
-    fn derive_subkey(&self, key: &[u8], salt: &[u8]) -> Vec<u8> {
+    pub fn derive_subkey(&self, key: &[u8], salt: &[u8]) -> Vec<u8> {
         if self.is_ss2022() {
             // SS2022: BLAKE3 key derivation
             // subkey = BLAKE3::derive_key("shadowsocks 2022 session subkey", key || salt)

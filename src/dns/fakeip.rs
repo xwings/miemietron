@@ -1,7 +1,9 @@
 use anyhow::Result;
 use dashmap::DashMap;
 use std::net::{IpAddr, Ipv4Addr};
+use std::path::Path;
 use std::sync::atomic::{AtomicU32, Ordering};
+use tracing::debug;
 
 /// FakeIP pool: assigns fake IPs from a CIDR range to domains.
 pub struct FakeIpPool {
@@ -122,6 +124,72 @@ impl FakeIpPool {
 
     pub fn size(&self) -> usize {
         self.ip_to_domain.len()
+    }
+
+    /// Save the current domain<->IP mappings to disk as JSON.
+    ///
+    /// Format: `{ "offset": N, "mappings": { "domain": "ip", ... } }`
+    pub fn save(&self, path: &Path) -> Result<()> {
+        let mut mappings = std::collections::HashMap::new();
+        for entry in self.domain_to_ip.iter() {
+            mappings.insert(entry.key().clone(), entry.value().to_string());
+        }
+        let data = serde_json::json!({
+            "offset": self.offset.load(Ordering::Relaxed),
+            "mappings": mappings,
+        });
+        let json = serde_json::to_string(&data)?;
+        // Write atomically via a temporary file
+        let tmp_path = path.with_extension("tmp");
+        std::fs::write(&tmp_path, json.as_bytes())?;
+        std::fs::rename(&tmp_path, path)?;
+        debug!(
+            "FakeIP pool saved to {} ({} entries)",
+            path.display(),
+            mappings.len()
+        );
+        Ok(())
+    }
+
+    /// Load domain<->IP mappings from disk, restoring the pool state.
+    ///
+    /// Only loads mappings whose IPs fall within the current pool range.
+    pub fn load(&self, path: &Path) -> Result<()> {
+        if !path.exists() {
+            debug!("FakeIP persistence file not found, starting fresh");
+            return Ok(());
+        }
+
+        let json = std::fs::read_to_string(path)?;
+        let data: serde_json::Value = serde_json::from_str(&json)?;
+
+        // Restore offset
+        if let Some(offset) = data.get("offset").and_then(|v| v.as_u64()) {
+            self.offset.store(offset as u32, Ordering::Relaxed);
+        }
+
+        // Restore mappings
+        let mut loaded = 0u64;
+        if let Some(mappings) = data.get("mappings").and_then(|v| v.as_object()) {
+            for (domain, ip_str) in mappings {
+                if let Some(ip_s) = ip_str.as_str() {
+                    if let Ok(ip) = ip_s.parse::<IpAddr>() {
+                        if self.contains(&ip) {
+                            self.ip_to_domain.insert(ip, domain.clone());
+                            self.domain_to_ip.insert(domain.clone(), ip);
+                            loaded += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        debug!(
+            "FakeIP pool loaded from {} ({} entries)",
+            path.display(),
+            loaded
+        );
+        Ok(())
     }
 }
 

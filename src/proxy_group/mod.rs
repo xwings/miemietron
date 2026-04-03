@@ -3,6 +3,7 @@
 
 #[allow(unused_imports)]
 mod fallback;
+pub mod health;
 #[allow(unused_imports)]
 mod load_balance;
 #[allow(unused_imports)]

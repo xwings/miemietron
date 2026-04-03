@@ -6,10 +6,11 @@ description = "High-performance proxy kernel for low-powered routers"
 license = "MIT"
 
 [features]
-default = ["ss", "vless", "trojan"]
+default = ["ss", "vless", "trojan", "vmess"]
 ss = []
 vless = []
 trojan = []
+vmess = []
 
 [dependencies]
 # Async runtime
@@ -27,6 +28,10 @@ hmac = "0.12"
 hex = "0.4"
 aes-gcm = "0.10"
 chacha20poly1305 = "0.10"
+cfb-mode = "0.8"
+chacha20 = "0.9"
+aes = "0.8"
+cipher = "0.4"
 blake3 = "1"
 rand = "0.8"
 digest = "0.10"
@@ -39,6 +44,10 @@ tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "fs"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
 hyper = { version = "1", features = ["full"] }
+
+# HTTP/2 & gRPC transport
+h2 = "0.4"
+http = "1"
 
 # WebSocket transport
 tokio-tungstenite = "0.26"

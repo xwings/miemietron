@@ -32,24 +32,38 @@ impl DomainMatcher {
     }
 
     pub fn lookup(&self, domain: &str) -> Option<String> {
+        self.lookup_detailed(domain)
+            .map(|(_rule_type, _payload, target)| target)
+    }
+
+    /// Like `lookup` but returns (rule_type, matched_payload, target).
+    pub fn lookup_detailed(&self, domain: &str) -> Option<(String, String, String)> {
         let domain_lower = domain.to_lowercase();
 
         // 1. Exact match (O(1))
         if let Some(target) = self.exact.get(&domain_lower) {
-            return Some(target.clone());
+            return Some(("DOMAIN".to_string(), domain_lower, target.clone()));
         }
 
         // 2. Suffix match
         for (suffix, target) in &self.suffixes {
             if domain_lower.ends_with(suffix) || domain_lower == suffix.trim_start_matches('.') {
-                return Some(target.clone());
+                let payload = suffix.trim_start_matches('.').to_string();
+                return Some(("DOMAIN-SUFFIX".to_string(), payload, target.clone()));
             }
         }
 
         // 3. Keyword match (Aho-Corasick - single pass)
         if let Some(ref ac) = self.keywords {
             if let Some(mat) = ac.find(&domain_lower) {
-                return Some(self.keyword_targets[mat.pattern().as_usize()].clone());
+                let idx = mat.pattern().as_usize();
+                // Extract the matched keyword pattern from the input
+                let keyword = domain_lower[mat.start()..mat.end()].to_string();
+                return Some((
+                    "DOMAIN-KEYWORD".to_string(),
+                    keyword,
+                    self.keyword_targets[idx].clone(),
+                ));
             }
         }
 

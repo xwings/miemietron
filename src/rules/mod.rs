@@ -66,7 +66,7 @@ impl RuleEngine {
     /// Create a new RuleEngine, loading GeoIP/GeoSite databases from `home_dir`.
     pub async fn with_home_dir(
         rule_strings: &[RuleString],
-        _providers: &HashMap<String, RuleProviderConfig>,
+        providers: &HashMap<String, RuleProviderConfig>,
         home_dir: &Path,
     ) -> Result<Self> {
         let mut rules = Vec::new();
@@ -79,6 +79,134 @@ impl RuleEngine {
 
         let geoip_matcher = geoip::GeoIpMatcher::new(home_dir);
         let geosite_matcher = geosite::GeoSiteMatcher::new(home_dir);
+
+        // Collect the target associated with each RULE-SET reference so we can
+        // assign provider rules to the correct proxy target.
+        let mut ruleset_targets: HashMap<String, String> = HashMap::new();
+        for rule_str in rule_strings {
+            let trimmed = rule_str.trim();
+            if trimmed.starts_with("RULE-SET,") {
+                let parts: Vec<&str> = trimmed.splitn(3, ',').collect();
+                if parts.len() >= 3 {
+                    ruleset_targets
+                        .insert(parts[1].trim().to_string(), parts[2].trim().to_string());
+                }
+            }
+        }
+
+        // Load rule providers and merge their rules into our indexes.
+        for (name, prov_config) in providers {
+            let path = prov_config.path.as_ref().map(|p| {
+                let pb = PathBuf::from(p);
+                if pb.is_relative() {
+                    home_dir.join(pb)
+                } else {
+                    pb
+                }
+            });
+
+            let rp = provider::RuleProvider::new(
+                name.clone(),
+                &prov_config.provider_type,
+                prov_config.url.clone(),
+                path,
+                prov_config.interval.unwrap_or(86400),
+                prov_config.format.as_deref(),
+            );
+
+            if let Err(e) = rp.load().await {
+                tracing::warn!("Failed to load rule provider '{}': {}", name, e);
+                continue;
+            }
+
+            let loaded_rules = rp.rules().await;
+            let behavior = prov_config.behavior.as_deref().unwrap_or("domain");
+            let target = ruleset_targets
+                .get(name)
+                .cloned()
+                .unwrap_or_else(|| "DIRECT".to_string());
+
+            tracing::info!(
+                "Merging rule provider '{}' ({} behavior, {} rules) -> target '{}'",
+                name,
+                behavior,
+                loaded_rules.len(),
+                target
+            );
+
+            for payload in &loaded_rules {
+                let payload = payload.trim();
+                if payload.is_empty() || payload.starts_with('#') {
+                    continue;
+                }
+
+                match behavior {
+                    "domain" => {
+                        // Each line is a domain or domain suffix (e.g. "google.com" or "+.google.com")
+                        let domain_val = payload
+                            .trim_start_matches("+.")
+                            .trim_start_matches("'")
+                            .trim_end_matches("'")
+                            .to_lowercase();
+                        if !domain_val.is_empty() {
+                            // Treat as a suffix match (like DOMAIN-SUFFIX)
+                            domain_suffixes.push((domain_val, target.clone()));
+                        }
+                    }
+                    "ipcidr" => {
+                        // Each line is a CIDR notation (e.g. "192.168.0.0/16")
+                        cidrs.push((payload.to_string(), target.clone()));
+                    }
+                    "classical" => {
+                        // Each line is a full rule string, e.g. "DOMAIN-SUFFIX,google.com"
+                        // We parse it as a regular rule but use the RULE-SET target
+                        // if the line doesn't already specify one.
+                        let full_rule = if payload.matches(',').count() >= 2 {
+                            // Already has type,payload,target
+                            payload.to_string()
+                        } else {
+                            // Append target: "DOMAIN-SUFFIX,google.com" -> "DOMAIN-SUFFIX,google.com,target"
+                            format!("{},{}", payload, target)
+                        };
+
+                        if let Ok(parsed) = parse_rule(&full_rule) {
+                            match parsed.rule_type.as_str() {
+                                "DOMAIN" => {
+                                    domain_exact
+                                        .insert(parsed.payload.clone(), parsed.target.clone());
+                                }
+                                "DOMAIN-SUFFIX" => {
+                                    domain_suffixes
+                                        .push((parsed.payload.clone(), parsed.target.clone()));
+                                }
+                                "DOMAIN-KEYWORD" => {
+                                    domain_keywords
+                                        .push((parsed.payload.clone(), parsed.target.clone()));
+                                }
+                                "IP-CIDR" | "IP-CIDR6" => {
+                                    cidrs.push((parsed.payload.clone(), parsed.target.clone()));
+                                }
+                                "SRC-IP-CIDR" => {
+                                    src_cidrs.push((parsed.payload.clone(), parsed.target.clone()));
+                                }
+                                "DST-PORT" => {
+                                    if let Ok(port) = parsed.payload.parse::<u16>() {
+                                        port_rules.insert(port, parsed.target.clone());
+                                    }
+                                }
+                                _ => {
+                                    // Other types: add as sequential rule
+                                    rules.push(parsed);
+                                }
+                            }
+                        }
+                    }
+                    other => {
+                        tracing::warn!("Unknown rule provider behavior '{}' for '{}'", other, name);
+                    }
+                }
+            }
+        }
 
         for rule_str in rule_strings {
             let parsed = parse_rule(rule_str)?;
@@ -140,45 +268,67 @@ impl RuleEngine {
         })
     }
 
-    /// Match a connection against the rule engine and return the action.
-    pub fn match_rules(&self, metadata: &RuleMetadata) -> Action {
+    /// Match a connection and return (action, rule_type, rule_payload).
+    ///
+    /// This is used by the connection manager to populate the `rule` and
+    /// `rulePayload` fields in the connections API.
+    pub fn match_rules_detailed(&self, metadata: &RuleMetadata) -> (Action, String, String) {
         // 1. Domain-based rules (fast path)
         if let Some(ref domain) = metadata.domain {
-            if let Some(target) = self.domain_matcher.lookup(domain) {
-                return target_to_action(&target);
+            if let Some((rule_type, payload, target)) = self.domain_matcher.lookup_detailed(domain)
+            {
+                return (target_to_action(&target), rule_type, payload);
             }
         }
 
         // 2. IP-based rules (dst)
         if let Some(ref ip) = metadata.dst_ip {
             if let Some(target) = self.cidr_matcher.lookup(ip) {
-                return target_to_action(&target);
+                let rule_type = if ip.is_ipv6() { "IP-CIDR6" } else { "IP-CIDR" };
+                return (
+                    target_to_action(&target),
+                    rule_type.to_string(),
+                    ip.to_string(),
+                );
             }
         }
 
         // 3. SRC-IP-CIDR rules
         if let Some(ref ip) = metadata.src_ip {
             if let Some(target) = self.src_cidr_matcher.lookup(ip) {
-                return target_to_action(&target);
+                return (
+                    target_to_action(&target),
+                    "SRC-IP-CIDR".to_string(),
+                    ip.to_string(),
+                );
             }
         }
 
         // 4. Port rules
         if metadata.dst_port > 0 {
             if let Some(target) = self.port_rules.get(&metadata.dst_port) {
-                return target_to_action(target);
+                return (
+                    target_to_action(target),
+                    "DST-PORT".to_string(),
+                    metadata.dst_port.to_string(),
+                );
             }
         }
 
         // 5. Sequential fallback for complex rules
         for rule in &self.rules {
             if let Some(action) = self.match_single_rule(rule, metadata) {
-                return action;
+                return (action, rule.rule_type.clone(), rule.payload.clone());
             }
         }
 
         // Default: DIRECT
-        Action::Direct
+        (Action::Direct, "MATCH".to_string(), String::new())
+    }
+
+    /// Match a connection against the rule engine and return the action.
+    pub fn match_rules(&self, metadata: &RuleMetadata) -> Action {
+        self.match_rules_detailed(metadata).0
     }
 
     fn match_single_rule(&self, rule: &ParsedRule, metadata: &RuleMetadata) -> Option<Action> {
@@ -325,6 +475,11 @@ impl RuleEngine {
     /// Check if the GeoIP database is loaded.
     pub fn has_geoip(&self) -> bool {
         self.geoip_matcher.is_loaded()
+    }
+
+    /// Get a reference to the GeoIP matcher (for DNS fallback filtering, etc.)
+    pub fn geoip_matcher(&self) -> &geoip::GeoIpMatcher {
+        &self.geoip_matcher
     }
 }
 

@@ -7,9 +7,11 @@ use tokio::net::TcpStream;
 use tracing::debug;
 
 use crate::common::addr::Address;
-use crate::config::proxy::{ProxyConfig, WsOpts};
+use crate::config::proxy::{ProxyConfig, RealityOpts, WsOpts};
 use crate::dns::DnsResolver;
 use crate::proxy::{OutboundHandler, ProxyStream};
+use crate::transport::fingerprint::TlsFingerprint;
+use crate::transport::reality::{self, RealityConfig};
 use crate::transport::tcp::{self, ConnectOpts};
 use crate::transport::tls::{self, TlsOptions};
 use crate::transport::ws::{self, WsOptions};
@@ -28,6 +30,7 @@ pub struct TrojanOutbound {
     fingerprint: Option<String>,
     network: String,
     ws_opts: Option<WsOpts>,
+    reality_opts: Option<RealityOpts>,
     udp: bool,
     connect_opts: ConnectOpts,
 }
@@ -75,6 +78,7 @@ impl TrojanOutbound {
             fingerprint,
             network,
             ws_opts: config.ws_opts.clone(),
+            reality_opts: config.reality_opts.clone(),
             udp: config.udp.unwrap_or(true),
             connect_opts,
         })
@@ -90,6 +94,27 @@ impl TrojanOutbound {
         );
         let stream = tcp::connect(addr, &self.connect_opts).await?;
         Ok(stream)
+    }
+
+    /// Build a [`RealityConfig`] from the proxy config's `reality_opts`,
+    /// if present.  Returns `Ok(None)` when Reality is not configured.
+    fn build_reality_config(&self) -> Result<Option<RealityConfig>> {
+        let opts = match self.reality_opts {
+            Some(ref o) => o,
+            None => return Ok(None),
+        };
+
+        let public_key = opts
+            .public_key
+            .as_deref()
+            .context("Trojan Reality: missing 'public-key'")?;
+        let short_id = opts.short_id.as_deref().unwrap_or("");
+        let fp = TlsFingerprint::from_str_opt(self.fingerprint.as_deref());
+
+        let config = RealityConfig::from_opts(public_key, short_id, self.sni.clone(), fp)
+            .context("Trojan Reality: invalid configuration")?;
+
+        Ok(Some(config))
     }
 
     /// Build TLS options. Trojan always requires TLS.
@@ -147,29 +172,55 @@ impl OutboundHandler for TrojanOutbound {
         // Step 1: TCP connect to the Trojan server.
         let tcp_stream = self.dial_server(dns).await?;
 
-        // Step 2: TLS handshake (Trojan always requires TLS).
-        let tls_opts = self.tls_options();
-        let tls_stream = tls::wrap_tls(tcp_stream, &tls_opts)
-            .await
-            .context("Trojan: TLS handshake failed")?;
+        // Step 2: Check if Reality transport is configured.
+        if let Some(reality_config) = self.build_reality_config()? {
+            debug!("Trojan [{}]: using Reality transport", self.name);
 
-        // Step 3: Optional WebSocket upgrade.
-        match self.network.as_str() {
-            "ws" => {
-                let ws_opts = self.build_ws_options();
-                let ws_stream = ws::wrap_ws(tls_stream, &ws_opts)
-                    .await
-                    .context("Trojan: WebSocket upgrade failed")?;
+            let reality_stream = reality::wrap_reality(tcp_stream, &reality_config)
+                .await
+                .context("Trojan: Reality handshake failed")?;
 
-                let header = encode_request(&self.password_hash, CMD_TCP, target);
-                let trojan_stream = TrojanStream::new(ws_stream, header);
-                Ok(Box::new(trojan_stream))
+            match self.network.as_str() {
+                "ws" => {
+                    let ws_opts = self.build_ws_options();
+                    let ws_stream = ws::wrap_ws(reality_stream, &ws_opts)
+                        .await
+                        .context("Trojan: WebSocket upgrade over Reality failed")?;
+
+                    let header = encode_request(&self.password_hash, CMD_TCP, target);
+                    let trojan_stream = TrojanStream::new(ws_stream, header);
+                    Ok(Box::new(trojan_stream))
+                }
+                _ => {
+                    let header = encode_request(&self.password_hash, CMD_TCP, target);
+                    let trojan_stream = TrojanStream::new(reality_stream, header);
+                    Ok(Box::new(trojan_stream))
+                }
             }
-            _ => {
-                // TLS only (standard Trojan).
-                let header = encode_request(&self.password_hash, CMD_TCP, target);
-                let trojan_stream = TrojanStream::new(tls_stream, header);
-                Ok(Box::new(trojan_stream))
+        } else {
+            // Standard TLS transport (Trojan always requires TLS).
+            let tls_opts = self.tls_options();
+            let tls_stream = tls::wrap_tls(tcp_stream, &tls_opts)
+                .await
+                .context("Trojan: TLS handshake failed")?;
+
+            match self.network.as_str() {
+                "ws" => {
+                    let ws_opts = self.build_ws_options();
+                    let ws_stream = ws::wrap_ws(tls_stream, &ws_opts)
+                        .await
+                        .context("Trojan: WebSocket upgrade failed")?;
+
+                    let header = encode_request(&self.password_hash, CMD_TCP, target);
+                    let trojan_stream = TrojanStream::new(ws_stream, header);
+                    Ok(Box::new(trojan_stream))
+                }
+                _ => {
+                    // TLS only (standard Trojan).
+                    let header = encode_request(&self.password_hash, CMD_TCP, target);
+                    let trojan_stream = TrojanStream::new(tls_stream, header);
+                    Ok(Box::new(trojan_stream))
+                }
             }
         }
     }

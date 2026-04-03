@@ -4,7 +4,9 @@
 use anyhow::Result;
 use clap::Parser;
 use std::path::PathBuf;
+use std::sync::Arc;
 use tokio::signal;
+use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
 mod api;
@@ -12,11 +14,13 @@ mod common;
 mod config;
 mod conn;
 mod dns;
+mod inbound;
 mod proxy;
 mod proxy_group;
 mod rules;
 mod sniffer;
 mod stack;
+mod store;
 mod transport;
 mod tun;
 
@@ -94,17 +98,151 @@ fn version_string() -> String {
     format!("Mihomo Meta v{VERSION} {os}/{arch} (miemietron)")
 }
 
+/// Shared application state that supports hot-reload.
+///
+/// Components behind `parking_lot::RwLock<Arc<T>>` can be swapped atomically
+/// on reload. Readers clone the inner `Arc` (cheap) and use it, so existing
+/// connections continue with the old state while new connections pick up
+/// the new state.
+pub struct AppState {
+    pub config: parking_lot::RwLock<Arc<MiemieConfig>>,
+    pub rule_engine: parking_lot::RwLock<Arc<rules::RuleEngine>>,
+    pub proxy_manager: parking_lot::RwLock<Arc<proxy::ProxyManager>>,
+    pub dns_resolver: parking_lot::RwLock<Arc<dns::DnsResolver>>,
+    pub stats: Arc<conn::StatsManager>,
+    pub runtime_config: parking_lot::RwLock<api::RuntimeConfig>,
+    pub home_dir: PathBuf,
+    pub config_path: parking_lot::RwLock<PathBuf>,
+    /// Channel for the API to request a config reload (used by POST /restart).
+    pub restart_tx: mpsc::Sender<()>,
+}
+
+impl AppState {
+    /// Snapshot the current config Arc (cheap clone).
+    pub fn config(&self) -> Arc<MiemieConfig> {
+        self.config.read().clone()
+    }
+
+    /// Snapshot the current rule engine Arc.
+    pub fn rule_engine(&self) -> Arc<rules::RuleEngine> {
+        self.rule_engine.read().clone()
+    }
+
+    /// Snapshot the current proxy manager Arc.
+    pub fn proxy_manager(&self) -> Arc<proxy::ProxyManager> {
+        self.proxy_manager.read().clone()
+    }
+
+    /// Snapshot the current DNS resolver Arc.
+    pub fn dns_resolver(&self) -> Arc<dns::DnsResolver> {
+        self.dns_resolver.read().clone()
+    }
+
+    /// Perform a full hot-reload from a new config.
+    /// Builds new RuleEngine, ProxyManager, and DnsResolver, then swaps them in.
+    pub async fn reload_from_config(&self, new_config: MiemieConfig) -> Result<()> {
+        let home_dir = &self.home_dir;
+
+        // Build new components from the new config
+        let new_dns = dns::DnsResolver::new(&new_config.dns).await?;
+        let new_rules = rules::RuleEngine::with_home_dir(
+            &new_config.rules,
+            &new_config.rule_providers,
+            home_dir,
+        )
+        .await?;
+        let new_proxies = proxy::ProxyManager::new(
+            &new_config.proxies,
+            &new_config.proxy_groups,
+            &new_config.proxy_providers,
+        )
+        .await?;
+
+        // If store-selected is enabled, restore saved selections
+        let store_selected = new_config
+            .profile
+            .as_ref()
+            .map(|p| p.store_selected)
+            .unwrap_or(false);
+        if store_selected {
+            let saved = store::load_selected(home_dir);
+            if !saved.is_empty() {
+                new_proxies.apply_saved_selections(&saved);
+                info!("Restored {} saved proxy selections", saved.len());
+            }
+        }
+
+        let rule_count = new_rules.rule_count();
+        let proxy_count = new_proxies.proxy_count();
+
+        // Swap in the new components atomically
+        {
+            let mut rt = self.runtime_config.write();
+            if rt.mode != new_config.mode {
+                info!(
+                    "Config reload: mode changed {} -> {}",
+                    rt.mode, new_config.mode
+                );
+                rt.mode = new_config.mode.clone();
+            }
+            if rt.log_level != new_config.log_level {
+                info!(
+                    "Config reload: log-level changed {} -> {}",
+                    rt.log_level, new_config.log_level
+                );
+                rt.log_level = new_config.log_level.clone();
+            }
+        }
+
+        *self.dns_resolver.write() = Arc::new(new_dns);
+        *self.rule_engine.write() = Arc::new(new_rules);
+        *self.proxy_manager.write() = Arc::new(new_proxies);
+        *self.config.write() = Arc::new(new_config);
+
+        info!(
+            "Config reload complete: {} rules, {} proxies",
+            rule_count, proxy_count
+        );
+
+        Ok(())
+    }
+
+    /// Perform a full hot-reload from a config file path.
+    pub async fn reload_from_path(&self, path: &std::path::Path) -> Result<()> {
+        info!("Reloading config from: {}", path.display());
+        let new_config = MiemieConfig::load(path)?;
+        self.reload_from_config(new_config).await
+    }
+
+    /// Perform a full hot-reload from a YAML string.
+    pub async fn reload_from_str(&self, yaml: &str) -> Result<()> {
+        let new_config = MiemieConfig::parse_str(yaml)?;
+        self.reload_from_config(new_config).await
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    // Initialize logging
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+    // Initialize logging with the broadcast layer for the /logs API
+    {
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::util::SubscriberInitExt;
+
+        let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+
+        let fmt_layer = tracing_subscriber::fmt::layer();
+
+        let broadcast_layer = api::logs::BroadcastLayer::new(api::logs::global_log_broadcast());
+
+        tracing_subscriber::registry()
+            .with(env_filter)
+            .with(fmt_layer)
+            .with(broadcast_layer)
+            .init();
+    }
 
     // -v: print version in mihomo-compatible format
     // OpenClash runs: `$CLASH -v | awk '{print $3}'` to extract version
@@ -150,7 +288,7 @@ async fn main() -> Result<()> {
     // Store home_dir for GeoIP/GeoSite loading
     let home_dir = cli.home_dir.clone().unwrap_or_else(default_home_dir);
 
-    let engine = Engine::new(config, home_dir).await?;
+    let engine = Engine::new(config, home_dir, config_path).await?;
     engine.run().await?;
 
     Ok(())
@@ -159,50 +297,107 @@ async fn main() -> Result<()> {
 pub struct Engine {
     config: MiemieConfig,
     home_dir: PathBuf,
+    config_path: PathBuf,
 }
 
 impl Engine {
-    async fn new(config: MiemieConfig, home_dir: PathBuf) -> Result<Self> {
-        Ok(Self { config, home_dir })
+    async fn new(config: MiemieConfig, home_dir: PathBuf, config_path: PathBuf) -> Result<Self> {
+        Ok(Self {
+            config,
+            home_dir,
+            config_path,
+        })
     }
 
     async fn run(self) -> Result<()> {
-        let config = std::sync::Arc::new(self.config);
-        let _home_dir = self.home_dir;
+        let home_dir = self.home_dir;
+        let config_path = self.config_path;
 
         // Start DNS resolver
-        let dns_resolver = std::sync::Arc::new(dns::DnsResolver::new(&config.dns).await?);
+        let dns_resolver = Arc::new(dns::DnsResolver::new(&self.config.dns).await?);
         info!("DNS resolver started");
 
+        // Load FakeIP persistence if enabled
+        let store_fake_ip = self
+            .config
+            .profile
+            .as_ref()
+            .map(|p| p.store_fake_ip)
+            .unwrap_or(false);
+        let fakeip_path = home_dir.join("cache").join("fakeip.json");
+        if store_fake_ip {
+            if let Some(parent) = fakeip_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if let Err(e) = dns_resolver.load_fakeip(&fakeip_path) {
+                warn!("Failed to load FakeIP cache: {}", e);
+            }
+        }
+
         // Build rule engine
-        let rule_engine = std::sync::Arc::new(
-            rules::RuleEngine::new(&config.rules, &config.rule_providers).await?,
+        let rule_engine = Arc::new(
+            rules::RuleEngine::with_home_dir(
+                &self.config.rules,
+                &self.config.rule_providers,
+                &home_dir,
+            )
+            .await?,
         );
         info!("Rule engine loaded with {} rules", rule_engine.rule_count());
 
         // Build proxy manager
-        let proxy_manager = std::sync::Arc::new(
+        let proxy_manager = Arc::new(
             proxy::ProxyManager::new(
-                &config.proxies,
-                &config.proxy_groups,
-                &config.proxy_providers,
+                &self.config.proxies,
+                &self.config.proxy_groups,
+                &self.config.proxy_providers,
             )
             .await?,
         );
+
+        // Restore saved proxy selections if store-selected is enabled
+        let store_selected = self
+            .config
+            .profile
+            .as_ref()
+            .map(|p| p.store_selected)
+            .unwrap_or(false);
+        if store_selected {
+            let saved = store::load_selected(&home_dir);
+            if !saved.is_empty() {
+                proxy_manager.apply_saved_selections(&saved);
+                info!("Restored {} saved proxy selections", saved.len());
+            }
+        }
+
         info!(
             "Proxy manager loaded with {} proxies",
             proxy_manager.proxy_count()
         );
 
+        // Build shared application state
+        let stats = Arc::new(conn::StatsManager::new());
+        let (restart_tx, mut restart_rx) = mpsc::channel::<()>(1);
+        let app_state = Arc::new(AppState {
+            config: parking_lot::RwLock::new(Arc::new(self.config.clone())),
+            rule_engine: parking_lot::RwLock::new(rule_engine.clone()),
+            proxy_manager: parking_lot::RwLock::new(proxy_manager.clone()),
+            dns_resolver: parking_lot::RwLock::new(dns_resolver.clone()),
+            stats: stats.clone(),
+            runtime_config: parking_lot::RwLock::new(api::RuntimeConfig {
+                mode: self.config.mode.clone(),
+                log_level: self.config.log_level.clone(),
+            }),
+            home_dir: home_dir.clone(),
+            config_path: parking_lot::RwLock::new(config_path.clone()),
+            restart_tx,
+        });
+
         // Start connection manager
-        let stats = std::sync::Arc::new(conn::StatsManager::new());
-        let conn_manager = std::sync::Arc::new(conn::ConnectionManager::new(
-            dns_resolver.clone(),
-            rule_engine.clone(),
-            proxy_manager.clone(),
-            stats.clone(),
-            config.clone(),
-        ));
+        let conn_manager = Arc::new(conn::ConnectionManager::new(app_state.clone()));
+
+        // Build runtime config reference for backward compat
+        let config = app_state.config();
 
         // Start API server
         let ext_ctl_addr = config.external_controller.clone();
@@ -210,12 +405,8 @@ impl Engine {
         let api_handle = if let Some(ref addr) = ext_ctl_addr {
             let addr = addr.clone();
             let api_state = api::ApiState {
-                config: config.clone(),
-                proxy_manager: proxy_manager.clone(),
-                rule_engine: rule_engine.clone(),
+                app: app_state.clone(),
                 conn_manager: conn_manager.clone(),
-                stats: stats.clone(),
-                dns_resolver: dns_resolver.clone(),
             };
             Some(tokio::spawn(async move {
                 if let Err(e) = api::start_server(&addr, api_secret, api_state).await {
@@ -257,28 +448,130 @@ impl Engine {
             None
         };
 
+        // Start inbound proxy listeners (HTTP, SOCKS5, mixed-port)
+        let mut inbound_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+
+        let bind_ip: std::net::IpAddr = if config.allow_lan {
+            if config.bind_address == "*" {
+                std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
+            } else {
+                config
+                    .bind_address
+                    .parse()
+                    .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))
+            }
+        } else {
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+        };
+
+        if config.mixed_port > 0 {
+            let addr = std::net::SocketAddr::new(bind_ip, config.mixed_port);
+            let cm = conn_manager.clone();
+            inbound_handles.push(tokio::spawn(async move {
+                if let Err(e) = inbound::run_mixed_proxy(addr, cm).await {
+                    error!("Mixed proxy error: {}", e);
+                }
+            }));
+            info!("Mixed proxy (HTTP+SOCKS5) on {}", addr);
+        }
+
+        if config.port > 0 {
+            let addr = std::net::SocketAddr::new(bind_ip, config.port);
+            let cm = conn_manager.clone();
+            inbound_handles.push(tokio::spawn(async move {
+                if let Err(e) = inbound::http::run_http_proxy(addr, cm).await {
+                    error!("HTTP proxy error: {}", e);
+                }
+            }));
+            info!("HTTP proxy on {}", addr);
+        }
+
+        if config.socks_port > 0 {
+            let addr = std::net::SocketAddr::new(bind_ip, config.socks_port);
+            let cm = conn_manager.clone();
+            inbound_handles.push(tokio::spawn(async move {
+                if let Err(e) = inbound::socks::run_socks_proxy(addr, cm).await {
+                    error!("SOCKS5 proxy error: {}", e);
+                }
+            }));
+            info!("SOCKS5 proxy on {}", addr);
+        }
+
+        // Spawn background health checks for url-test and fallback groups
+        let health_handles = proxy_group::health::spawn_health_checks(
+            proxy_manager.list_live_groups(),
+            proxy_manager.proxies_map().clone(),
+        );
+        if !health_handles.is_empty() {
+            info!("Spawned {} health check tasks", health_handles.len());
+        }
+
+        // Spawn periodic FakeIP persistence task (every 60s)
+        let fakeip_save_handle = if store_fake_ip {
+            let resolver = dns_resolver.clone();
+            let path = fakeip_path.clone();
+            Some(tokio::spawn(async move {
+                let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
+                loop {
+                    interval.tick().await;
+                    if let Err(e) = resolver.save_fakeip(&path) {
+                        warn!("Failed to save FakeIP cache: {}", e);
+                    }
+                }
+            }))
+        } else {
+            None
+        };
+
         info!("Miemietron started successfully");
 
-        // Wait for shutdown or reload signal
+        // Wait for shutdown, reload signal, or API-triggered restart
         loop {
-            let sig = shutdown_or_reload_signal().await;
-            match sig {
-                Signal::Shutdown => {
-                    info!("Shutting down...");
-                    break;
+            tokio::select! {
+                sig = shutdown_or_reload_signal() => {
+                    match sig {
+                        Signal::Shutdown => {
+                            info!("Shutting down...");
+                            break;
+                        }
+                        Signal::Reload => {
+                            info!("SIGHUP received, performing full config reload...");
+                            let path = app_state.config_path.read().clone();
+                            if let Err(e) = app_state.reload_from_path(&path).await {
+                                error!("Config reload failed: {}", e);
+                            }
+                        }
+                    }
                 }
-                Signal::Reload => {
-                    info!("SIGHUP received, reloading config...");
-                    // TODO: implement full hot-reload (re-parse config, rebuild rules/proxies)
-                    // For now, log it — OpenClash expects SIGHUP to be handled
-                    info!(
-                        "Config reload not yet fully implemented, continuing with current config"
-                    );
+                _ = restart_rx.recv() => {
+                    info!("Restart requested via API, performing full config reload...");
+                    let path = app_state.config_path.read().clone();
+                    if let Err(e) = app_state.reload_from_path(&path).await {
+                        error!("Config reload (restart) failed: {}", e);
+                    }
                 }
             }
         }
 
+        // Save FakeIP state on shutdown
+        if store_fake_ip {
+            if let Err(e) = dns_resolver.save_fakeip(&fakeip_path) {
+                warn!("Failed to save FakeIP cache on shutdown: {}", e);
+            } else {
+                info!("FakeIP cache saved");
+            }
+        }
+
         // Cleanup
+        if let Some(h) = fakeip_save_handle {
+            h.abort();
+        }
+        for h in inbound_handles {
+            h.abort();
+        }
+        for h in health_handles {
+            h.abort();
+        }
         if let Some(h) = tun_handle {
             h.abort();
         }
@@ -287,6 +580,13 @@ impl Engine {
         }
         if let Some(h) = dns_handle {
             h.abort();
+        }
+
+        // Clean up iptables and routing rules
+        if config.tun.enable {
+            if let Err(e) = tun::cleanup(&config.tun).await {
+                warn!("TUN cleanup error: {}", e);
+            }
         }
 
         info!("Goodbye!");

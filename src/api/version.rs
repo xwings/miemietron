@@ -1,5 +1,7 @@
-use axum::{http::StatusCode, Json};
+use axum::{extract::State, http::StatusCode, Json};
 use serde_json::{json, Value};
+
+use super::ApiState;
 
 pub async fn get_version() -> Json<Value> {
     Json(json!({
@@ -22,9 +24,22 @@ pub async fn get_gc() -> StatusCode {
     StatusCode::OK
 }
 
-pub async fn post_restart() -> Json<Value> {
-    // TODO: implement graceful restart
+pub async fn post_restart(State(state): State<ApiState>) -> Json<Value> {
+    // Send a restart signal to the main loop, which performs a full config reload
+    // (rebuilds DNS, rules, proxies — equivalent to SIGHUP).
+    let _ = state.app.restart_tx.try_send(());
+    tracing::info!("Restart requested via API");
     Json(json!({"status": "ok"}))
+}
+
+/// POST /upgrade — core self-upgrade stub.
+pub async fn post_upgrade_stub() -> Json<Value> {
+    Json(json!({"status": "ok"}))
+}
+
+/// PUT /debug/gc — trigger GC (no-op in Rust).
+pub async fn put_debug_gc() -> StatusCode {
+    StatusCode::OK
 }
 
 fn get_memory_usage() -> u64 {

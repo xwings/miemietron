@@ -31,6 +31,10 @@ pub struct ProxyConfig {
     #[serde(default)]
     pub plugin_opts: Option<HashMap<String, serde_yaml::Value>>,
 
+    // VMess fields
+    #[serde(default, alias = "alterId")]
+    pub alter_id: Option<u16>,
+
     // VLESS fields
     #[serde(default)]
     pub uuid: Option<String>,
