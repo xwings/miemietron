@@ -313,4 +313,155 @@ mod tests {
         assert_eq!(pool.lookup_ip("test.com"), Some(ip));
         assert_eq!(pool.lookup_ip("nonexistent.com"), None);
     }
+
+    // ---- Additional wildcard filter tests ----
+
+    #[test]
+    fn wildcard_filter_matches_subdomain() {
+        let filter = vec!["*.example.com".to_string()];
+        let pool = FakeIpPool::new("198.18.0.0/24", &filter, "blacklist").unwrap();
+        assert!(pool.should_bypass("foo.example.com"));
+        assert!(pool.should_bypass("bar.example.com"));
+        assert!(pool.should_bypass("deep.sub.example.com"));
+    }
+
+    #[test]
+    fn wildcard_filter_matches_exact_domain() {
+        // *.example.com should also match "example.com" itself
+        let filter = vec!["*.example.com".to_string()];
+        let pool = FakeIpPool::new("198.18.0.0/24", &filter, "blacklist").unwrap();
+        assert!(pool.should_bypass("example.com"));
+    }
+
+    #[test]
+    fn wildcard_filter_does_not_match_partial() {
+        let filter = vec!["*.example.com".to_string()];
+        let pool = FakeIpPool::new("198.18.0.0/24", &filter, "blacklist").unwrap();
+        // "notexample.com" should NOT match *.example.com
+        assert!(!pool.should_bypass("notexample.com"));
+        assert!(!pool.should_bypass("other.com"));
+    }
+
+    #[test]
+    fn wildcard_filter_star_lan() {
+        let filter = vec!["*.lan".to_string()];
+        let pool = FakeIpPool::new("198.18.0.0/24", &filter, "blacklist").unwrap();
+        assert!(pool.should_bypass("router.lan"));
+        assert!(pool.should_bypass("nas.lan"));
+        assert!(pool.should_bypass("lan")); // exact match
+        assert!(!pool.should_bypass("lanmore.com"));
+    }
+
+    #[test]
+    fn wildcard_filter_star_local() {
+        let filter = vec!["*.local".to_string()];
+        let pool = FakeIpPool::new("198.18.0.0/24", &filter, "blacklist").unwrap();
+        assert!(pool.should_bypass("myhost.local"));
+        assert!(pool.should_bypass("local"));
+        assert!(!pool.should_bypass("localhost")); // not a suffix match for .local
+    }
+
+    #[test]
+    fn exact_filter_match() {
+        let filter = vec!["dns.msftncsi.com".to_string()];
+        let pool = FakeIpPool::new("198.18.0.0/24", &filter, "blacklist").unwrap();
+        assert!(pool.should_bypass("dns.msftncsi.com"));
+        assert!(!pool.should_bypass("sub.dns.msftncsi.com"));
+        assert!(!pool.should_bypass("other.com"));
+    }
+
+    #[test]
+    fn plus_prefix_filter() {
+        let filter = vec!["+.google.com".to_string()];
+        let pool = FakeIpPool::new("198.18.0.0/24", &filter, "blacklist").unwrap();
+        assert!(pool.should_bypass("www.google.com"));
+        assert!(pool.should_bypass("mail.google.com"));
+        // "google.com" does NOT end with ".google.com" (the + prefix strips
+        // only the '+', so the suffix becomes ".google.com" which is longer)
+        assert!(!pool.should_bypass("google.com"));
+    }
+
+    // ---- Whitelist mode tests ----
+
+    #[test]
+    fn whitelist_only_matching_domains_get_fakeip() {
+        let filter = vec!["*.example.com".to_string(), "specific.org".to_string()];
+        let pool = FakeIpPool::new("198.18.0.0/24", &filter, "whitelist").unwrap();
+
+        // Matches filter -> should NOT bypass (gets fake IP in whitelist mode)
+        assert!(!pool.should_bypass("foo.example.com"));
+        assert!(!pool.should_bypass("specific.org"));
+
+        // Does NOT match filter -> should bypass (no fake IP)
+        assert!(pool.should_bypass("google.com"));
+        assert!(pool.should_bypass("random.org"));
+        assert!(pool.should_bypass("other.specific.org"));
+    }
+
+    #[test]
+    fn whitelist_empty_filter_bypasses_everything() {
+        let pool = FakeIpPool::new("198.18.0.0/24", &[], "whitelist").unwrap();
+        // With empty whitelist, nothing matches -> everything is bypassed
+        assert!(pool.should_bypass("any.domain.com"));
+        assert!(pool.should_bypass("example.com"));
+    }
+
+    #[test]
+    fn blacklist_empty_filter_bypasses_nothing() {
+        let pool = FakeIpPool::new("198.18.0.0/24", &[], "blacklist").unwrap();
+        // With empty blacklist, nothing matches -> nothing is bypassed
+        assert!(!pool.should_bypass("any.domain.com"));
+        assert!(!pool.should_bypass("example.com"));
+    }
+
+    // ---- Multiple filters combined ----
+
+    #[test]
+    fn multiple_filters_blacklist() {
+        let filter = vec![
+            "*.lan".to_string(),
+            "*.local".to_string(),
+            "localhost".to_string(),
+            "dns.msftncsi.com".to_string(),
+        ];
+        let pool = FakeIpPool::new("198.18.0.0/24", &filter, "blacklist").unwrap();
+        assert!(pool.should_bypass("router.lan"));
+        assert!(pool.should_bypass("mypc.local"));
+        assert!(pool.should_bypass("localhost"));
+        assert!(pool.should_bypass("dns.msftncsi.com"));
+        assert!(!pool.should_bypass("google.com"));
+        assert!(!pool.should_bypass("example.com"));
+    }
+
+    // ---- Save/Load persistence ----
+
+    #[test]
+    fn save_and_load_round_trip() {
+        let pool = make_pool();
+        let ip1 = pool.allocate("a.com");
+        let ip2 = pool.allocate("b.com");
+
+        let tmp = std::env::temp_dir().join("fakeip_test.json");
+        pool.save(&tmp).unwrap();
+
+        // Create a new pool and load from the saved file
+        let pool2 = make_pool();
+        pool2.load(&tmp).unwrap();
+
+        assert_eq!(pool2.lookup_domain(&ip1), Some("a.com".to_string()));
+        assert_eq!(pool2.lookup_domain(&ip2), Some("b.com".to_string()));
+        assert_eq!(pool2.lookup_ip("a.com"), Some(ip1));
+        assert_eq!(pool2.lookup_ip("b.com"), Some(ip2));
+
+        // Clean up
+        std::fs::remove_file(&tmp).ok();
+    }
+
+    #[test]
+    fn load_nonexistent_file_is_ok() {
+        let pool = make_pool();
+        let result = pool.load(Path::new("/tmp/nonexistent_fakeip_test_12345.json"));
+        assert!(result.is_ok());
+        assert_eq!(pool.size(), 0);
+    }
 }

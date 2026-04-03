@@ -366,4 +366,131 @@ mod tests {
     fn sniff_domain_empty() {
         assert_eq!(sniff_domain(&[]), None);
     }
+
+    // --- Additional HTTP Host header tests ---
+
+    #[test]
+    fn extract_http_host_put() {
+        let data = b"PUT /resource HTTP/1.1\r\nHost: put.example.com\r\n\r\n";
+        assert_eq!(extract_http_host(data), Some("put.example.com".to_string()));
+    }
+
+    #[test]
+    fn extract_http_host_delete() {
+        let data = b"DELETE /item/42 HTTP/1.1\r\nHost: api.delete.com\r\n\r\n";
+        assert_eq!(extract_http_host(data), Some("api.delete.com".to_string()));
+    }
+
+    #[test]
+    fn extract_http_host_head() {
+        let data = b"HEAD / HTTP/1.1\r\nHost: head.example.com\r\n\r\n";
+        assert_eq!(
+            extract_http_host(data),
+            Some("head.example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_http_host_options() {
+        let data = b"OPTIONS * HTTP/1.1\r\nHost: options.example.com\r\n\r\n";
+        assert_eq!(
+            extract_http_host(data),
+            Some("options.example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_http_host_patch() {
+        let data = b"PATCH /item HTTP/1.1\r\nHost: patch.example.com\r\nContent-Type: application/json\r\n\r\n{}";
+        assert_eq!(
+            extract_http_host(data),
+            Some("patch.example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_http_host_trace() {
+        let data = b"TRACE / HTTP/1.1\r\nHost: trace.example.com\r\n\r\n";
+        assert_eq!(
+            extract_http_host(data),
+            Some("trace.example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_http_host_strips_standard_port_443() {
+        let data = b"GET / HTTP/1.1\r\nHost: secure.example.com:443\r\n\r\n";
+        assert_eq!(
+            extract_http_host(data),
+            Some("secure.example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_http_host_strips_nonstandard_port() {
+        let data = b"GET / HTTP/1.1\r\nHost: app.example.com:3000\r\n\r\n";
+        assert_eq!(extract_http_host(data), Some("app.example.com".to_string()));
+    }
+
+    #[test]
+    fn extract_http_host_ipv6_literal_returns_none() {
+        let data = b"GET / HTTP/1.1\r\nHost: [::1]:80\r\n\r\n";
+        assert_eq!(extract_http_host(data), None);
+    }
+
+    #[test]
+    fn extract_http_host_not_http_method() {
+        let data = b"INVALID / HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        assert_eq!(extract_http_host(data), None);
+    }
+
+    #[test]
+    fn extract_http_host_missing_host_header() {
+        let data = b"GET / HTTP/1.1\r\nAccept: */*\r\n\r\n";
+        assert_eq!(extract_http_host(data), None);
+    }
+
+    #[test]
+    fn extract_http_host_connect_with_port() {
+        let data =
+            b"CONNECT proxy.example.com:8443 HTTP/1.1\r\nHost: proxy.example.com:8443\r\n\r\n";
+        assert_eq!(
+            extract_http_host(data),
+            Some("proxy.example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_http_host_with_extra_whitespace() {
+        let data = b"GET / HTTP/1.1\r\nHost:   spaced.example.com  \r\n\r\n";
+        assert_eq!(
+            extract_http_host(data),
+            Some("spaced.example.com".to_string())
+        );
+    }
+
+    // --- Additional sniff_domain dispatch tests ---
+
+    #[test]
+    fn sniff_domain_non_tls_non_http() {
+        // Random binary data starting with something other than 0x16
+        let data = &[0x50, 0x51, 0x52, 0x53, 0x54];
+        assert_eq!(sniff_domain(data), None);
+    }
+
+    #[test]
+    fn sniff_domain_prefers_tls_over_http() {
+        // Data starting with 0x16 should try TLS first
+        let packet = build_client_hello("tls-priority.example.com");
+        assert_eq!(
+            sniff_domain(&packet),
+            Some("tls-priority.example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn sniff_domain_single_byte() {
+        assert_eq!(sniff_domain(&[0x00]), None);
+        assert_eq!(sniff_domain(&[0x16]), None); // TLS marker but truncated
+    }
 }

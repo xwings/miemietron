@@ -286,3 +286,65 @@ where
             .map_err(io::Error::other)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ws_options_default() {
+        let opts = WsOptions::default();
+        assert!(opts.host.is_empty());
+        assert!(opts.path.is_empty());
+        assert!(opts.headers.is_empty());
+    }
+
+    #[test]
+    fn ws_options_construction() {
+        let opts = WsOptions {
+            host: "example.com".to_string(),
+            path: "/ws".to_string(),
+            headers: vec![
+                ("X-Custom".to_string(), "value1".to_string()),
+                ("Authorization".to_string(), "Bearer tok".to_string()),
+            ],
+        };
+        assert_eq!(opts.host, "example.com");
+        assert_eq!(opts.path, "/ws");
+        assert_eq!(opts.headers.len(), 2);
+        assert_eq!(opts.headers[0].0, "X-Custom");
+        assert_eq!(opts.headers[0].1, "value1");
+        assert_eq!(opts.headers[1].0, "Authorization");
+        assert_eq!(opts.headers[1].1, "Bearer tok");
+    }
+
+    #[test]
+    fn ws_options_clone() {
+        let opts = WsOptions {
+            host: "host.com".to_string(),
+            path: "/path".to_string(),
+            headers: vec![("key".to_string(), "val".to_string())],
+        };
+        let cloned = opts.clone();
+        assert_eq!(cloned.host, opts.host);
+        assert_eq!(cloned.path, opts.path);
+        assert_eq!(cloned.headers, opts.headers);
+    }
+
+    #[test]
+    fn ws_options_debug() {
+        let opts = WsOptions {
+            host: "test.com".to_string(),
+            path: "/".to_string(),
+            headers: vec![],
+        };
+        let debug_str = format!("{:?}", opts);
+        assert!(debug_str.contains("test.com"));
+        assert!(debug_str.contains("WsOptions"));
+    }
+
+    #[test]
+    fn default_max_early_data_is_2048() {
+        assert_eq!(DEFAULT_MAX_EARLY_DATA, 2048);
+    }
+}

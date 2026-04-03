@@ -152,3 +152,157 @@ fn default_cache_algorithm() -> String {
 fn default_geoip_code() -> String {
     "CN".to_string()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_dns_config_has_correct_defaults() {
+        let yaml = "{}";
+        let config: DnsConfig = serde_yaml::from_str(yaml).unwrap();
+
+        assert!(!config.enable);
+        assert_eq!(config.listen, "0.0.0.0:1053");
+        assert!(!config.ipv6);
+        assert!(!config.prefer_h3);
+        assert!(config.use_hosts);
+        assert!(config.use_system_hosts);
+        assert!(!config.respect_rules);
+        assert_eq!(config.enhanced_mode, "fake-ip");
+        assert_eq!(config.fake_ip_range, "198.18.0.0/15");
+        assert_eq!(config.fake_ip_ttl, 3600);
+        assert!(config.fake_ip_filter.is_empty());
+        assert_eq!(config.fake_ip_filter_mode, "blacklist");
+        assert_eq!(
+            config.default_nameserver,
+            vec!["114.114.114.114".to_string(), "8.8.8.8".to_string()]
+        );
+        assert!(config.nameserver.is_empty());
+        assert!(config.fallback.is_empty());
+        assert!(config.fallback_filter.is_none());
+        assert!(config.nameserver_policy.is_empty());
+        assert!(config.proxy_server_nameserver.is_empty());
+        assert!(config.direct_nameserver.is_empty());
+        assert!(!config.direct_nameserver_follow_policy);
+        assert_eq!(config.cache_algorithm, "arc");
+        assert_eq!(config.cache_max_size, 0);
+    }
+
+    #[test]
+    fn full_dns_config_parses_all_fields() {
+        let yaml = r#"
+enable: true
+listen: "127.0.0.1:5353"
+ipv6: true
+prefer-h3: true
+use-hosts: false
+use-system-hosts: false
+respect-rules: true
+enhanced-mode: redir-host
+fake-ip-range: "10.0.0.0/8"
+fake-ip-ttl: 7200
+fake-ip-filter:
+  - "*.lan"
+  - "dns.msftncsi.com"
+fake-ip-filter-mode: whitelist
+default-nameserver:
+  - "1.1.1.1"
+nameserver:
+  - "https://1.1.1.1/dns-query"
+  - "tls://8.8.8.8:853"
+fallback:
+  - "https://1.0.0.1/dns-query"
+fallback-filter:
+  geoip: true
+  geoip-code: US
+  ipcidr:
+    - "240.0.0.0/4"
+  domain:
+    - "+.google.com"
+nameserver-policy:
+  "geosite:cn": "114.114.114.114"
+proxy-server-nameserver:
+  - "https://1.1.1.1/dns-query"
+direct-nameserver:
+  - "114.114.114.114"
+direct-nameserver-follow-policy: true
+cache-algorithm: lru
+cache-max-size: 1000
+"#;
+        let config: DnsConfig = serde_yaml::from_str(yaml).unwrap();
+
+        assert!(config.enable);
+        assert_eq!(config.listen, "127.0.0.1:5353");
+        assert!(config.ipv6);
+        assert!(config.prefer_h3);
+        assert!(!config.use_hosts);
+        assert!(!config.use_system_hosts);
+        assert!(config.respect_rules);
+        assert_eq!(config.enhanced_mode, "redir-host");
+        assert_eq!(config.fake_ip_range, "10.0.0.0/8");
+        assert_eq!(config.fake_ip_ttl, 7200);
+        assert_eq!(config.fake_ip_filter, vec!["*.lan", "dns.msftncsi.com"]);
+        assert_eq!(config.fake_ip_filter_mode, "whitelist");
+        assert_eq!(config.default_nameserver, vec!["1.1.1.1"]);
+        assert_eq!(config.nameserver.len(), 2);
+        assert_eq!(config.fallback.len(), 1);
+
+        let ff = config.fallback_filter.as_ref().unwrap();
+        assert!(ff.geoip);
+        assert_eq!(ff.geoip_code, "US");
+        assert_eq!(ff.ipcidr, vec!["240.0.0.0/4"]);
+        assert_eq!(ff.domain, vec!["+.google.com"]);
+
+        assert_eq!(config.nameserver_policy.len(), 1);
+        assert_eq!(
+            config.proxy_server_nameserver,
+            vec!["https://1.1.1.1/dns-query"]
+        );
+        assert_eq!(config.direct_nameserver, vec!["114.114.114.114"]);
+        assert!(config.direct_nameserver_follow_policy);
+        assert_eq!(config.cache_algorithm, "lru");
+        assert_eq!(config.cache_max_size, 1000);
+    }
+
+    #[test]
+    fn default_trait_matches_serde_defaults() {
+        let from_default = DnsConfig::default();
+        let from_yaml: DnsConfig = serde_yaml::from_str("{}").unwrap();
+
+        assert_eq!(from_default.enable, from_yaml.enable);
+        assert_eq!(from_default.listen, from_yaml.listen);
+        assert_eq!(from_default.enhanced_mode, from_yaml.enhanced_mode);
+        assert_eq!(from_default.fake_ip_range, from_yaml.fake_ip_range);
+        assert_eq!(from_default.fake_ip_ttl, from_yaml.fake_ip_ttl);
+        assert_eq!(from_default.cache_algorithm, from_yaml.cache_algorithm);
+        assert_eq!(
+            from_default.default_nameserver,
+            from_yaml.default_nameserver
+        );
+    }
+
+    #[test]
+    fn fallback_filter_defaults() {
+        let yaml = "geoip: false";
+        let ff: FallbackFilter = serde_yaml::from_str(yaml).unwrap();
+        assert!(!ff.geoip);
+        assert_eq!(ff.geoip_code, "CN");
+        assert!(ff.ipcidr.is_empty());
+        assert!(ff.domain.is_empty());
+    }
+
+    #[test]
+    fn unknown_fields_are_silently_captured() {
+        let yaml = r#"
+enable: true
+some-future-field: "value"
+another-new-thing: 42
+"#;
+        let config: DnsConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.enable);
+        // Unknown fields go into extra
+        assert!(config.extra.contains_key("some-future-field"));
+        assert!(config.extra.contains_key("another-new-thing"));
+    }
+}

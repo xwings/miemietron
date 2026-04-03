@@ -63,3 +63,69 @@ impl ProxyGroup for SelectorGroup {
         proxies.get(&selected).cloned()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn now_returns_first_proxy() {
+        let group = SelectorGroup::new(
+            "test-select".to_string(),
+            vec![
+                "proxy-a".to_string(),
+                "proxy-b".to_string(),
+                "proxy-c".to_string(),
+            ],
+        );
+        assert_eq!(group.now(), "proxy-a");
+    }
+
+    #[test]
+    fn select_changes_active_proxy() {
+        let group = SelectorGroup::new(
+            "test-select".to_string(),
+            vec!["proxy-a".to_string(), "proxy-b".to_string()],
+        );
+        assert_eq!(group.now(), "proxy-a");
+
+        assert!(group.select("proxy-b"));
+        assert_eq!(group.now(), "proxy-b");
+    }
+
+    #[test]
+    fn select_invalid_name_returns_false() {
+        let group = SelectorGroup::new(
+            "test-select".to_string(),
+            vec!["proxy-a".to_string(), "proxy-b".to_string()],
+        );
+        assert!(!group.select("nonexistent"));
+        // The selection should be unchanged.
+        assert_eq!(group.now(), "proxy-a");
+    }
+
+    #[test]
+    fn all_returns_all_proxies() {
+        let names = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let group = SelectorGroup::new("test".to_string(), names.clone());
+        assert_eq!(group.all(), names);
+    }
+
+    #[test]
+    fn group_type_is_selector() {
+        let group = SelectorGroup::new("g".to_string(), vec!["x".to_string()]);
+        assert_eq!(group.group_type(), "Selector");
+    }
+
+    #[test]
+    fn name_matches_construction() {
+        let group = SelectorGroup::new("my-group".to_string(), vec![]);
+        assert_eq!(group.name(), "my-group");
+    }
+
+    #[test]
+    fn empty_proxies_now_returns_empty_string() {
+        let group = SelectorGroup::new("empty".to_string(), vec![]);
+        assert_eq!(group.now(), "");
+    }
+}

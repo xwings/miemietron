@@ -180,3 +180,61 @@ impl ProxyGroup for UrlTestGroup {
         None
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn defaults_are_correct() {
+        let group = UrlTestGroup::new(
+            "auto".to_string(),
+            vec!["a".to_string(), "b".to_string()],
+            "http://test.example/204".to_string(),
+            300,
+            150,
+        );
+        assert_eq!(group.name(), "auto");
+        assert_eq!(group.group_type(), "URLTest");
+        assert_eq!(group.interval(), Duration::from_secs(300));
+        assert_eq!(group.test_url(), "http://test.example/204");
+        assert_eq!(group.all(), vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn now_before_health_check_returns_first_proxy() {
+        let group = UrlTestGroup::new(
+            "auto".to_string(),
+            vec!["fast".to_string(), "slow".to_string()],
+            "http://test.example/204".to_string(),
+            300,
+            50,
+        );
+        // No health check has run, delays map is empty.
+        assert_eq!(group.now(), "fast");
+    }
+
+    #[test]
+    fn select_always_returns_false() {
+        let group = UrlTestGroup::new(
+            "auto".to_string(),
+            vec!["a".to_string()],
+            "http://test.example/204".to_string(),
+            300,
+            50,
+        );
+        assert!(!group.select("a"));
+    }
+
+    #[test]
+    fn empty_proxies_now_returns_empty_string() {
+        let group = UrlTestGroup::new(
+            "empty".to_string(),
+            vec![],
+            "http://test.example/204".to_string(),
+            300,
+            50,
+        );
+        assert_eq!(group.now(), "");
+    }
+}

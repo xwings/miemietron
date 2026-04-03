@@ -188,3 +188,99 @@ impl ServerCertVerifier for NoVerifier {
         self.schemes.clone()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tls_options_construction() {
+        let opts = TlsOptions {
+            sni: "example.com".to_string(),
+            skip_cert_verify: false,
+            alpn: vec!["h2".to_string(), "http/1.1".to_string()],
+            fingerprint: Some("chrome".to_string()),
+        };
+        assert_eq!(opts.sni, "example.com");
+        assert!(!opts.skip_cert_verify);
+        assert_eq!(opts.alpn.len(), 2);
+        assert_eq!(opts.fingerprint, Some("chrome".to_string()));
+    }
+
+    #[test]
+    fn tls_options_clone() {
+        let opts = TlsOptions {
+            sni: "test.com".to_string(),
+            skip_cert_verify: true,
+            alpn: vec!["h2".to_string()],
+            fingerprint: None,
+        };
+        let cloned = opts.clone();
+        assert_eq!(cloned.sni, opts.sni);
+        assert_eq!(cloned.skip_cert_verify, opts.skip_cert_verify);
+        assert_eq!(cloned.alpn, opts.alpn);
+        assert_eq!(cloned.fingerprint, opts.fingerprint);
+    }
+
+    #[test]
+    fn tls_options_debug() {
+        let opts = TlsOptions {
+            sni: "debug.com".to_string(),
+            skip_cert_verify: false,
+            alpn: vec![],
+            fingerprint: None,
+        };
+        let debug_str = format!("{:?}", opts);
+        assert!(debug_str.contains("debug.com"));
+        assert!(debug_str.contains("TlsOptions"));
+    }
+
+    #[test]
+    fn no_verifier_verify_server_cert_succeeds() {
+        let verifier = NoVerifier::new();
+        let cert = CertificateDer::from(vec![0u8; 32]);
+        let server_name = ServerName::try_from("example.com").unwrap();
+        let result = verifier.verify_server_cert(&cert, &[], &server_name, &[], UnixTime::now());
+        assert!(result.is_ok());
+    }
+
+    // Note: verify_tls12_signature and verify_tls13_signature cannot be
+    // directly unit-tested because DigitallySignedStruct::new is pub(crate)
+    // to rustls. However, verify_server_cert is the primary verification
+    // entry point and is fully tested above.
+
+    #[test]
+    fn no_verifier_supported_schemes_non_empty() {
+        let verifier = NoVerifier::new();
+        let schemes = verifier.supported_verify_schemes();
+        assert!(!schemes.is_empty());
+    }
+
+    #[test]
+    fn tls_connector_rejects_invalid_sni() {
+        let result = TlsConnector::new("".to_string(), false, vec![], None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn tls_connector_accepts_valid_sni() {
+        let result = TlsConnector::new(
+            "example.com".to_string(),
+            false,
+            vec!["h2".to_string()],
+            None,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn tls_connector_skip_cert_verify() {
+        let result = TlsConnector::new(
+            "self-signed.example.com".to_string(),
+            true,
+            vec![],
+            Some("chrome".to_string()),
+        );
+        assert!(result.is_ok());
+    }
+}

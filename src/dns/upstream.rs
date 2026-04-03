@@ -527,3 +527,185 @@ fn rand_u16() -> u16 {
         .unwrap_or_default();
     (t.subsec_nanos() ^ t.as_secs() as u32) as u16
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::Ipv6Addr;
+
+    // ---- is_private_ip tests ----
+
+    #[test]
+    fn is_private_ip_10_range() {
+        assert!(is_private_ip(&IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))));
+        assert!(is_private_ip(&IpAddr::V4(Ipv4Addr::new(10, 255, 255, 255))));
+    }
+
+    #[test]
+    fn is_private_ip_172_16_range() {
+        assert!(is_private_ip(&IpAddr::V4(Ipv4Addr::new(172, 16, 0, 1))));
+        assert!(is_private_ip(&IpAddr::V4(Ipv4Addr::new(172, 31, 255, 255))));
+        // 172.15.x.x is NOT private.
+        assert!(!is_private_ip(&IpAddr::V4(Ipv4Addr::new(172, 15, 0, 1))));
+        // 172.32.x.x is NOT private.
+        assert!(!is_private_ip(&IpAddr::V4(Ipv4Addr::new(172, 32, 0, 1))));
+    }
+
+    #[test]
+    fn is_private_ip_192_168_range() {
+        assert!(is_private_ip(&IpAddr::V4(Ipv4Addr::new(192, 168, 0, 1))));
+        assert!(is_private_ip(&IpAddr::V4(Ipv4Addr::new(
+            192, 168, 255, 255
+        ))));
+    }
+
+    #[test]
+    fn is_private_ip_loopback() {
+        assert!(is_private_ip(&IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))));
+        assert!(is_private_ip(&IpAddr::V6(Ipv6Addr::LOCALHOST)));
+    }
+
+    #[test]
+    fn is_private_ip_link_local() {
+        assert!(is_private_ip(&IpAddr::V4(Ipv4Addr::new(169, 254, 1, 1))));
+    }
+
+    #[test]
+    fn is_private_ip_zero_range() {
+        assert!(is_private_ip(&IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0))));
+    }
+
+    #[test]
+    fn is_private_ip_public() {
+        assert!(!is_private_ip(&IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))));
+        assert!(!is_private_ip(&IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))));
+        assert!(!is_private_ip(&IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1))));
+    }
+
+    // ---- parse_cidr_simple tests ----
+
+    #[test]
+    fn parse_cidr_valid() {
+        let (base, prefix) = parse_cidr_simple("198.18.0.0/15").unwrap();
+        assert_eq!(base, u32::from(Ipv4Addr::new(198, 18, 0, 0)));
+        assert_eq!(prefix, 15);
+    }
+
+    #[test]
+    fn parse_cidr_host() {
+        let (base, prefix) = parse_cidr_simple("10.0.0.1/32").unwrap();
+        assert_eq!(base, u32::from(Ipv4Addr::new(10, 0, 0, 1)));
+        assert_eq!(prefix, 32);
+    }
+
+    #[test]
+    fn parse_cidr_invalid_no_slash() {
+        assert!(parse_cidr_simple("192.168.1.0").is_err());
+    }
+
+    #[test]
+    fn parse_cidr_invalid_bad_ip() {
+        assert!(parse_cidr_simple("not.an.ip/24").is_err());
+    }
+
+    // ---- build_dns_query tests ----
+
+    #[test]
+    fn build_dns_query_structure() {
+        let query = build_dns_query("example.com", 1);
+
+        // DNS header is 12 bytes.
+        assert!(query.len() >= 12);
+
+        // Flags: 0x0100 (standard query, recursion desired).
+        assert_eq!(query[2], 0x01);
+        assert_eq!(query[3], 0x00);
+
+        // Question count = 1.
+        assert_eq!(query[4], 0x00);
+        assert_eq!(query[5], 0x01);
+
+        // Answer, authority, additional counts = 0.
+        assert_eq!(query[6], 0x00);
+        assert_eq!(query[7], 0x00);
+        assert_eq!(query[8], 0x00);
+        assert_eq!(query[9], 0x00);
+        assert_eq!(query[10], 0x00);
+        assert_eq!(query[11], 0x00);
+
+        // Question section starts at byte 12.
+        // "example" = 7 bytes, "com" = 3 bytes.
+        assert_eq!(query[12], 7); // length of "example"
+        assert_eq!(&query[13..20], b"example");
+        assert_eq!(query[20], 3); // length of "com"
+        assert_eq!(&query[21..24], b"com");
+        assert_eq!(query[24], 0); // end of name
+
+        // Type A = 0x0001.
+        assert_eq!(query[25], 0x00);
+        assert_eq!(query[26], 0x01);
+
+        // Class IN = 0x0001.
+        assert_eq!(query[27], 0x00);
+        assert_eq!(query[28], 0x01);
+    }
+
+    // ---- should_use_fallback tests ----
+
+    #[test]
+    fn should_use_fallback_local_domain() {
+        let config = DnsConfig::default();
+        let ip = IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4));
+        // Local-looking domains should never trigger fallback.
+        assert!(!should_use_fallback(&ip, "router.local", &config));
+        assert!(!should_use_fallback(&ip, "myhost.lan", &config));
+        assert!(!should_use_fallback(&ip, "localhost", &config));
+        assert!(!should_use_fallback(&ip, "internal.internal", &config));
+    }
+
+    #[test]
+    fn should_use_fallback_private_ip() {
+        let config = DnsConfig::default();
+        // A private IP for a public domain is suspicious.
+        let ip = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1));
+        assert!(should_use_fallback(&ip, "google.com", &config));
+    }
+
+    #[test]
+    fn should_use_fallback_fake_ip_range() {
+        let config = DnsConfig {
+            fake_ip_range: "198.18.0.0/15".to_string(),
+            ..Default::default()
+        };
+        // An IP inside the fake-ip range is suspicious.
+        let ip = IpAddr::V4(Ipv4Addr::new(198, 18, 1, 1));
+        assert!(should_use_fallback(&ip, "google.com", &config));
+    }
+
+    #[test]
+    fn should_use_fallback_public_ip_no_filter() {
+        let config = DnsConfig {
+            fake_ip_range: "198.18.0.0/15".to_string(),
+            fallback_filter: None,
+            ..Default::default()
+        };
+        // A public, non-fake IP with no fallback filter should not trigger.
+        let ip = IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8));
+        assert!(!should_use_fallback(&ip, "example.com", &config));
+    }
+
+    // ---- parse_dns_response tests ----
+
+    #[test]
+    fn parse_dns_response_too_short() {
+        assert!(parse_dns_response(&[0u8; 5]).is_err());
+    }
+
+    #[test]
+    fn parse_dns_response_no_answers() {
+        // Minimal DNS response header with 0 answers.
+        let data = vec![0u8; 12];
+        // ancount = 0 (bytes 6-7 already zero).
+        assert!(parse_dns_response(&data).is_err());
+    }
+}

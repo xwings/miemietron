@@ -174,3 +174,138 @@ impl ProxyGroup for LoadBalanceGroup {
         name.and_then(|n| proxies.get(&n).cloned())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn consistent_hash_deterministic() {
+        let group = LoadBalanceGroup::new(
+            "lb".to_string(),
+            vec![
+                "a".to_string(),
+                "b".to_string(),
+                "c".to_string(),
+                "d".to_string(),
+            ],
+            LoadBalanceStrategy::ConsistentHashing,
+        );
+
+        // Same destination should always produce the same index.
+        let idx1 = group.pick_consistent_hash("example.com:443");
+        let idx2 = group.pick_consistent_hash("example.com:443");
+        let idx3 = group.pick_consistent_hash("example.com:443");
+        assert_eq!(idx1, idx2);
+        assert_eq!(idx2, idx3);
+    }
+
+    #[test]
+    fn consistent_hash_different_destinations_may_differ() {
+        let group = LoadBalanceGroup::new(
+            "lb".to_string(),
+            vec![
+                "a".to_string(),
+                "b".to_string(),
+                "c".to_string(),
+                "d".to_string(),
+            ],
+            LoadBalanceStrategy::ConsistentHashing,
+        );
+
+        // Different destinations should (with high probability) produce
+        // at least one different index. Test a set of destinations.
+        let mut indices = std::collections::HashSet::new();
+        for i in 0..100 {
+            indices.insert(group.pick_consistent_hash(&format!("host-{}.example.com:443", i)));
+        }
+        // With 4 proxies and 100 different destinations, we should hit more than 1 bucket.
+        assert!(indices.len() > 1);
+    }
+
+    #[test]
+    fn round_robin_cycles_through_proxies() {
+        let group = LoadBalanceGroup::new(
+            "lb".to_string(),
+            vec!["a".to_string(), "b".to_string(), "c".to_string()],
+            LoadBalanceStrategy::RoundRobin,
+        );
+
+        let idx0 = group.pick_round_robin();
+        let idx1 = group.pick_round_robin();
+        let idx2 = group.pick_round_robin();
+        let idx3 = group.pick_round_robin();
+
+        assert_eq!(idx0, 0);
+        assert_eq!(idx1, 1);
+        assert_eq!(idx2, 2);
+        assert_eq!(idx3, 0); // wraps around
+    }
+
+    #[test]
+    fn strategy_from_str() {
+        assert_eq!(
+            LoadBalanceStrategy::from_str("consistent-hashing"),
+            LoadBalanceStrategy::ConsistentHashing,
+        );
+        assert_eq!(
+            LoadBalanceStrategy::from_str("round-robin"),
+            LoadBalanceStrategy::RoundRobin,
+        );
+        assert_eq!(
+            LoadBalanceStrategy::from_str("sticky-sessions"),
+            LoadBalanceStrategy::StickySession,
+        );
+        // Unknown defaults to ConsistentHashing.
+        assert_eq!(
+            LoadBalanceStrategy::from_str("unknown"),
+            LoadBalanceStrategy::ConsistentHashing,
+        );
+    }
+
+    #[test]
+    fn group_type_is_load_balance() {
+        let group = LoadBalanceGroup::new(
+            "lb".to_string(),
+            vec!["x".to_string()],
+            LoadBalanceStrategy::RoundRobin,
+        );
+        assert_eq!(group.group_type(), "LoadBalance");
+    }
+
+    #[test]
+    fn select_always_returns_false() {
+        let group = LoadBalanceGroup::new(
+            "lb".to_string(),
+            vec!["a".to_string()],
+            LoadBalanceStrategy::RoundRobin,
+        );
+        assert!(!group.select("a"));
+    }
+
+    #[test]
+    fn empty_proxies_consistent_hash_returns_zero() {
+        let group = LoadBalanceGroup::new(
+            "lb".to_string(),
+            vec![],
+            LoadBalanceStrategy::ConsistentHashing,
+        );
+        assert_eq!(group.pick_consistent_hash("anything"), 0);
+    }
+
+    #[test]
+    fn sticky_session_insert_and_retrieve() {
+        let group = LoadBalanceGroup::new(
+            "lb".to_string(),
+            vec!["a".to_string(), "b".to_string()],
+            LoadBalanceStrategy::StickySession,
+        );
+
+        group.insert_sticky("dest1", "a");
+        group.insert_sticky("dest2", "b");
+
+        assert_eq!(group.pick_sticky("dest1"), Some("a".to_string()));
+        assert_eq!(group.pick_sticky("dest2"), Some("b".to_string()));
+        assert_eq!(group.pick_sticky("dest3"), None);
+    }
+}

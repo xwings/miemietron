@@ -602,3 +602,195 @@ fn get_memory_usage() -> u64 {
     }
     0
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicU64;
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // ---- PeekableStream tests ----
+
+    #[tokio::test]
+    async fn peekable_stream_replays_prefix_then_inner() {
+        let prefix = b"hello".to_vec();
+        let inner_data = b"world";
+        let inner = tokio_test::io::Builder::new().read(inner_data).build();
+        let mut stream = PeekableStream::new(prefix, inner);
+
+        let mut buf = vec![0u8; 10];
+        let n = stream.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"hello");
+
+        let n = stream.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"world");
+    }
+
+    #[tokio::test]
+    async fn peekable_stream_partial_prefix_read() {
+        let prefix = b"abcdef".to_vec();
+        let inner = tokio_test::io::Builder::new().build();
+        let mut stream = PeekableStream::new(prefix, inner);
+
+        // Read only 3 bytes at a time
+        let mut buf = vec![0u8; 3];
+        let n = stream.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"abc");
+
+        let n = stream.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"def");
+    }
+
+    #[tokio::test]
+    async fn peekable_stream_empty_prefix() {
+        let inner_data = b"data";
+        let inner = tokio_test::io::Builder::new().read(inner_data).build();
+        let mut stream = PeekableStream::new(vec![], inner);
+
+        let mut buf = vec![0u8; 10];
+        let n = stream.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"data");
+    }
+
+    // ---- CountingStream tests ----
+
+    #[tokio::test]
+    async fn counting_stream_tracks_download_bytes() {
+        let up = Arc::new(AtomicU64::new(0));
+        let down = Arc::new(AtomicU64::new(0));
+        let inner = tokio_test::io::Builder::new().read(b"hello world").build();
+        let mut stream = CountingStream::new(inner, up.clone(), down.clone());
+
+        let mut buf = vec![0u8; 20];
+        let n = stream.read(&mut buf).await.unwrap();
+        assert_eq!(n, 11);
+        assert_eq!(down.load(Ordering::Relaxed), 11);
+        assert_eq!(up.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn counting_stream_tracks_upload_bytes() {
+        let up = Arc::new(AtomicU64::new(0));
+        let down = Arc::new(AtomicU64::new(0));
+        let inner = tokio_test::io::Builder::new().write(b"outgoing").build();
+        let mut stream = CountingStream::new(inner, up.clone(), down.clone());
+
+        let n = stream.write(b"outgoing").await.unwrap();
+        assert_eq!(n, 8);
+        assert_eq!(up.load(Ordering::Relaxed), 8);
+        assert_eq!(down.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn counting_stream_accumulates_multiple_ops() {
+        let up = Arc::new(AtomicU64::new(0));
+        let down = Arc::new(AtomicU64::new(0));
+        let inner = tokio_test::io::Builder::new()
+            .read(b"abc")
+            .read(b"defgh")
+            .write(b"12")
+            .write(b"3456")
+            .build();
+        let mut stream = CountingStream::new(inner, up.clone(), down.clone());
+
+        let mut buf = vec![0u8; 10];
+        stream.read(&mut buf).await.unwrap();
+        stream.read(&mut buf).await.unwrap();
+        stream.write(b"12").await.unwrap();
+        stream.write(b"3456").await.unwrap();
+
+        assert_eq!(down.load(Ordering::Relaxed), 8); // 3 + 5
+        assert_eq!(up.load(Ordering::Relaxed), 6); // 2 + 4
+    }
+
+    // ---- ConnectionInfo / ConnectionSnapshot serialization tests ----
+
+    #[test]
+    fn connection_info_serializes_correctly() {
+        let info = ConnectionInfo {
+            id: "test-id".to_string(),
+            metadata: ConnectionMetadata {
+                network: "tcp".to_string(),
+                conn_type: "tun".to_string(),
+                source_ip: "192.168.1.1".to_string(),
+                destination_ip: "1.2.3.4".to_string(),
+                source_port: "12345".to_string(),
+                destination_port: "443".to_string(),
+                host: "example.com".to_string(),
+                dns_mode: "fake-ip".to_string(),
+                process_path: "".to_string(),
+                special_proxy: "".to_string(),
+                special_rules: "".to_string(),
+                remote_destination: "example.com:443".to_string(),
+                dscp: 0,
+                sniff_host: "example.com".to_string(),
+            },
+            upload: 100,
+            download: 200,
+            start: "2024-01-01T00:00:00Z".to_string(),
+            chains: vec!["proxy-a".to_string(), "Group".to_string()],
+            rule: "DOMAIN-SUFFIX".to_string(),
+            rule_payload: "example.com".to_string(),
+        };
+
+        let json = serde_json::to_value(&info).unwrap();
+        assert_eq!(json["id"], "test-id");
+        assert_eq!(json["metadata"]["network"], "tcp");
+        assert_eq!(json["metadata"]["type"], "tun");
+        assert_eq!(json["metadata"]["sourceIP"], "192.168.1.1");
+        assert_eq!(json["metadata"]["destinationIP"], "1.2.3.4");
+        assert_eq!(json["metadata"]["sourcePort"], "12345");
+        assert_eq!(json["metadata"]["destinationPort"], "443");
+        assert_eq!(json["metadata"]["host"], "example.com");
+        assert_eq!(json["metadata"]["dnsMode"], "fake-ip");
+        assert_eq!(json["metadata"]["processPath"], "");
+        assert_eq!(json["metadata"]["specialProxy"], "");
+        assert_eq!(json["metadata"]["specialRules"], "");
+        assert_eq!(json["metadata"]["remoteDestination"], "example.com:443");
+        assert_eq!(json["metadata"]["dscp"], 0);
+        assert_eq!(json["metadata"]["sniffHost"], "example.com");
+        assert_eq!(json["upload"], 100);
+        assert_eq!(json["download"], 200);
+        assert_eq!(json["rulePayload"], "example.com");
+    }
+
+    #[test]
+    fn connection_snapshot_serializes_with_renamed_fields() {
+        let snap = ConnectionSnapshot {
+            download_total: 1000,
+            upload_total: 500,
+            connections: vec![],
+            memory: 4096,
+        };
+
+        let json = serde_json::to_value(&snap).unwrap();
+        assert_eq!(json["downloadTotal"], 1000);
+        assert_eq!(json["uploadTotal"], 500);
+        assert!(json["connections"].as_array().unwrap().is_empty());
+        assert_eq!(json["memory"], 4096);
+    }
+
+    // ---- StatsManager tests ----
+
+    #[test]
+    fn stats_manager_tracks_traffic() {
+        let stats = StatsManager::new();
+        stats.add_upload(100);
+        stats.add_upload(50);
+        stats.add_download(200);
+        assert_eq!(stats.upload_total(), 150);
+        assert_eq!(stats.download_total(), 200);
+    }
+
+    #[test]
+    fn stats_manager_tracks_connections() {
+        let stats = StatsManager::new();
+        assert_eq!(stats.active_connections(), 0);
+        stats.add_connection();
+        stats.add_connection();
+        assert_eq!(stats.active_connections(), 2);
+        stats.remove_connection();
+        assert_eq!(stats.active_connections(), 1);
+    }
+}

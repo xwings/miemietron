@@ -71,3 +71,58 @@ impl std::ops::DerefMut for PooledBuffer {
         &mut self.buf
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn get_buffer_from_pool() {
+        let pool = BufferPool::new(8192, 16);
+        let buf = pool.get();
+        assert_eq!(buf.len(), 8192);
+    }
+
+    #[test]
+    fn buffer_has_correct_default_size() {
+        let pool = BufferPool::default();
+        let buf = pool.get();
+        assert_eq!(buf.len(), DEFAULT_BUF_SIZE);
+    }
+
+    #[test]
+    fn buffer_as_slice_and_mut_slice() {
+        let pool = BufferPool::new(64, 4);
+        let mut buf = pool.get();
+        assert_eq!(buf.as_slice().len(), 64);
+        buf.as_mut_slice()[0] = 0xAB;
+        assert_eq!(buf.as_slice()[0], 0xAB);
+    }
+
+    #[test]
+    fn drop_returns_buffer_to_pool() {
+        // Create a pool with capacity 4, pre-filled with 1 buffer (4/4 = 1).
+        let pool = BufferPool::new(128, 4);
+        // The pool pre-allocates pool_size/4 = 1 buffer.
+        // Pop the pre-allocated one to start clean.
+        let _initial = pool.pool.pop();
+
+        // Get a buffer (pool is now empty, so it allocates a fresh one).
+        let buf = pool.get();
+        // Drop it -- it should be pushed back into the pool.
+        drop(buf);
+
+        // Now the pool should have exactly 1 buffer available.
+        assert!(pool.pool.pop().is_some());
+        assert!(pool.pool.pop().is_none());
+    }
+
+    #[test]
+    fn deref_gives_access_to_slice() {
+        let pool = BufferPool::new(32, 2);
+        let buf = pool.get();
+        // Deref should give us a &[u8] of length 32.
+        let slice: &[u8] = &*buf;
+        assert_eq!(slice.len(), 32);
+    }
+}

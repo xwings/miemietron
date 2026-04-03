@@ -227,3 +227,151 @@ impl OutboundHandler for VmessOutbound {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::proxy::ProxyConfig;
+    use std::collections::HashMap;
+
+    fn make_vmess_config() -> ProxyConfig {
+        ProxyConfig {
+            name: "vmess-test".to_string(),
+            proxy_type: "vmess".to_string(),
+            server: Some("1.2.3.4".to_string()),
+            port: Some(443),
+            uuid: Some("12345678-1234-1234-1234-123456789abc".to_string()),
+            cipher: Some("auto".to_string()),
+            tls: Some(true),
+            sni: Some("example.com".to_string()),
+            skip_cert_verify: Some(false),
+            alpn: Some(vec!["h2".to_string()]),
+            client_fingerprint: Some("chrome".to_string()),
+            network: Some("tcp".to_string()),
+            alter_id: Some(0),
+            udp: Some(true),
+            tfo: Some(false),
+            mptcp: Some(false),
+            // Defaults for the rest
+            password: None,
+            udp_over_tcp: None,
+            udp_over_tcp_version: None,
+            plugin: None,
+            plugin_opts: None,
+            flow: None,
+            encryption: None,
+            packet_encoding: None,
+            xudp: None,
+            packet_addr: None,
+            servername: None,
+            fingerprint: None,
+            certificate: None,
+            private_key: None,
+            reality_opts: None,
+            ech_opts: None,
+            ws_opts: None,
+            grpc_opts: None,
+            h2_opts: None,
+            http_opts: None,
+            ss_opts: None,
+            interface_name: None,
+            routing_mark: None,
+            ip_version: None,
+            dialer_proxy: None,
+            extra: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn vmess_outbound_from_valid_config() {
+        let config = make_vmess_config();
+        let outbound = VmessOutbound::new(&config).unwrap();
+
+        assert_eq!(outbound.name, "vmess-test");
+        assert_eq!(outbound.server, "1.2.3.4");
+        assert_eq!(outbound.port, 443);
+        assert!(outbound.tls);
+        assert_eq!(outbound.sni, "example.com");
+        assert_eq!(outbound.network, "tcp");
+        assert!(outbound.udp);
+        assert_eq!(outbound.alpn, vec!["h2".to_string()]);
+        assert_eq!(outbound.fingerprint, Some("chrome".to_string()));
+    }
+
+    #[test]
+    fn vmess_security_auto_maps_to_aes128gcm() {
+        assert_eq!(VmessSecurity::from_str("auto"), VmessSecurity::Aes128Gcm,);
+    }
+
+    #[test]
+    fn vmess_security_chacha20() {
+        assert_eq!(
+            VmessSecurity::from_str("chacha20-poly1305"),
+            VmessSecurity::Chacha20Poly1305,
+        );
+    }
+
+    #[test]
+    fn vmess_security_none() {
+        assert_eq!(VmessSecurity::from_str("none"), VmessSecurity::None,);
+    }
+
+    #[test]
+    fn vmess_security_zero_maps_to_none() {
+        assert_eq!(VmessSecurity::from_str("zero"), VmessSecurity::None,);
+    }
+
+    #[test]
+    fn vmess_security_aes128gcm_explicit() {
+        assert_eq!(
+            VmessSecurity::from_str("aes-128-gcm"),
+            VmessSecurity::Aes128Gcm,
+        );
+    }
+
+    #[test]
+    fn vmess_security_unknown_defaults_to_aes128gcm() {
+        assert_eq!(
+            VmessSecurity::from_str("something-random"),
+            VmessSecurity::Aes128Gcm,
+        );
+    }
+
+    #[test]
+    fn vmess_missing_server_fails() {
+        let mut config = make_vmess_config();
+        config.server = None;
+        assert!(VmessOutbound::new(&config).is_err());
+    }
+
+    #[test]
+    fn vmess_missing_uuid_fails() {
+        let mut config = make_vmess_config();
+        config.uuid = None;
+        assert!(VmessOutbound::new(&config).is_err());
+    }
+
+    #[test]
+    fn vmess_invalid_uuid_fails() {
+        let mut config = make_vmess_config();
+        config.uuid = Some("not-a-valid-uuid".to_string());
+        assert!(VmessOutbound::new(&config).is_err());
+    }
+
+    #[test]
+    fn vmess_sni_falls_back_to_server() {
+        let mut config = make_vmess_config();
+        config.sni = None;
+        config.servername = None;
+        let outbound = VmessOutbound::new(&config).unwrap();
+        assert_eq!(outbound.sni, "1.2.3.4");
+    }
+
+    #[test]
+    fn vmess_default_network_is_tcp() {
+        let mut config = make_vmess_config();
+        config.network = None;
+        let outbound = VmessOutbound::new(&config).unwrap();
+        assert_eq!(outbound.network, "tcp");
+    }
+}

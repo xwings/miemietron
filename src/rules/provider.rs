@@ -233,3 +233,213 @@ fn parse_yaml_format(content: &str) -> Result<Vec<String>> {
         .filter(|s| !s.is_empty())
         .collect())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---- parse_text_format tests (domain behavior) ----
+
+    #[test]
+    fn parse_text_domain_one_per_line() {
+        let content = "example.com\ngoogle.com\nyoutube.com\n";
+        let rules = parse_text_format(content);
+        assert_eq!(rules, vec!["example.com", "google.com", "youtube.com"]);
+    }
+
+    #[test]
+    fn parse_text_ignores_comments_and_blank_lines() {
+        let content = "# This is a comment\n\nexample.com\n  \n# Another comment\ngoogle.com\n";
+        let rules = parse_text_format(content);
+        assert_eq!(rules, vec!["example.com", "google.com"]);
+    }
+
+    #[test]
+    fn parse_text_trims_whitespace() {
+        let content = "  example.com  \n\tgoogle.com\t\n";
+        let rules = parse_text_format(content);
+        assert_eq!(rules, vec!["example.com", "google.com"]);
+    }
+
+    #[test]
+    fn parse_text_empty_content() {
+        let content = "";
+        let rules = parse_text_format(content);
+        assert!(rules.is_empty());
+    }
+
+    #[test]
+    fn parse_text_only_comments() {
+        let content = "# comment 1\n# comment 2\n";
+        let rules = parse_text_format(content);
+        assert!(rules.is_empty());
+    }
+
+    // ---- parse_text_format tests (ipcidr behavior) ----
+
+    #[test]
+    fn parse_text_ipcidr_behavior() {
+        let content = "192.168.0.0/16\n10.0.0.0/8\n172.16.0.0/12\n";
+        let rules = parse_text_format(content);
+        assert_eq!(rules, vec!["192.168.0.0/16", "10.0.0.0/8", "172.16.0.0/12"]);
+    }
+
+    #[test]
+    fn parse_text_ipcidr_with_ipv6() {
+        let content = "fc00::/7\n::1/128\n";
+        let rules = parse_text_format(content);
+        assert_eq!(rules, vec!["fc00::/7", "::1/128"]);
+    }
+
+    // ---- parse_text_format tests (classical behavior) ----
+
+    #[test]
+    fn parse_text_classical_full_rule_strings() {
+        let content = "\
+DOMAIN-SUFFIX,google.com
+DOMAIN-KEYWORD,youtube
+IP-CIDR,192.168.0.0/16
+DOMAIN,exact.example.com
+";
+        let rules = parse_text_format(content);
+        assert_eq!(
+            rules,
+            vec![
+                "DOMAIN-SUFFIX,google.com",
+                "DOMAIN-KEYWORD,youtube",
+                "IP-CIDR,192.168.0.0/16",
+                "DOMAIN,exact.example.com",
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_text_classical_with_comments() {
+        let content = "\
+# Ad blocking rules
+DOMAIN-SUFFIX,ads.example.com
+# Tracking domains
+DOMAIN-KEYWORD,tracker
+";
+        let rules = parse_text_format(content);
+        assert_eq!(
+            rules,
+            vec!["DOMAIN-SUFFIX,ads.example.com", "DOMAIN-KEYWORD,tracker"]
+        );
+    }
+
+    // ---- parse_yaml_format tests ----
+
+    #[test]
+    fn parse_yaml_domain_payload() {
+        let content = r#"
+payload:
+  - "example.com"
+  - "google.com"
+  - "youtube.com"
+"#;
+        let rules = parse_yaml_format(content).unwrap();
+        assert_eq!(rules, vec!["example.com", "google.com", "youtube.com"]);
+    }
+
+    #[test]
+    fn parse_yaml_with_plus_dot_prefix() {
+        let content = r#"
+payload:
+  - "'+.example.com'"
+  - "+.google.com"
+  - "plain.com"
+"#;
+        let rules = parse_yaml_format(content).unwrap();
+        assert_eq!(rules, vec!["example.com", "google.com", "plain.com"]);
+    }
+
+    #[test]
+    fn parse_yaml_empty_payload() {
+        let content = "payload: []\n";
+        let rules = parse_yaml_format(content).unwrap();
+        assert!(rules.is_empty());
+    }
+
+    #[test]
+    fn parse_yaml_missing_payload_key() {
+        let content = "other-key: value\n";
+        let rules = parse_yaml_format(content).unwrap();
+        assert!(rules.is_empty());
+    }
+
+    #[test]
+    fn parse_yaml_ipcidr_payload() {
+        let content = r#"
+payload:
+  - "192.168.0.0/16"
+  - "10.0.0.0/8"
+  - "fc00::/7"
+"#;
+        let rules = parse_yaml_format(content).unwrap();
+        assert_eq!(rules, vec!["192.168.0.0/16", "10.0.0.0/8", "fc00::/7"]);
+    }
+
+    #[test]
+    fn parse_yaml_classical_payload() {
+        let content = r#"
+payload:
+  - "DOMAIN-SUFFIX,google.com"
+  - "IP-CIDR,192.168.0.0/16"
+  - "DOMAIN-KEYWORD,ads"
+"#;
+        let rules = parse_yaml_format(content).unwrap();
+        assert_eq!(
+            rules,
+            vec![
+                "DOMAIN-SUFFIX,google.com",
+                "IP-CIDR,192.168.0.0/16",
+                "DOMAIN-KEYWORD,ads",
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_yaml_invalid_yaml() {
+        let content = "this is: [not: valid yaml: {{";
+        assert!(parse_yaml_format(content).is_err());
+    }
+
+    // ---- RuleProvider construction tests ----
+
+    #[test]
+    fn rule_provider_new_http() {
+        let provider = RuleProvider::new(
+            "test".to_string(),
+            "http",
+            Some("https://example.com/rules.txt".to_string()),
+            Some(PathBuf::from("/tmp/rules.txt")),
+            3600,
+            Some("text"),
+        );
+        assert_eq!(provider.name(), "test");
+        assert_eq!(provider.interval(), 3600);
+    }
+
+    #[test]
+    fn rule_provider_new_file() {
+        let provider = RuleProvider::new(
+            "local".to_string(),
+            "file",
+            None,
+            Some(PathBuf::from("/etc/rules.txt")),
+            0,
+            Some("yaml"),
+        );
+        assert_eq!(provider.name(), "local");
+        assert_eq!(provider.interval(), 0);
+    }
+
+    #[test]
+    fn rule_provider_default_format_is_text() {
+        let provider = RuleProvider::new("def".to_string(), "file", None, None, 0, None);
+        // We can indirectly verify by parsing through the provider's parse_content
+        let result = provider.parse_content("example.com\ngoogle.com").unwrap();
+        assert_eq!(result, vec!["example.com", "google.com"]);
+    }
+}

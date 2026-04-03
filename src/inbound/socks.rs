@@ -215,3 +215,109 @@ async fn resolve_target(host: &str, port: u16) -> Result<SocketAddr> {
         .next()
         .ok_or_else(|| anyhow!("DNS resolution failed for {}", host))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---- resolve_target tests (address parsing) ----
+
+    #[tokio::test]
+    async fn resolve_target_ipv4() {
+        let addr = resolve_target("1.2.3.4", 8080).await.unwrap();
+        assert_eq!(addr, SocketAddr::new("1.2.3.4".parse().unwrap(), 8080));
+    }
+
+    #[tokio::test]
+    async fn resolve_target_ipv6() {
+        let addr = resolve_target("::1", 443).await.unwrap();
+        assert_eq!(addr, SocketAddr::new("::1".parse().unwrap(), 443));
+    }
+
+    #[tokio::test]
+    async fn resolve_target_ipv4_any() {
+        let addr = resolve_target("0.0.0.0", 0).await.unwrap();
+        assert_eq!(addr, SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0));
+    }
+
+    #[tokio::test]
+    async fn resolve_target_localhost() {
+        // localhost should resolve to 127.0.0.1 or ::1 on most systems
+        let addr = resolve_target("localhost", 80).await.unwrap();
+        assert!(addr.ip().is_loopback());
+        assert_eq!(addr.port(), 80);
+    }
+
+    // ---- SOCKS5 constants tests ----
+
+    #[test]
+    fn socks5_constants_match_rfc1928() {
+        assert_eq!(SOCKS5_VERSION, 0x05);
+        assert_eq!(AUTH_NONE, 0x00);
+        assert_eq!(AUTH_USER_PASS, 0x02);
+        assert_eq!(AUTH_NO_ACCEPTABLE, 0xFF);
+        assert_eq!(CMD_CONNECT, 0x01);
+        assert_eq!(CMD_UDP_ASSOCIATE, 0x03);
+        assert_eq!(ATYP_IPV4, 0x01);
+        assert_eq!(ATYP_DOMAIN, 0x03);
+        assert_eq!(ATYP_IPV6, 0x04);
+        assert_eq!(REP_SUCCESS, 0x00);
+        assert_eq!(REP_GENERAL_FAILURE, 0x01);
+        assert_eq!(REP_CMD_NOT_SUPPORTED, 0x07);
+    }
+
+    // ---- send_reply serialization test ----
+
+    #[tokio::test]
+    async fn send_reply_ipv4_format() {
+        // Create a pair of connected TCP streams for testing
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let connect_fut = TcpStream::connect(addr);
+        let accept_fut = listener.accept();
+
+        let (client_res, accept_res) = tokio::join!(connect_fut, accept_fut);
+        let mut client = client_res.unwrap();
+        let (mut server, _) = accept_res.unwrap();
+
+        let bind = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 1080));
+        send_reply(&mut server, REP_SUCCESS, &bind).await.unwrap();
+
+        let mut buf = vec![0u8; 32];
+        let n = client.read(&mut buf).await.unwrap();
+        // Expected: version(5) + rep(0) + rsv(0) + atyp(1) + ip(4 bytes) + port(2 bytes)
+        assert_eq!(n, 10);
+        assert_eq!(buf[0], SOCKS5_VERSION);
+        assert_eq!(buf[1], REP_SUCCESS);
+        assert_eq!(buf[2], 0x00); // reserved
+        assert_eq!(buf[3], ATYP_IPV4);
+        assert_eq!(&buf[4..8], &[127, 0, 0, 1]);
+        assert_eq!(u16::from_be_bytes([buf[8], buf[9]]), 1080);
+    }
+
+    #[tokio::test]
+    async fn send_reply_ipv6_format() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let connect_fut = TcpStream::connect(addr);
+        let accept_fut = listener.accept();
+
+        let (client_res, accept_res) = tokio::join!(connect_fut, accept_fut);
+        let mut client = client_res.unwrap();
+        let (mut server, _) = accept_res.unwrap();
+
+        let bind = SocketAddr::new(Ipv6Addr::LOCALHOST.into(), 9090);
+        send_reply(&mut server, REP_SUCCESS, &bind).await.unwrap();
+
+        let mut buf = vec![0u8; 32];
+        let n = client.read(&mut buf).await.unwrap();
+        // Expected: version(5) + rep(0) + rsv(0) + atyp(4) + ip(16 bytes) + port(2 bytes)
+        assert_eq!(n, 22);
+        assert_eq!(buf[0], SOCKS5_VERSION);
+        assert_eq!(buf[1], REP_SUCCESS);
+        assert_eq!(buf[3], ATYP_IPV6);
+        assert_eq!(u16::from_be_bytes([buf[20], buf[21]]), 9090);
+    }
+}
