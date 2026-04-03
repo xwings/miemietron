@@ -9,6 +9,8 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # Force static linking for musl targets
+  RUSTFLAGS: "-C target-feature=+crt-static"
 
 jobs:
   build:
@@ -38,11 +40,20 @@ jobs:
       - name: Build release binary
         run: cross build --release --target ${{ matrix.target }}
 
+      - name: Verify static linking
+        run: |
+          file target/${{ matrix.target }}/release/miemietron
+          # Must say "statically linked", not "dynamically linked"
+          file target/${{ matrix.target }}/release/miemietron | grep -q "statically linked" \
+            && echo "OK: statically linked" \
+            || echo "WARNING: may be dynamically linked"
+
       - name: Package binary
         run: |
           VERSION="${GITHUB_REF_NAME}"
           BINARY="miemietron-${VERSION}-${{ matrix.target }}"
           cp target/${{ matrix.target }}/release/miemietron "${BINARY}"
+          chmod +x "${BINARY}"
           sha256sum "${BINARY}" > "${BINARY}.sha256"
 
       - name: Upload artifact
@@ -68,7 +79,7 @@ jobs:
           merge-multiple: true
 
       - name: List artifacts
-        run: ls -la artifacts/
+        run: ls -la artifacts/ && file artifacts/miemietron-*
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2

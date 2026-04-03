@@ -57,6 +57,8 @@ jobs:
           - x86_64-unknown-linux-musl
           - aarch64-unknown-linux-musl
           - armv7-unknown-linux-musleabihf
+    env:
+      RUSTFLAGS: "-C target-feature=+crt-static"
     steps:
       - uses: actions/checkout@v4
 
@@ -74,14 +76,14 @@ jobs:
       - name: Build release binary
         run: cross build --release --target ${{ matrix.target }}
 
-      - name: Rename binary
+      - name: Verify static linking
         run: |
-          cp target/${{ matrix.target }}/release/miemietron \
-             miemietron-${{ matrix.target }}
+          file target/${{ matrix.target }}/release/miemietron
+          file target/${{ matrix.target }}/release/miemietron | grep -q "statically linked"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: miemietron-${{ matrix.target }}
-          path: miemietron-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/miemietron
           retention-days: 7

@@ -1,5 +1,5 @@
 [build.env]
-passthrough = ["CARGO_TERM_COLOR"]
+passthrough = ["CARGO_TERM_COLOR", "RUSTFLAGS"]
 
 [target.x86_64-unknown-linux-musl]
 image = "ghcr.io/cross-rs/x86_64-unknown-linux-musl:main"
