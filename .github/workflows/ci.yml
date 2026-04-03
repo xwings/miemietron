@@ -81,7 +81,7 @@ jobs:
       - name: Verify static linking
         run: |
           file target/${{ matrix.target }}/release/miemietron
-          file target/${{ matrix.target }}/release/miemietron | grep -q "statically linked"
+          file target/${{ matrix.target }}/release/miemietron | grep -qE "static(-pie)? linked"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
