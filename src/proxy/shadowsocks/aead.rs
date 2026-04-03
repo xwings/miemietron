@@ -27,6 +27,10 @@ pub enum AeadCipher {
     Aes128Gcm,
     Aes256Gcm,
     ChaCha20Poly1305,
+    // SS2022 ciphers (use BLAKE3 KDF, base64 key)
+    Blake3Aes128Gcm,
+    Blake3Aes256Gcm,
+    Blake3ChaCha20Poly1305,
 }
 
 impl AeadCipher {
@@ -36,6 +40,11 @@ impl AeadCipher {
             "aes-128-gcm" => Some(AeadCipher::Aes128Gcm),
             "aes-256-gcm" => Some(AeadCipher::Aes256Gcm),
             "chacha20-ietf-poly1305" | "chacha20-poly1305" => Some(AeadCipher::ChaCha20Poly1305),
+            "2022-blake3-aes-128-gcm" => Some(AeadCipher::Blake3Aes128Gcm),
+            "2022-blake3-aes-256-gcm" => Some(AeadCipher::Blake3Aes256Gcm),
+            "2022-blake3-chacha20-poly1305" | "2022-blake3-chacha20-ietf-poly1305" => {
+                Some(AeadCipher::Blake3ChaCha20Poly1305)
+            }
             _ => None,
         }
     }
@@ -43,9 +52,11 @@ impl AeadCipher {
     /// Key length in bytes.
     pub fn key_len(&self) -> usize {
         match self {
-            AeadCipher::Aes128Gcm => 16,
-            AeadCipher::Aes256Gcm => 32,
-            AeadCipher::ChaCha20Poly1305 => 32,
+            AeadCipher::Aes128Gcm | AeadCipher::Blake3Aes128Gcm => 16,
+            AeadCipher::Aes256Gcm
+            | AeadCipher::ChaCha20Poly1305
+            | AeadCipher::Blake3Aes256Gcm
+            | AeadCipher::Blake3ChaCha20Poly1305 => 32,
         }
     }
 
@@ -54,9 +65,33 @@ impl AeadCipher {
         self.key_len()
     }
 
-    /// Derive a subkey from the master key and salt using HKDF-SHA1.
+    /// Whether this is an SS2022 cipher (uses BLAKE3 KDF + base64 key).
+    pub fn is_ss2022(&self) -> bool {
+        matches!(
+            self,
+            AeadCipher::Blake3Aes128Gcm
+                | AeadCipher::Blake3Aes256Gcm
+                | AeadCipher::Blake3ChaCha20Poly1305
+        )
+    }
+
+    /// Derive a subkey from the master key and salt.
+    /// SS2022 uses BLAKE3; legacy uses HKDF-SHA1.
     fn derive_subkey(&self, key: &[u8], salt: &[u8]) -> Vec<u8> {
-        hkdf_sha1(key, salt, b"ss-subkey", self.key_len())
+        if self.is_ss2022() {
+            // SS2022: BLAKE3 key derivation
+            // subkey = BLAKE3::derive_key("shadowsocks 2022 session subkey", key || salt)
+            let mut context_material = Vec::with_capacity(key.len() + salt.len());
+            context_material.extend_from_slice(key);
+            context_material.extend_from_slice(salt);
+            let mut out = vec![0u8; self.key_len()];
+            let mut hasher = blake3::Hasher::new_derive_key("shadowsocks 2022 session subkey");
+            hasher.update(&context_material);
+            hasher.finalize_xof().fill(&mut out);
+            out
+        } else {
+            hkdf_sha1(key, salt, b"ss-subkey", self.key_len())
+        }
     }
 }
 
@@ -164,19 +199,19 @@ impl CipherCore {
     ) -> Result<(), io::Error> {
         let nonce_ga = GenericArray::from_slice(nonce);
         match self.cipher {
-            AeadCipher::Aes128Gcm => {
+            AeadCipher::Aes128Gcm | AeadCipher::Blake3Aes128Gcm => {
                 let cipher = Aes128Gcm::new(GenericArray::from_slice(&self.key));
                 cipher
                     .encrypt_in_place(nonce_ga, b"", data)
                     .map_err(|e| io::Error::other(format!("aes-128-gcm encrypt: {}", e)))
             }
-            AeadCipher::Aes256Gcm => {
+            AeadCipher::Aes256Gcm | AeadCipher::Blake3Aes256Gcm => {
                 let cipher = Aes256Gcm::new(GenericArray::from_slice(&self.key));
                 cipher
                     .encrypt_in_place(nonce_ga, b"", data)
                     .map_err(|e| io::Error::other(format!("aes-256-gcm encrypt: {}", e)))
             }
-            AeadCipher::ChaCha20Poly1305 => {
+            AeadCipher::ChaCha20Poly1305 | AeadCipher::Blake3ChaCha20Poly1305 => {
                 let cipher = ChaCha20Poly1305::new(GenericArray::from_slice(&self.key));
                 cipher
                     .encrypt_in_place(nonce_ga, b"", data)
@@ -193,7 +228,7 @@ impl CipherCore {
     ) -> Result<(), io::Error> {
         let nonce_ga = GenericArray::from_slice(nonce);
         match self.cipher {
-            AeadCipher::Aes128Gcm => {
+            AeadCipher::Aes128Gcm | AeadCipher::Blake3Aes128Gcm => {
                 let cipher = Aes128Gcm::new(GenericArray::from_slice(&self.key));
                 cipher.decrypt_in_place(nonce_ga, b"", data).map_err(|e| {
                     io::Error::new(
@@ -202,7 +237,7 @@ impl CipherCore {
                     )
                 })
             }
-            AeadCipher::Aes256Gcm => {
+            AeadCipher::Aes256Gcm | AeadCipher::Blake3Aes256Gcm => {
                 let cipher = Aes256Gcm::new(GenericArray::from_slice(&self.key));
                 cipher.decrypt_in_place(nonce_ga, b"", data).map_err(|e| {
                     io::Error::new(
@@ -211,7 +246,7 @@ impl CipherCore {
                     )
                 })
             }
-            AeadCipher::ChaCha20Poly1305 => {
+            AeadCipher::ChaCha20Poly1305 | AeadCipher::Blake3ChaCha20Poly1305 => {
                 let cipher = ChaCha20Poly1305::new(GenericArray::from_slice(&self.key));
                 cipher.decrypt_in_place(nonce_ga, b"", data).map_err(|e| {
                     io::Error::new(

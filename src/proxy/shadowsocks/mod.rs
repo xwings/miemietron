@@ -48,8 +48,25 @@ impl ShadowsocksOutbound {
         let cipher = AeadCipher::from_name(cipher_name)
             .ok_or_else(|| anyhow!("ss: unsupported cipher '{}'", cipher_name))?;
 
-        // Derive the master key from the password using EVP_BytesToKey
-        let master_key = evp_bytes_to_key(password.as_bytes(), cipher.key_len());
+        // Derive the master key:
+        // - SS2022 ciphers: password is base64-encoded raw key
+        // - Legacy ciphers: password is derived via EVP_BytesToKey
+        let master_key = if cipher.is_ss2022() {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD
+                .decode(password)
+                .map_err(|e| anyhow!("ss2022: invalid base64 key: {}", e))?
+        } else {
+            evp_bytes_to_key(password.as_bytes(), cipher.key_len())
+        };
+
+        if master_key.len() != cipher.key_len() {
+            return Err(anyhow!(
+                "ss: key length mismatch: expected {} bytes, got {}",
+                cipher.key_len(),
+                master_key.len()
+            ));
+        }
 
         let udp = config.udp.unwrap_or(false);
         let plugin = config.plugin.clone();

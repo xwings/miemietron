@@ -71,7 +71,9 @@ jobs:
           key: ${{ matrix.target }}
 
       - name: Install cross
-        run: cargo install cross --git https://github.com/cross-rs/cross
+        run: |
+          curl -sSfL https://github.com/cross-rs/cross/releases/latest/download/cross-x86_64-unknown-linux-musl.tar.gz \
+            | tar xz -C /usr/local/bin cross
 
       - name: Build release binary
         run: cross build --release --target ${{ matrix.target }}

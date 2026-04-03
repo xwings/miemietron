@@ -9,7 +9,6 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  # Force static linking for musl targets
   RUSTFLAGS: "-C target-feature=+crt-static"
 
 jobs:
@@ -35,7 +34,9 @@ jobs:
           key: ${{ matrix.target }}
 
       - name: Install cross
-        run: cargo install cross --git https://github.com/cross-rs/cross
+        run: |
+          curl -sSfL https://github.com/cross-rs/cross/releases/latest/download/cross-x86_64-unknown-linux-musl.tar.gz \
+            | tar xz -C /usr/local/bin cross
 
       - name: Build release binary
         run: cross build --release --target ${{ matrix.target }}
@@ -43,7 +44,6 @@ jobs:
       - name: Verify static linking
         run: |
           file target/${{ matrix.target }}/release/miemietron
-          # Must say "statically linked", not "dynamically linked"
           file target/${{ matrix.target }}/release/miemietron | grep -q "statically linked" \
             && echo "OK: statically linked" \
             || echo "WARNING: may be dynamically linked"

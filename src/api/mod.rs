@@ -5,6 +5,7 @@ pub mod dns_api;
 pub mod logs;
 pub mod proxies;
 pub mod rules_api;
+pub mod ui;
 pub mod version;
 
 use anyhow::Result;
@@ -14,7 +15,8 @@ use axum::{
 };
 use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
-use tracing::info;
+use tower_http::services::ServeDir;
+use tracing::{info, warn};
 
 use crate::config::MiemieConfig;
 use crate::conn::{ConnectionManager, StatsManager};
@@ -39,12 +41,34 @@ pub async fn start_server(addr: &str, secret: Option<String>, state: ApiState) -
         .allow_methods(Any)
         .allow_headers(Any);
 
-    let app = Router::new()
+    // Auto-download UI if external-ui is configured but directory is empty/missing
+    if let Some(ui_dir) = ui::resolve_ui_dir(&state.config) {
+        let needs_download = !ui_dir.exists()
+            || ui_dir
+                .read_dir()
+                .map(|mut d| d.next().is_none())
+                .unwrap_or(true);
+
+        if needs_download {
+            let url = state.config.external_ui_url.as_deref();
+            info!("UI directory empty, downloading metacubexd...");
+            match ui::download_ui(&ui_dir, url).await {
+                Ok(()) => info!("UI downloaded to {}", ui_dir.display()),
+                Err(e) => warn!(
+                    "Failed to download UI: {} (dashboard will be unavailable)",
+                    e
+                ),
+            }
+        }
+    }
+
+    let mut app = Router::new()
         // Version / system
         .route("/version", get(version::get_version))
         .route("/memory", get(version::get_memory))
         .route("/gc", get(version::get_gc))
         .route("/restart", post(version::post_restart))
+        .route("/upgrade/ui", post(ui::post_upgrade_ui))
         // Configs
         .route("/configs", get(configs::get_configs))
         .route("/configs", put(configs::put_configs))
@@ -87,8 +111,17 @@ pub async fn start_server(addr: &str, secret: Option<String>, state: ApiState) -
         .route("/cache/fakeip/flush", post(dns_api::post_fakeip_flush))
         .route("/cache/dns/flush", post(dns_api::post_dns_flush))
         // Logs
-        .route("/logs", get(logs::get_logs))
-        // Middleware
+        .route("/logs", get(logs::get_logs));
+
+    // Serve external UI as static files at /ui/
+    if let Some(ui_dir) = ui::resolve_ui_dir(&state.config) {
+        if ui_dir.exists() {
+            info!("Serving UI from {} at /ui/", ui_dir.display());
+            app = app.nest_service("/ui", ServeDir::new(&ui_dir));
+        }
+    }
+
+    let app = app
         .layer(cors)
         .layer(axum::middleware::from_fn_with_state(
             secret.unwrap_or_default(),
