@@ -1,10 +1,11 @@
-//! Inbound proxy listeners: HTTP, SOCKS5, and mixed-port.
+//! Inbound proxy listeners: HTTP, SOCKS5, mixed-port, and transparent proxy (redir).
 //!
 //! These listeners accept connections from local applications (as an
 //! alternative to TUN) and hand them to the ConnectionManager for
 //! rule-matching and proxying.
 
 pub mod http;
+pub mod redir;
 pub mod socks;
 
 use anyhow::Result;
@@ -20,7 +21,11 @@ use crate::conn::ConnectionManager;
 ///
 /// - 0x05 -> SOCKS5 handshake
 /// - anything else -> HTTP proxy
-pub async fn run_mixed_proxy(addr: SocketAddr, conn_manager: Arc<ConnectionManager>) -> Result<()> {
+pub async fn run_mixed_proxy(
+    addr: SocketAddr,
+    conn_manager: Arc<ConnectionManager>,
+    auth: Arc<Vec<String>>,
+) -> Result<()> {
     let listener = TcpListener::bind(addr).await?;
     tracing::info!("Mixed (HTTP+SOCKS5) proxy listening on {}", addr);
 
@@ -34,8 +39,9 @@ pub async fn run_mixed_proxy(addr: SocketAddr, conn_manager: Arc<ConnectionManag
         };
 
         let cm = conn_manager.clone();
+        let auth = auth.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_mixed(stream, peer, cm).await {
+            if let Err(e) = handle_mixed(stream, peer, cm, auth).await {
                 debug!("Mixed connection from {} ended: {}", peer, e);
             }
         });
@@ -47,6 +53,7 @@ async fn handle_mixed(
     stream: tokio::net::TcpStream,
     peer: SocketAddr,
     conn_manager: Arc<ConnectionManager>,
+    auth: Arc<Vec<String>>,
 ) -> Result<()> {
     // Peek the first byte without consuming it
     let mut peek_buf = [0u8; 1];
@@ -57,9 +64,9 @@ async fn handle_mixed(
 
     if peek_buf[0] == 0x05 {
         // SOCKS5
-        socks::run_socks_single(stream, peer, conn_manager).await
+        socks::run_socks_single(stream, peer, conn_manager, auth).await
     } else {
         // HTTP
-        http::run_http_single(stream, peer, conn_manager).await
+        http::run_http_single(stream, peer, conn_manager, auth).await
     }
 }

@@ -89,7 +89,7 @@ impl VlessOutbound {
 
     /// Resolve the proxy server address and open a TCP connection.
     async fn dial_server(&self, dns: &DnsResolver) -> Result<TcpStream> {
-        let ip = dns.query_upstream(&self.server).await?;
+        let ip = dns.resolve_proxy_server(&self.server).await?;
         let addr = SocketAddr::new(ip, self.port);
         debug!(
             "VLESS [{}]: connecting to {}:{}",

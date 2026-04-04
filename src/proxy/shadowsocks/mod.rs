@@ -23,6 +23,8 @@ pub struct ShadowsocksOutbound {
     port: u16,
     cipher: AeadCipher,
     master_key: Vec<u8>,
+    /// For SS2022 multi-user: (server_key, user_key). None for single-user or legacy.
+    identity_keys: Option<(Vec<u8>, Vec<u8>)>,
     udp: bool,
     plugin: Option<String>,
     plugin_opts: PluginOpts,
@@ -53,23 +55,53 @@ impl ShadowsocksOutbound {
 
         // Derive the master key:
         // - SS2022 ciphers: password is base64-encoded raw key
+        //   Multi-user format: "server_key:user_key" — decode each part, concatenate
         // - Legacy ciphers: password is derived via EVP_BytesToKey
-        let master_key = if cipher.is_ss2022() {
+        // For SS2022 multi-user, we need both server_key and user_key separately.
+        // master_key = user_key (used for session encryption)
+        // identity_keys = Some((server_key, user_key)) for identity header
+        let (master_key, identity_keys) = if cipher.is_ss2022() {
             use base64::Engine;
-            base64::engine::general_purpose::STANDARD
-                .decode(password)
-                .map_err(|e| anyhow!("ss2022: invalid base64 key: {}", e))?
-        } else {
-            evp_bytes_to_key(password.as_bytes(), cipher.key_len())
-        };
+            let decode_b64 = |s: &str| -> Result<Vec<u8>> {
+                base64::engine::general_purpose::STANDARD
+                    .decode(s)
+                    .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(s))
+                    .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(s))
+                    .or_else(|_| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(s))
+                    .map_err(|e| anyhow!("ss2022: invalid base64 key '{}': {}", s, e))
+            };
 
-        if master_key.len() != cipher.key_len() {
-            return Err(anyhow!(
-                "ss: key length mismatch: expected {} bytes, got {}",
-                cipher.key_len(),
-                master_key.len()
-            ));
-        }
+            if password.contains(':') {
+                // Multi-user format: "server_key:user_key"
+                let parts: Vec<&str> = password.splitn(2, ':').collect();
+                let server_key = decode_b64(parts[0])?;
+                let user_key = decode_b64(parts[1])?;
+                if server_key.len() != cipher.key_len() || user_key.len() != cipher.key_len() {
+                    return Err(anyhow!(
+                        "ss2022: key length mismatch: expected {} bytes each, got server={} user={}",
+                        cipher.key_len(),
+                        server_key.len(),
+                        user_key.len()
+                    ));
+                }
+                // master_key = user_key (for session), identity_keys for header
+                let ik = Some((server_key, user_key.clone()));
+                (user_key, ik)
+            } else {
+                let key = decode_b64(password)?;
+                if key.len() != cipher.key_len() {
+                    return Err(anyhow!(
+                        "ss2022: key length mismatch: expected {} bytes, got {}",
+                        cipher.key_len(),
+                        key.len()
+                    ));
+                }
+                (key, None) // single user, no identity header
+            }
+        } else {
+            let key = evp_bytes_to_key(password.as_bytes(), cipher.key_len());
+            (key, None)
+        };
 
         let udp = config.udp.unwrap_or(false);
         let plugin = config.plugin.clone();
@@ -97,6 +129,7 @@ impl ShadowsocksOutbound {
             port,
             cipher,
             master_key,
+            identity_keys,
             udp,
             plugin,
             plugin_opts,
@@ -109,14 +142,21 @@ impl ShadowsocksOutbound {
     async fn connect_to_server(&self, dns: &DnsResolver) -> Result<TcpStream> {
         let addr = {
             let ip = dns
-                .query_upstream(&self.server)
+                .resolve_proxy_server(&self.server)
                 .await
                 .map_err(|e| anyhow!("ss: failed to resolve server '{}': {}", self.server, e))?;
             std::net::SocketAddr::new(ip, self.port)
         };
 
-        debug!("ss: connecting to server {}:{}", addr.ip(), addr.port());
-        let stream = connect(addr, &self.connect_opts).await?;
+        info!("ss: connecting to server {} ({}:{})", self.server, addr.ip(), addr.port());
+        let stream = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            connect(addr, &self.connect_opts),
+        )
+        .await
+        .map_err(|_| anyhow!("ss: TCP connect timeout to {}:{}", addr.ip(), addr.port()))?
+        .map_err(|e| anyhow!("ss: TCP connect failed to {}:{}: {}", addr.ip(), addr.port(), e))?;
+        info!("ss: TCP connected to {}:{}", addr.ip(), addr.port());
         Ok(stream)
     }
 }
@@ -161,6 +201,7 @@ impl OutboundHandler for ShadowsocksOutbound {
                     self.cipher,
                     self.master_key.clone(),
                     addr_header,
+                    self.identity_keys.clone(),
                 );
                 Ok(Box::new(ss))
             }
@@ -182,6 +223,7 @@ impl OutboundHandler for ShadowsocksOutbound {
                     self.cipher,
                     self.master_key.clone(),
                     addr_header,
+                    self.identity_keys.clone(),
                 );
                 Ok(Box::new(ss))
             }
@@ -195,8 +237,13 @@ impl OutboundHandler for ShadowsocksOutbound {
                         .await
                         .map_err(|e| anyhow!("ss: v2ray-plugin setup failed: {}", e))?;
 
-                let ss =
-                    SsStream::new(transport, self.cipher, self.master_key.clone(), addr_header);
+                let ss = SsStream::new(
+                    transport,
+                    self.cipher,
+                    self.master_key.clone(),
+                    addr_header,
+                    self.identity_keys.clone(),
+                );
                 Ok(Box::new(ss))
             }
 
@@ -214,6 +261,7 @@ impl OutboundHandler for ShadowsocksOutbound {
                     self.cipher,
                     self.master_key.clone(),
                     addr_header,
+                    self.identity_keys.clone(),
                 );
                 Ok(Box::new(ss))
             }
@@ -229,6 +277,7 @@ impl OutboundHandler for ShadowsocksOutbound {
                     self.cipher,
                     self.master_key.clone(),
                     addr_header,
+                    self.identity_keys.clone(),
                 );
                 Ok(Box::new(ss))
             }

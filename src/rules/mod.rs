@@ -83,6 +83,7 @@ impl RuleEngine {
         // Collect the target associated with each RULE-SET reference so we can
         // assign provider rules to the correct proxy target.
         let mut ruleset_targets: HashMap<String, String> = HashMap::new();
+        let mut provider_rules: HashMap<String, Vec<ParsedRule>> = HashMap::new();
         for rule_str in rule_strings {
             let trimmed = rule_str.trim();
             if trimmed.starts_with("RULE-SET,") {
@@ -142,63 +143,52 @@ impl RuleEngine {
 
                 match behavior {
                     "domain" => {
-                        // Each line is a domain or domain suffix (e.g. "google.com" or "+.google.com")
                         let domain_val = payload
                             .trim_start_matches("+.")
                             .trim_start_matches("'")
                             .trim_end_matches("'")
                             .to_lowercase();
                         if !domain_val.is_empty() {
-                            // Treat as a suffix match (like DOMAIN-SUFFIX)
-                            domain_suffixes.push((domain_val, target.clone()));
+                            domain_suffixes.push((domain_val.clone(), target.clone()));
+                            // Also store for inline expansion
+                            provider_rules
+                                .entry(name.clone())
+                                .or_insert_with(Vec::new)
+                                .push(ParsedRule {
+                                    rule_type: "DOMAIN-SUFFIX".to_string(),
+                                    payload: domain_val,
+                                    target: target.clone(),
+                                    params: vec![],
+                                });
                         }
                     }
                     "ipcidr" => {
-                        // Each line is a CIDR notation (e.g. "192.168.0.0/16")
                         cidrs.push((payload.to_string(), target.clone()));
+                        provider_rules
+                            .entry(name.clone())
+                            .or_insert_with(Vec::new)
+                            .push(ParsedRule {
+                                rule_type: "IP-CIDR".to_string(),
+                                payload: payload.to_string(),
+                                target: target.clone(),
+                                params: vec![],
+                            });
                     }
                     "classical" => {
                         // Each line is a full rule string, e.g. "DOMAIN-SUFFIX,google.com"
-                        // We parse it as a regular rule but use the RULE-SET target
-                        // if the line doesn't already specify one.
                         let full_rule = if payload.matches(',').count() >= 2 {
-                            // Already has type,payload,target
                             payload.to_string()
                         } else {
-                            // Append target: "DOMAIN-SUFFIX,google.com" -> "DOMAIN-SUFFIX,google.com,target"
                             format!("{},{}", payload, target)
                         };
 
                         if let Ok(parsed) = parse_rule(&full_rule) {
-                            match parsed.rule_type.as_str() {
-                                "DOMAIN" => {
-                                    domain_exact
-                                        .insert(parsed.payload.clone(), parsed.target.clone());
-                                }
-                                "DOMAIN-SUFFIX" => {
-                                    domain_suffixes
-                                        .push((parsed.payload.clone(), parsed.target.clone()));
-                                }
-                                "DOMAIN-KEYWORD" => {
-                                    domain_keywords
-                                        .push((parsed.payload.clone(), parsed.target.clone()));
-                                }
-                                "IP-CIDR" | "IP-CIDR6" => {
-                                    cidrs.push((parsed.payload.clone(), parsed.target.clone()));
-                                }
-                                "SRC-IP-CIDR" => {
-                                    src_cidrs.push((parsed.payload.clone(), parsed.target.clone()));
-                                }
-                                "DST-PORT" => {
-                                    if let Ok(port) = parsed.payload.parse::<u16>() {
-                                        port_rules.insert(port, parsed.target.clone());
-                                    }
-                                }
-                                _ => {
-                                    // Other types: add as sequential rule
-                                    rules.push(parsed);
-                                }
-                            }
+                            // Store in provider_rules for later inline expansion
+                            // at the RULE-SET position in the main rules list
+                            provider_rules
+                                .entry(name.clone())
+                                .or_insert_with(Vec::new)
+                                .push(parsed);
                         }
                     }
                     other => {
@@ -249,13 +239,30 @@ impl RuleEngine {
                 }
             }
 
-            rules.push(parsed);
+            // For RULE-SET: expand provider rules inline at this position
+            if parsed.rule_type == "RULE-SET" {
+                if let Some(expanded) = provider_rules.remove(&parsed.payload) {
+                    rules.extend(expanded);
+                }
+                // Don't push the RULE-SET rule itself — it's been expanded
+            } else {
+                rules.push(parsed);
+            }
         }
 
         let domain_matcher =
             domain::DomainMatcher::new(domain_exact, domain_suffixes, domain_keywords);
         let cidr_matcher = ipcidr::CidrMatcher::new(cidrs);
         let src_cidr_matcher = ipcidr::CidrMatcher::new(src_cidrs);
+
+        // Log the first 20 rules for debugging rule order
+        tracing::info!("Rule engine: {} total sequential rules", rules.len());
+        for (i, rule) in rules.iter().take(20).enumerate() {
+            tracing::info!("  Rule[{}]: {},{},{}", i, rule.rule_type, rule.payload, rule.target);
+        }
+        if rules.len() > 20 {
+            tracing::info!("  ... ({} more rules)", rules.len() - 20);
+        }
 
         Ok(Self {
             rules,
@@ -273,49 +280,13 @@ impl RuleEngine {
     /// This is used by the connection manager to populate the `rule` and
     /// `rulePayload` fields in the connections API.
     pub fn match_rules_detailed(&self, metadata: &RuleMetadata) -> (Action, String, String) {
-        // 1. Domain-based rules (fast path)
-        if let Some(ref domain) = metadata.domain {
-            if let Some((rule_type, payload, target)) = self.domain_matcher.lookup_detailed(domain)
-            {
-                return (target_to_action(&target), rule_type, payload);
-            }
-        }
-
-        // 2. IP-based rules (dst)
-        if let Some(ref ip) = metadata.dst_ip {
-            if let Some(target) = self.cidr_matcher.lookup(ip) {
-                let rule_type = if ip.is_ipv6() { "IP-CIDR6" } else { "IP-CIDR" };
-                return (
-                    target_to_action(&target),
-                    rule_type.to_string(),
-                    ip.to_string(),
-                );
-            }
-        }
-
-        // 3. SRC-IP-CIDR rules
-        if let Some(ref ip) = metadata.src_ip {
-            if let Some(target) = self.src_cidr_matcher.lookup(ip) {
-                return (
-                    target_to_action(&target),
-                    "SRC-IP-CIDR".to_string(),
-                    ip.to_string(),
-                );
-            }
-        }
-
-        // 4. Port rules
-        if metadata.dst_port > 0 {
-            if let Some(target) = self.port_rules.get(&metadata.dst_port) {
-                return (
-                    target_to_action(target),
-                    "DST-PORT".to_string(),
-                    metadata.dst_port.to_string(),
-                );
-            }
-        }
-
-        // 5. Sequential fallback for complex rules
+        // Evaluate rules in CONFIG ORDER — first match wins.
+        // This matches mihomo behavior where rule priority is determined by
+        // position in the YAML file, not by rule type.
+        //
+        // We still use indexed data structures (domain trie, CIDR table, etc.)
+        // for O(1) lookup within each rule, but the evaluation order follows
+        // the original config sequence.
         for rule in &self.rules {
             if let Some(action) = self.match_single_rule(rule, metadata) {
                 return (action, rule.rule_type.clone(), rule.payload.clone());
@@ -455,8 +426,52 @@ impl RuleEngine {
                 }
             }
 
-            // Domain/IP/Port rules already handled in fast path
-            "DOMAIN" | "DOMAIN-SUFFIX" | "DOMAIN-KEYWORD" | "IP-CIDR" | "IP-CIDR6" | "DST-PORT" => {
+            "DOMAIN" => {
+                if let Some(ref domain) = metadata.domain {
+                    if domain.eq_ignore_ascii_case(&rule.payload) {
+                        return Some(target_to_action(&rule.target));
+                    }
+                }
+                None
+            }
+
+            "DOMAIN-SUFFIX" => {
+                if let Some(ref domain) = metadata.domain {
+                    let d = domain.to_lowercase();
+                    let s = rule.payload.to_lowercase();
+                    if d == s || d.ends_with(&format!(".{}", s)) {
+                        return Some(target_to_action(&rule.target));
+                    }
+                }
+                None
+            }
+
+            "DOMAIN-KEYWORD" => {
+                if let Some(ref domain) = metadata.domain {
+                    if domain.to_lowercase().contains(&rule.payload.to_lowercase()) {
+                        return Some(target_to_action(&rule.target));
+                    }
+                }
+                None
+            }
+
+            "IP-CIDR" | "IP-CIDR6" => {
+                if let Some(ref ip) = metadata.dst_ip {
+                    if let Some(target) = self.cidr_matcher.lookup(ip) {
+                        if target == rule.target {
+                            return Some(target_to_action(&rule.target));
+                        }
+                    }
+                }
+                None
+            }
+
+            "DST-PORT" => {
+                if let Ok(port) = rule.payload.parse::<u16>() {
+                    if metadata.dst_port == port {
+                        return Some(target_to_action(&rule.target));
+                    }
+                }
                 None
             }
 

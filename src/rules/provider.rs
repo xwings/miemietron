@@ -48,9 +48,10 @@ impl RuleProvider {
         };
 
         let format = match format {
-            Some("yaml") => RuleFormat::Yaml,
+            Some("text") => RuleFormat::Text,
             Some("mrs") => RuleFormat::Mrs,
-            _ => RuleFormat::Text,
+            // mihomo defaults to YAML for rule providers
+            _ => RuleFormat::Yaml,
         };
 
         Self {
@@ -182,7 +183,13 @@ impl RuleProvider {
     fn parse_content(&self, content: &str) -> Result<Vec<String>> {
         match self.format {
             RuleFormat::Text => Ok(parse_text_format(content)),
-            RuleFormat::Yaml => parse_yaml_format(content),
+            RuleFormat::Yaml => {
+                // Try YAML first; fall back to text if YAML parsing fails
+                match parse_yaml_format(content) {
+                    Ok(rules) if !rules.is_empty() => Ok(rules),
+                    _ => Ok(parse_text_format(content)),
+                }
+            }
             RuleFormat::Mrs => {
                 tracing::warn!(
                     "MRS binary format not yet implemented for provider '{}'",

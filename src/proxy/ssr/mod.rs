@@ -134,7 +134,7 @@ impl SsrOutbound {
     async fn connect_to_server(&self, dns: &DnsResolver) -> Result<TcpStream> {
         let addr = {
             let ip = dns
-                .query_upstream(&self.server)
+                .resolve_proxy_server(&self.server)
                 .await
                 .map_err(|e| anyhow!("ssr: failed to resolve server '{}': {}", self.server, e))?;
             std::net::SocketAddr::new(ip, self.port)

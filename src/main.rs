@@ -225,13 +225,42 @@ impl AppState {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    // Initialize logging with the broadcast layer for the /logs API
+    // -v: print version in mihomo-compatible format (before logging init)
+    if cli.print_version {
+        println!("{}", version_string());
+        return Ok(());
+    }
+
+    // -d: set working directory (OpenClash always passes -d /etc/openclash)
+    if let Some(ref home) = cli.home_dir {
+        if home.exists() {
+            if let Err(e) = std::env::set_current_dir(home) {
+                eprintln!("Failed to chdir to {}: {}", home.display(), e);
+            }
+        }
+    }
+
+    // Load config FIRST so we can use its log-level for tracing init
+    let config_path = resolve_config_path(&cli);
+    let mut config = MiemieConfig::load(&config_path)?;
+
+    // Initialize logging with the broadcast layer for the /logs API.
+    // Honor config's log-level (like mihomo), but RUST_LOG env var overrides.
     {
         use tracing_subscriber::layer::SubscriberExt;
         use tracing_subscriber::util::SubscriberInitExt;
 
+        let log_level = match config.log_level.as_str() {
+            "silent" => "off",
+            "error" => "error",
+            "warning" | "warn" => "warn",
+            "debug" => "debug",
+            "trace" => "trace",
+            _ => "info",
+        };
+
         let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(log_level));
 
         let fmt_layer = tracing_subscriber::fmt::layer();
 
@@ -244,27 +273,7 @@ async fn main() -> Result<()> {
             .init();
     }
 
-    // -v: print version in mihomo-compatible format
-    // OpenClash runs: `$CLASH -v | awk '{print $3}'` to extract version
-    // OpenClash runs: `$CLASH -v | grep 'meta'` to detect Meta core
-    if cli.print_version {
-        println!("{}", version_string());
-        return Ok(());
-    }
-
-    // -d: set working directory (OpenClash always passes -d /etc/openclash)
-    if let Some(ref home) = cli.home_dir {
-        if home.exists() {
-            if let Err(e) = std::env::set_current_dir(home) {
-                warn!("Failed to chdir to {}: {}", home.display(), e);
-            }
-        }
-    }
-
-    let config_path = resolve_config_path(&cli);
     info!("Loading config from: {}", config_path.display());
-
-    let mut config = MiemieConfig::load(&config_path)?;
 
     // Apply CLI overrides
     if let Some(ref addr) = cli.ext_ctl {
@@ -448,8 +457,11 @@ impl Engine {
             None
         };
 
-        // Start inbound proxy listeners (HTTP, SOCKS5, mixed-port)
+        // Start inbound proxy listeners (HTTP, SOCKS5, mixed-port, redir-port, tproxy-port)
         let mut inbound_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+
+        // Shared authentication list for inbound proxy connections
+        let auth_list: Arc<Vec<String>> = Arc::new(config.authentication.clone());
 
         let bind_ip: std::net::IpAddr = if config.allow_lan {
             if config.bind_address == "*" {
@@ -467,8 +479,9 @@ impl Engine {
         if config.mixed_port > 0 {
             let addr = std::net::SocketAddr::new(bind_ip, config.mixed_port);
             let cm = conn_manager.clone();
+            let auth = auth_list.clone();
             inbound_handles.push(tokio::spawn(async move {
-                if let Err(e) = inbound::run_mixed_proxy(addr, cm).await {
+                if let Err(e) = inbound::run_mixed_proxy(addr, cm, auth).await {
                     error!("Mixed proxy error: {}", e);
                 }
             }));
@@ -478,8 +491,9 @@ impl Engine {
         if config.port > 0 {
             let addr = std::net::SocketAddr::new(bind_ip, config.port);
             let cm = conn_manager.clone();
+            let auth = auth_list.clone();
             inbound_handles.push(tokio::spawn(async move {
-                if let Err(e) = inbound::http::run_http_proxy(addr, cm).await {
+                if let Err(e) = inbound::http::run_http_proxy(addr, cm, auth).await {
                     error!("HTTP proxy error: {}", e);
                 }
             }));
@@ -489,12 +503,44 @@ impl Engine {
         if config.socks_port > 0 {
             let addr = std::net::SocketAddr::new(bind_ip, config.socks_port);
             let cm = conn_manager.clone();
+            let auth = auth_list.clone();
             inbound_handles.push(tokio::spawn(async move {
-                if let Err(e) = inbound::socks::run_socks_proxy(addr, cm).await {
+                if let Err(e) = inbound::socks::run_socks_proxy(addr, cm, auth).await {
                     error!("SOCKS5 proxy error: {}", e);
                 }
             }));
             info!("SOCKS5 proxy on {}", addr);
+        }
+
+        // redir-port: transparent TCP proxy for iptables REDIRECT (used by OpenClash)
+        if config.redir_port > 0 {
+            let port = config.redir_port;
+            let cm = conn_manager.clone();
+            inbound_handles.push(tokio::spawn(async move {
+                if let Err(e) = inbound::redir::run_redir_listener(port, cm).await {
+                    error!("Redir proxy error: {}", e);
+                }
+            }));
+            info!(
+                "Transparent TCP (redir-port) on 0.0.0.0:{}",
+                config.redir_port
+            );
+        }
+
+        // tproxy-port: transparent UDP proxy for iptables TPROXY (used by OpenClash)
+        if config.tproxy_port > 0 {
+            let port = config.tproxy_port;
+            let cm = conn_manager.clone();
+            let dns = dns_resolver.clone();
+            inbound_handles.push(tokio::spawn(async move {
+                if let Err(e) = tun::run_tproxy_udp_listener(port, cm, dns).await {
+                    error!("TPROXY UDP proxy error: {}", e);
+                }
+            }));
+            info!(
+                "Transparent UDP (tproxy-port) on 0.0.0.0:{}",
+                config.tproxy_port
+            );
         }
 
         // Spawn background health checks for url-test and fallback groups

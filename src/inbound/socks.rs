@@ -28,7 +28,11 @@ const REP_GENERAL_FAILURE: u8 = 0x01;
 const REP_CMD_NOT_SUPPORTED: u8 = 0x07;
 
 /// Start a SOCKS5 proxy listener on `addr`.
-pub async fn run_socks_proxy(addr: SocketAddr, conn_manager: Arc<ConnectionManager>) -> Result<()> {
+pub async fn run_socks_proxy(
+    addr: SocketAddr,
+    conn_manager: Arc<ConnectionManager>,
+    auth: Arc<Vec<String>>,
+) -> Result<()> {
     let listener = TcpListener::bind(addr).await?;
     tracing::info!("SOCKS5 proxy listening on {}", addr);
 
@@ -42,8 +46,9 @@ pub async fn run_socks_proxy(addr: SocketAddr, conn_manager: Arc<ConnectionManag
         };
 
         let cm = conn_manager.clone();
+        let auth = auth.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_socks5(stream, peer, cm).await {
+            if let Err(e) = handle_socks5(stream, peer, cm, &auth).await {
                 debug!("SOCKS5 connection from {} ended: {}", peer, e);
             }
         });
@@ -54,7 +59,10 @@ async fn handle_socks5(
     mut stream: TcpStream,
     peer: SocketAddr,
     conn_manager: Arc<ConnectionManager>,
+    auth_list: &[String],
 ) -> Result<()> {
+    let require_auth = !auth_list.is_empty();
+
     // --- Auth negotiation ---
     let version = stream.read_u8().await?;
     if version != SOCKS5_VERSION {
@@ -65,16 +73,28 @@ async fn handle_socks5(
     let mut methods = vec![0u8; n_methods];
     stream.read_exact(&mut methods).await?;
 
-    // Prefer no-auth; fall back to user/pass if offered
-    let chosen = if methods.contains(&AUTH_NONE) {
-        AUTH_NONE
-    } else if methods.contains(&AUTH_USER_PASS) {
-        AUTH_USER_PASS
+    let chosen = if require_auth {
+        // When authentication is configured, require username/password
+        if methods.contains(&AUTH_USER_PASS) {
+            AUTH_USER_PASS
+        } else {
+            stream
+                .write_all(&[SOCKS5_VERSION, AUTH_NO_ACCEPTABLE])
+                .await?;
+            return Err(anyhow!("client does not support required auth method"));
+        }
     } else {
-        stream
-            .write_all(&[SOCKS5_VERSION, AUTH_NO_ACCEPTABLE])
-            .await?;
-        return Err(anyhow!("no acceptable auth method"));
+        // No authentication configured: prefer no-auth, fall back to user/pass
+        if methods.contains(&AUTH_NONE) {
+            AUTH_NONE
+        } else if methods.contains(&AUTH_USER_PASS) {
+            AUTH_USER_PASS
+        } else {
+            stream
+                .write_all(&[SOCKS5_VERSION, AUTH_NO_ACCEPTABLE])
+                .await?;
+            return Err(anyhow!("no acceptable auth method"));
+        }
     };
 
     stream.write_all(&[SOCKS5_VERSION, chosen]).await?;
@@ -92,7 +112,23 @@ async fn handle_socks5(
         let mut passwd = vec![0u8; plen];
         stream.read_exact(&mut passwd).await?;
 
-        // Accept all credentials (auth enforcement is out of scope for now)
+        let username = String::from_utf8_lossy(&uname);
+        let password = String::from_utf8_lossy(&passwd);
+
+        if require_auth {
+            // Validate against the configured authentication list
+            // Each entry is "username:password"
+            let credential = format!("{}:{}", username, password);
+            if !auth_list.iter().any(|entry| entry == &credential) {
+                stream.write_all(&[0x01, 0x01]).await?; // failure
+                return Err(anyhow!(
+                    "SOCKS5 auth failed for user '{}' from {}",
+                    username,
+                    peer
+                ));
+            }
+        }
+
         stream.write_all(&[0x01, 0x00]).await?; // success
     }
 
@@ -107,8 +143,16 @@ async fn handle_socks5(
 
     let (host, port) = read_address(&mut stream, atyp).await?;
 
-    // Resolve to SocketAddr
-    let dst = resolve_target(&host, port).await?;
+    // Build dst SocketAddr and host_override (for domain targets)
+    let (dst, host_override) = if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        (SocketAddr::new(ip, port), None)
+    } else {
+        // Domain target — use placeholder IP, pass domain via host_override
+        (
+            SocketAddr::new(std::net::IpAddr::V4(Ipv4Addr::UNSPECIFIED), port),
+            Some(host.clone()),
+        )
+    };
 
     match cmd {
         CMD_CONNECT => {
@@ -116,7 +160,7 @@ async fn handle_socks5(
             send_reply(&mut stream, REP_SUCCESS, &dst).await?;
 
             conn_manager
-                .handle_tcp_typed(peer, dst, stream, "socks5")
+                .handle_tcp_with_host(peer, dst, stream, "socks5", host_override)
                 .await?;
         }
         CMD_UDP_ASSOCIATE => {
@@ -198,55 +242,14 @@ pub async fn run_socks_single(
     stream: TcpStream,
     peer: SocketAddr,
     conn_manager: Arc<ConnectionManager>,
+    auth: Arc<Vec<String>>,
 ) -> Result<()> {
-    handle_socks5(stream, peer, conn_manager).await
-}
-
-/// Resolve host:port to a SocketAddr.
-async fn resolve_target(host: &str, port: u16) -> Result<SocketAddr> {
-    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-        return Ok(SocketAddr::new(ip, port));
-    }
-    let addrs: Vec<SocketAddr> = tokio::net::lookup_host(format!("{}:{}", host, port))
-        .await?
-        .collect();
-    addrs
-        .into_iter()
-        .next()
-        .ok_or_else(|| anyhow!("DNS resolution failed for {}", host))
+    handle_socks5(stream, peer, conn_manager, &auth).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // ---- resolve_target tests (address parsing) ----
-
-    #[tokio::test]
-    async fn resolve_target_ipv4() {
-        let addr = resolve_target("1.2.3.4", 8080).await.unwrap();
-        assert_eq!(addr, SocketAddr::new("1.2.3.4".parse().unwrap(), 8080));
-    }
-
-    #[tokio::test]
-    async fn resolve_target_ipv6() {
-        let addr = resolve_target("::1", 443).await.unwrap();
-        assert_eq!(addr, SocketAddr::new("::1".parse().unwrap(), 443));
-    }
-
-    #[tokio::test]
-    async fn resolve_target_ipv4_any() {
-        let addr = resolve_target("0.0.0.0", 0).await.unwrap();
-        assert_eq!(addr, SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0));
-    }
-
-    #[tokio::test]
-    async fn resolve_target_localhost() {
-        // localhost should resolve to 127.0.0.1 or ::1 on most systems
-        let addr = resolve_target("localhost", 80).await.unwrap();
-        assert!(addr.ip().is_loopback());
-        assert_eq!(addr.port(), 80);
-    }
 
     // ---- SOCKS5 constants tests ----
 

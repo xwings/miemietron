@@ -26,6 +26,99 @@ static DNS_GEOIP: std::sync::LazyLock<GeoIpMatcher> = std::sync::LazyLock::new(|
     GeoIpMatcher::new(&home_dir)
 });
 
+/// Resolve a proxy server hostname using only direct/bootstrap DNS.
+///
+/// Uses `proxy-server-nameserver` if configured, otherwise falls back to
+/// `default-nameserver`. These are typically plain UDP servers (e.g.
+/// 114.114.114.114) set by OpenClash, avoiding the circular dependency
+/// where DoH/DoT nameservers need a proxy but the proxy needs DNS first.
+pub async fn resolve_proxy_server(domain: &str, config: &DnsConfig) -> Result<IpAddr> {
+    // 0. Check nameserver-policy first (e.g. "+.oix_nodes.com": "124.221.68.73:1053")
+    if let Some(server) = match_nameserver_policy(domain, &config.nameserver_policy) {
+        match query_server(domain, &server).await {
+            Ok(ip) => {
+                debug!(
+                    "DNS nameserver-policy resolved {} -> {} via {}",
+                    domain, ip, server
+                );
+                return Ok(ip);
+            }
+            Err(e) => {
+                debug!(
+                    "DNS nameserver-policy {} failed for {}: {}",
+                    server, domain, e
+                );
+            }
+        }
+    }
+
+    // 1. Use proxy-server-nameserver if configured
+    if !config.proxy_server_nameserver.is_empty() {
+        for server in &config.proxy_server_nameserver {
+            match query_server(domain, server).await {
+                Ok(ip) => {
+                    debug!(
+                        "DNS proxy-server-nameserver resolved {} -> {} via {}",
+                        domain, ip, server
+                    );
+                    return Ok(ip);
+                }
+                Err(e) => {
+                    debug!(
+                        "DNS proxy-server-nameserver {} failed for {}: {}",
+                        server, domain, e
+                    );
+                }
+            }
+        }
+    }
+
+    // 2. Fall back to default-nameserver (bootstrap DNS)
+    if !config.default_nameserver.is_empty() {
+        for server in &config.default_nameserver {
+            match query_server(domain, server).await {
+                Ok(ip) => {
+                    debug!(
+                        "DNS default-nameserver resolved {} -> {} via {}",
+                        domain, ip, server
+                    );
+                    return Ok(ip);
+                }
+                Err(e) => {
+                    debug!(
+                        "DNS default-nameserver {} failed for {}: {}",
+                        server, domain, e
+                    );
+                }
+            }
+        }
+    }
+
+    // 3. Fall back to system resolver (like mihomo's SystemResolver)
+    // This uses the OS /etc/resolv.conf DNS
+    match tokio::net::lookup_host(format!("{}:0", domain)).await {
+        Ok(mut addrs) => {
+            if let Some(addr) = addrs.next() {
+                debug!(
+                    "DNS system resolver resolved {} -> {}",
+                    domain,
+                    addr.ip()
+                );
+                return Ok(addr.ip());
+            }
+        }
+        Err(e) => {
+            debug!("DNS system resolver failed for {}: {}", domain, e);
+        }
+    }
+
+    Err(anyhow::anyhow!(
+        "all DNS servers failed for proxy server '{}' \
+         (proxy-server-nameserver, default-nameserver, and system resolver all failed)",
+        domain
+    ))
+}
+
 /// Resolve a domain by querying upstream DNS servers.
 ///
 /// Implements fallback logic: queries primary nameservers first, and if the
@@ -518,6 +611,54 @@ fn skip_dns_name(data: &[u8], mut pos: usize) -> Result<usize> {
         }
         pos += 1 + len;
     }
+}
+
+/// Match a domain against nameserver-policy entries.
+///
+/// Policy keys can be:
+/// - `"+.domain.com"` — matches domain.com and all subdomains
+/// - `"domain.com"` — exact match
+/// - `"geosite:xxx"` — not supported yet, returns None
+///
+/// Policy values can be a string (single server) or YAML array.
+fn match_nameserver_policy(
+    domain: &str,
+    policy: &std::collections::HashMap<String, serde_yaml::Value>,
+) -> Option<String> {
+    let domain_lower = domain.to_lowercase();
+
+    for (pattern, value) in policy {
+        let pattern_lower = pattern.to_lowercase();
+
+        // Skip geosite: patterns (not supported in proxy server resolution)
+        if pattern_lower.starts_with("geosite:") {
+            continue;
+        }
+
+        let matches = if let Some(suffix) = pattern_lower.strip_prefix("+.") {
+            // "+.domain.com" matches "domain.com" and "*.domain.com"
+            domain_lower == suffix || domain_lower.ends_with(&format!(".{}", suffix))
+        } else {
+            domain_lower == pattern_lower
+        };
+
+        if matches {
+            // Extract server string from YAML value
+            let server = match value {
+                serde_yaml::Value::String(s) => Some(s.clone()),
+                serde_yaml::Value::Sequence(seq) => {
+                    // Use first server in the list
+                    seq.first().and_then(|v| v.as_str().map(String::from))
+                }
+                _ => None,
+            };
+            if let Some(s) = server {
+                return Some(s);
+            }
+        }
+    }
+
+    None
 }
 
 fn rand_u16() -> u16 {

@@ -44,15 +44,21 @@ pub async fn run_tun(
     let tun_dev = TunDevice::open(&config)?;
     info!("TUN device {} opened (MTU {})", config.device, config.mtu);
 
-    // ---- Step 2: Set up ip routes ----
+    // ---- Step 2: Set up ip routes and iptables ----
+    // Only set up routes and firewall rules when auto-route is enabled.
+    // When auto-route is false, an external manager (e.g. OpenClash) handles
+    // all firewall rules and redirects traffic to redir-port/tproxy-port instead.
     if config.auto_route {
         route::setup_routes(&config).await?;
         info!("Auto-route configured");
-    }
 
-    // ---- Step 3: Set up iptables redirect rules ----
-    route::setup_iptables(&config.device, TCP_REDIR_PORT, UDP_TPROXY_PORT, FWMARK).await?;
-    info!("iptables redirect rules configured");
+        route::setup_iptables(&config.device, TCP_REDIR_PORT, UDP_TPROXY_PORT, FWMARK).await?;
+        info!("iptables redirect rules configured");
+    } else {
+        info!(
+            "Auto-route disabled — skipping route and firewall setup (external manager expected)"
+        );
+    }
 
     // ---- Step 4: Start the system stack (TCP listener) ----
     let stack = SystemStack::new(&config.device, TCP_REDIR_PORT).await?;
@@ -787,11 +793,24 @@ fn send_udp_from(from_addr: SocketAddr, to_addr: SocketAddr, data: &[u8]) -> std
     Ok(())
 }
 
+/// Run a standalone UDP TPROXY listener on the given port.
+///
+/// This is used when `tproxy-port` is configured (e.g. by OpenClash) to accept
+/// TPROXY'd UDP datagrams independently of the TUN device.
+pub async fn run_tproxy_udp_listener(
+    port: u16,
+    conn_manager: Arc<ConnectionManager>,
+    dns: Arc<DnsResolver>,
+) -> Result<()> {
+    // Default UDP session timeout of 300 seconds
+    run_udp_relay(port, conn_manager, dns, 300).await
+}
+
 /// Cleanup guard that removes iptables rules when the TUN module shuts down.
 /// This is called from the Engine when it aborts the TUN task.
 pub async fn cleanup(config: &TunConfig) -> Result<()> {
-    route::cleanup_iptables(&config.device).await?;
     if config.auto_route {
+        route::cleanup_iptables(&config.device).await?;
         route::cleanup_routes(config).await?;
     }
     Ok(())

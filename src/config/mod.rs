@@ -37,6 +37,12 @@ pub struct MiemieConfig {
     #[serde(default = "default_bind_address")]
     pub bind_address: String,
 
+    // --- Authentication ---
+    /// List of "username:password" pairs for inbound proxy authentication.
+    /// When non-empty, SOCKS5 and HTTP proxy inbound connections must authenticate.
+    #[serde(default)]
+    pub authentication: Vec<String>,
+
     // --- External controller ---
     #[serde(default)]
     pub external_controller: Option<String>,

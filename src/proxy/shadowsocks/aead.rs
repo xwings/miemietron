@@ -2,6 +2,7 @@ use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+use aes::cipher::BlockEncrypt;
 use aes_gcm::aead::generic_array::GenericArray;
 use aes_gcm::aead::{AeadInPlace, KeyInit};
 use aes_gcm::{Aes128Gcm, Aes256Gcm};
@@ -12,8 +13,11 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::common::addr::Address;
 
-/// Maximum payload size per chunk (0x3FFF = 16383 bytes).
+/// Maximum payload size per chunk.
+/// Legacy AEAD: 0x3FFF (16383 bytes)
+/// SS2022: 0xFFFF (65535 bytes)
 const MAX_PAYLOAD_SIZE: usize = 0x3FFF;
+const MAX_PAYLOAD_SIZE_2022: usize = 0xFFFF;
 
 /// AEAD tag size for all supported ciphers (16 bytes).
 const TAG_LEN: usize = 16;
@@ -295,12 +299,24 @@ enum WriteState {
     Ready,
     /// We have encrypted data that needs to be flushed to the inner writer.
     Flushing { buf: Vec<u8>, pos: usize },
+    /// SS2022: waiting for first user data to bundle with the address header.
+    /// The first poll_write builds the complete initial request including user data.
+    WaitingFirstData {
+        salt: Vec<u8>,
+        addr_header: Vec<u8>,
+        identity_server_key: Option<Vec<u8>>,
+        identity_user_key: Option<Vec<u8>>,
+    },
 }
 
 /// Internal states for the read (decrypt) half.
 enum ReadState {
     /// We need to read the salt from the remote server first.
     WaitingSalt { buf: Vec<u8> },
+    /// SS2022 only: read and validate the fixed-size response header after salt.
+    /// The response header is: [0x01][timestamp: 8 bytes][request_salt: key_len bytes]
+    /// encrypted as a single AEAD chunk (header_len + TAG_LEN bytes on the wire).
+    WaitingSs2022ResponseHeader { buf: Vec<u8>, header_len: usize },
     /// We need to read the encrypted length field (2 bytes + TAG_LEN).
     WaitingLength { buf: Vec<u8> },
     /// We need to read the encrypted payload (payload_len bytes + TAG_LEN).
@@ -315,15 +331,32 @@ pin_project! {
     /// Wraps an inner async stream (TCP, TLS, WebSocket, etc.) and provides
     /// transparent AEAD encryption/decryption per the Shadowsocks protocol.
     ///
-    /// Wire format (client -> server):
+    /// Legacy wire format (client -> server):
     ///   [salt][encrypted_length(2) + tag(16)][encrypted_payload + tag(16)] ...
+    ///   The first payload chunk contains the target address header.
     ///
-    /// The first payload chunk contains the target address header.
+    /// SS2022 wire format (client -> server):
+    ///   [salt][encrypted_request_header + tag(16)][encrypted_length + tag][encrypted_payload + tag] ...
+    ///   Request header: [0x00][timestamp_be(8)][variable_len_be(2)][socks_addr][padding_len(2)][padding][initial_data]
+    ///
+    /// SS2022 wire format (server -> client):
+    ///   [salt][encrypted_response_header + tag(16)][encrypted_length + tag][encrypted_payload + tag] ...
+    ///   Response header: [0x01][timestamp_be(8)][request_salt(key_len)][variable_length_be(2)][variable_data]
     pub struct SsStream<T> {
         #[pin]
         inner: T,
         cipher_type: AeadCipher,
         master_key: Vec<u8>,
+
+        // SS2022 mode flag
+        is_ss2022: bool,
+        // The salt we sent in the request (needed to verify response header)
+        request_salt: Vec<u8>,
+
+        // SS2022 multi-user: the key used for response decryption session derivation.
+        // For single-user this is the same as master_key.
+        // For multi-user this is the user_key (second part after ':').
+        session_key: Vec<u8>,
 
         // Encrypt state (write path)
         enc_cipher: Option<CipherCore>,
@@ -341,37 +374,70 @@ pin_project! {
 impl<T> SsStream<T> {
     /// Create a new SsStream wrapping the given inner stream.
     ///
-    /// `master_key` is derived from the password via evp_bytes_to_key.
+    /// `master_key` is derived from the password via evp_bytes_to_key (legacy) or base64-decoded (SS2022).
     /// `cipher` specifies which AEAD cipher to use.
-    /// `initial_payload` is the first data to send (typically the address header + first data).
+    /// `initial_payload` is the first data to send (typically the address header for legacy,
+    /// or the SOCKS address header for SS2022).
+    /// `identity_keys` is for SS2022 multi-user mode: `Some((server_key, user_key))`.
+    ///   When present, the identity header is derived from server_key and the session
+    ///   encryption uses user_key. When `None`, master_key is used for everything.
     pub fn new(
         inner: T,
         cipher: AeadCipher,
         master_key: Vec<u8>,
         initial_payload: Vec<u8>,
+        identity_keys: Option<(Vec<u8>, Vec<u8>)>,
     ) -> Self {
+        let is_ss2022 = cipher.is_ss2022();
+
         // Generate random salt for the encryption direction
         let salt = generate_salt(cipher.salt_len());
 
-        // Derive the encryption subkey from master key + salt
-        let enc_subkey = cipher.derive_subkey(&master_key, &salt);
+        // For SS2022 multi-user, the session key is derived from the USER key,
+        // and the identity header uses the SERVER key.
+        // For single-user or legacy, session key = master_key.
+        let (session_key, identity) = if let Some((ref server_key, ref user_key)) = identity_keys {
+            (user_key.clone(), Some(server_key.clone()))
+        } else {
+            (master_key.clone(), None)
+        };
+
+        // Derive the encryption subkey from session key + salt
+        let enc_subkey = cipher.derive_subkey(&session_key, &salt);
         let enc_cipher = CipherCore::new(cipher, enc_subkey);
 
-        // Build the initial write buffer: salt + encrypted first chunk(s)
-        let mut enc_nonce = NonceCounter::new();
-        let initial_buf =
-            build_initial_buffer(&salt, &enc_cipher, &mut enc_nonce, &initial_payload);
+        // Keep a copy of the salt for SS2022 response header verification
+        let request_salt = if is_ss2022 { salt.clone() } else { Vec::new() };
+
+        // For SS2022: delay building the initial buffer until first poll_write,
+        // so we can bundle the first user data (TLS ClientHello) with the address.
+        // For legacy: build the initial buffer immediately.
+        let (write_state, enc_nonce) = if is_ss2022 {
+            (
+                WriteState::WaitingFirstData {
+                    salt,
+                    addr_header: initial_payload,
+                    identity_server_key: identity,
+                    identity_user_key: identity_keys.as_ref().map(|(_, uk)| uk.clone()),
+                },
+                NonceCounter::new(),
+            )
+        } else {
+            let mut nonce = NonceCounter::new();
+            let buf = build_initial_buffer(&salt, &enc_cipher, &mut nonce, &initial_payload);
+            (WriteState::Flushing { buf, pos: 0 }, nonce)
+        };
 
         Self {
             inner,
             cipher_type: cipher,
             master_key,
+            is_ss2022,
+            request_salt,
+            session_key,
             enc_cipher: Some(enc_cipher),
             enc_nonce,
-            write_state: WriteState::Flushing {
-                buf: initial_buf,
-                pos: 0,
-            },
+            write_state,
             salt_sent: true,
             dec_cipher: None,
             dec_nonce: NonceCounter::new(),
@@ -416,6 +482,169 @@ fn build_initial_buffer(
     }
 
     buf
+}
+
+/// Build the initial send buffer for SS2022:
+/// [salt][identity_header (16 bytes, if multi-user)][encrypted_request_header + tag(16)]
+///
+/// The request header plaintext is:
+///   [0x00 (client type)][timestamp_be(8)][variable_length_be(2)][socks_addr][padding_len_be(2)][padding][initial_data]
+///
+/// The entire header is encrypted as ONE AEAD chunk (nonce=0).
+/// After the header, subsequent data uses standard length-prefixed chunks (nonce continues).
+///
+/// For multi-user mode:
+///   `server_key` = Some(server PSK) -- used to derive the identity subkey
+///   `user_key` = Some(user PSK) -- its hash is encrypted as the identity header
+///   The session cipher (passed in `cipher`) must already be derived from the user_key.
+fn build_ss2022_request_buffer(
+    salt: &[u8],
+    cipher: &CipherCore,
+    nonce: &mut NonceCounter,
+    addr_header: &[u8],
+    cipher_type: AeadCipher,
+    server_key: Option<&[u8]>,
+    user_key: Option<&[u8]>,
+    first_data: &[u8],
+) -> Vec<u8> {
+    // SS2022 TCP request format (per shadowsocks-rust / SIP022):
+    //
+    //   [salt][EIH?][AEAD_header (nonce=0)][AEAD_data (nonce=1)]
+    //
+    // AEAD_header plaintext (11 bytes):
+    //   [type(1)=0x00][timestamp(8)][data_length(2)]
+    //   data_length = length of the NEXT chunk's plaintext (addr+padding_len+padding)
+    //
+    // AEAD_data plaintext:
+    //   [socks_addr][padding_len(2)][padding bytes]
+    //
+    // Only 2 nonces used. No separate encrypted length prefixes — the header
+    // chunk embeds the data length. After this, subsequent writes use the
+    // standard [enc_len(18)][enc_payload] format with nonces 2, 3, 4, ...
+
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time before epoch")
+        .as_secs();
+
+    // Data chunk plaintext: [socks_addr][padding_len(2)][padding][first_user_data]
+    // When first_data is non-empty, padding=0. When empty, random 0-900 padding.
+    let padding_size: u16 = if first_data.is_empty() {
+        use rand::Rng;
+        rand::thread_rng().gen_range(0..=900)
+    } else {
+        0
+    };
+    let mut data_payload =
+        Vec::with_capacity(addr_header.len() + 2 + padding_size as usize + first_data.len());
+    data_payload.extend_from_slice(addr_header);
+    data_payload.extend_from_slice(&padding_size.to_be_bytes());
+    if padding_size > 0 {
+        data_payload.resize(data_payload.len() + padding_size as usize, 0);
+    }
+    data_payload.extend_from_slice(first_data);
+
+    // Header chunk plaintext (11 bytes): [type][timestamp][data_length]
+    let mut header = Vec::with_capacity(11);
+    header.push(0x00); // type: client request
+    header.extend_from_slice(&timestamp.to_be_bytes()); // 8 bytes
+    header.extend_from_slice(&(data_payload.len() as u16).to_be_bytes()); // 2 bytes
+
+    tracing::info!(
+        "SS2022 request: timestamp={} data_len={} salt_len={} identity={}",
+        timestamp,
+        data_payload.len(),
+        salt.len(),
+        server_key.is_some(),
+    );
+
+    // --- Build wire buffer ---
+    let mut buf = Vec::with_capacity(
+        salt.len() + 16 + (header.len() + TAG_LEN) + (data_payload.len() + TAG_LEN),
+    );
+
+    // [1] Salt (plaintext)
+    buf.extend_from_slice(salt);
+
+    // [2] EIH (identity header, AES-ECB encrypted, multi-user only)
+    if let (Some(server_key), Some(user_key)) = (server_key, user_key) {
+        let identity_header =
+            build_identity_header(server_key, user_key, salt, cipher_type.key_len());
+        buf.extend_from_slice(&identity_header);
+    }
+
+    // [3] AEAD header chunk (nonce=0): 11 bytes plaintext → 27 bytes on wire
+    cipher
+        .encrypt_in_place(nonce.current(), &mut header)
+        .expect("encrypt ss2022 header");
+    nonce.increment();
+    buf.extend_from_slice(&header);
+
+    // [4] AEAD data chunk (nonce=1): data_payload bytes → data_payload.len()+16 on wire
+    cipher
+        .encrypt_in_place(nonce.current(), &mut data_payload)
+        .expect("encrypt ss2022 data");
+    nonce.increment();
+    buf.extend_from_slice(&data_payload);
+
+    tracing::info!(
+        "SS2022 wire: total={} (salt={} eih={} header={} data={})",
+        buf.len(),
+        salt.len(),
+        if server_key.is_some() { 16 } else { 0 },
+        header.len(),
+        data_payload.len(),
+    );
+
+    buf
+}
+
+/// Build the 16-byte identity header for SS2022 multi-user mode.
+///
+/// 1. Derive identity_subkey = blake3::derive_key("shadowsocks 2022 identity subkey", server_psk || salt)
+/// 2. Compute psk_hash = blake3::hash(user_psk)[0..16]
+/// 3. AES-ECB encrypt psk_hash with identity_subkey[0..16]
+fn build_identity_header(
+    server_key: &[u8],
+    user_key: &[u8],
+    salt: &[u8],
+    key_len: usize,
+) -> [u8; 16] {
+    // Derive identity subkey
+    let mut context_material = Vec::with_capacity(server_key.len() + salt.len());
+    context_material.extend_from_slice(server_key);
+    context_material.extend_from_slice(salt);
+    let mut identity_subkey = vec![0u8; key_len];
+    let mut hasher = blake3::Hasher::new_derive_key("shadowsocks 2022 identity subkey");
+    hasher.update(&context_material);
+    hasher.finalize_xof().fill(&mut identity_subkey);
+
+    // Compute psk_hash = blake3::hash(user_psk)[0..16]
+    let user_hash = blake3::hash(user_key);
+    let mut psk_hash = [0u8; 16];
+    psk_hash.copy_from_slice(&user_hash.as_bytes()[..16]);
+
+    // AES-ECB encrypt psk_hash with identity_subkey.
+    // Key size matches the cipher: AES-128 for 16-byte keys, AES-256 for 32-byte keys.
+    let mut block = aes::Block::from(psk_hash);
+    match key_len {
+        16 => {
+            let aes_key = GenericArray::from_slice(&identity_subkey[..16]);
+            aes::Aes128::new(aes_key).encrypt_block(&mut block);
+        }
+        32 => {
+            use aes::cipher::KeyInit as _;
+            let aes_key = aes::cipher::generic_array::GenericArray::from_slice(&identity_subkey[..32]);
+            aes::Aes256::new(aes_key).encrypt_block(&mut block);
+        }
+        _ => {
+            // Fallback to AES-128 with first 16 bytes
+            let aes_key = GenericArray::from_slice(&identity_subkey[..16]);
+            aes::Aes128::new(aes_key).encrypt_block(&mut block);
+        }
+    }
+
+    block.into()
 }
 
 /// Generate a random salt of the given length.
@@ -547,6 +776,323 @@ mod tests {
         assert_eq!(AeadCipher::Aes256Gcm.key_len(), 32);
         assert_eq!(AeadCipher::ChaCha20Poly1305.key_len(), 32);
     }
+
+    #[test]
+    fn ss2022_cipher_detection() {
+        assert!(!AeadCipher::Aes128Gcm.is_ss2022());
+        assert!(!AeadCipher::Aes256Gcm.is_ss2022());
+        assert!(!AeadCipher::ChaCha20Poly1305.is_ss2022());
+        assert!(AeadCipher::Blake3Aes128Gcm.is_ss2022());
+        assert!(AeadCipher::Blake3Aes256Gcm.is_ss2022());
+        assert!(AeadCipher::Blake3ChaCha20Poly1305.is_ss2022());
+    }
+
+    #[test]
+    fn ss2022_blake3_key_derivation() {
+        let cipher = AeadCipher::Blake3Aes256Gcm;
+        let key = vec![0x42u8; 32];
+        let salt = vec![0xABu8; 32];
+        let subkey = cipher.derive_subkey(&key, &salt);
+        assert_eq!(subkey.len(), 32);
+
+        // Same inputs should produce same output
+        let subkey2 = cipher.derive_subkey(&key, &salt);
+        assert_eq!(subkey, subkey2);
+
+        // Different salt should produce different subkey
+        let salt2 = vec![0xCDu8; 32];
+        let subkey3 = cipher.derive_subkey(&key, &salt2);
+        assert_ne!(subkey, subkey3);
+    }
+
+    #[test]
+    fn ss2022_request_buffer_structure_aes256() {
+        let cipher = AeadCipher::Blake3Aes256Gcm;
+        let key = vec![0x42u8; 32];
+        let salt = generate_salt(cipher.salt_len());
+        let subkey = cipher.derive_subkey(&key, &salt);
+        let enc_cipher = CipherCore::new(cipher, subkey.clone());
+        let mut nonce = NonceCounter::new();
+
+        // Address header for example.com:443
+        let addr = Address::Domain("example.com".to_string(), 443);
+        let addr_header = encode_address(&addr);
+
+        let buf = build_ss2022_request_buffer(
+            &salt,
+            &enc_cipher,
+            &mut nonce,
+            &addr_header,
+            AeadCipher::Blake3Aes256Gcm,
+            None,
+            None,
+        );
+
+        // Buffer should start with the salt
+        assert_eq!(&buf[..32], &salt[..]);
+
+        // After the salt: encrypted header
+        // Header plaintext: type(1) + timestamp(8) + variable_len(2) + addr(15) + padding_len(2) = 28 bytes
+        // Encrypted: 28 + TAG_LEN(16) = 44 bytes
+        let header_plaintext_len = 1 + 8 + 2 + addr_header.len() + 2;
+        let encrypted_header_len = header_plaintext_len + TAG_LEN;
+        assert_eq!(buf.len(), 32 + encrypted_header_len);
+
+        // Verify we can decrypt the header
+        let dec_cipher = CipherCore::new(cipher, subkey);
+        let mut dec_nonce = NonceCounter::new();
+        let mut header_data = buf[32..].to_vec();
+        dec_cipher
+            .decrypt_in_place(dec_nonce.current(), &mut header_data)
+            .expect("decrypt ss2022 request header");
+        dec_nonce.increment();
+
+        // Verify header structure
+        assert_eq!(header_data[0], 0x00); // client type
+                                          // Bytes 1..9 = timestamp (8 bytes big-endian)
+        let ts = u64::from_be_bytes(header_data[1..9].try_into().unwrap());
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert!(
+            ts.abs_diff(now) < 5,
+            "timestamp should be within 5 seconds of now"
+        );
+
+        // Bytes 9..11 = variable_length (addr + padding_len)
+        let var_len = u16::from_be_bytes(header_data[9..11].try_into().unwrap()) as usize;
+        assert_eq!(var_len, addr_header.len() + 2); // addr + padding_len(2)
+
+        // Bytes 11..11+addr_len = SOCKS address
+        let addr_end = 11 + addr_header.len();
+        assert_eq!(&header_data[11..addr_end], &addr_header[..]);
+
+        // Bytes addr_end..addr_end+2 = padding length (should be 0)
+        let padding_len =
+            u16::from_be_bytes(header_data[addr_end..addr_end + 2].try_into().unwrap());
+        assert_eq!(padding_len, 0);
+
+        // Nonce should have been incremented once (for the header chunk)
+        assert_eq!(nonce.current()[0], 1);
+    }
+
+    #[test]
+    fn ss2022_request_buffer_structure_aes128() {
+        let cipher = AeadCipher::Blake3Aes128Gcm;
+        let key = vec![0x42u8; 16];
+        let salt = generate_salt(cipher.salt_len());
+        let subkey = cipher.derive_subkey(&key, &salt);
+        let enc_cipher = CipherCore::new(cipher, subkey.clone());
+        let mut nonce = NonceCounter::new();
+
+        let addr = Address::Ip(SocketAddr::V4(SocketAddrV4::new(
+            Ipv4Addr::new(1, 2, 3, 4),
+            443,
+        )));
+        let addr_header = encode_address(&addr);
+
+        let buf = build_ss2022_request_buffer(
+            &salt,
+            &enc_cipher,
+            &mut nonce,
+            &addr_header,
+            AeadCipher::Blake3Aes128Gcm,
+            None,
+            None,
+        );
+
+        // Salt is 16 bytes for AES-128
+        assert_eq!(&buf[..16], &salt[..]);
+
+        // Verify decryption
+        let dec_cipher = CipherCore::new(cipher, subkey);
+        let dec_nonce = NonceCounter::new();
+        let mut header_data = buf[16..].to_vec();
+        dec_cipher
+            .decrypt_in_place(dec_nonce.current(), &mut header_data)
+            .expect("decrypt ss2022 request header");
+
+        assert_eq!(header_data[0], 0x00); // client type
+    }
+
+    #[test]
+    fn ss2022_legacy_buffer_uses_length_prefixed_chunks() {
+        let cipher = AeadCipher::Aes256Gcm;
+        let key = evp_bytes_to_key(b"testpassword", cipher.key_len());
+        let salt = generate_salt(cipher.salt_len());
+        let subkey = cipher.derive_subkey(&key, &salt);
+        let enc_cipher = CipherCore::new(cipher, subkey.clone());
+        let mut nonce = NonceCounter::new();
+
+        let payload = b"Hello, World!";
+        let buf = build_initial_buffer(&salt, &enc_cipher, &mut nonce, payload);
+
+        // Buffer: salt(32) + enc_length(2+16) + enc_payload(13+16) = 32 + 18 + 29 = 79
+        assert_eq!(buf.len(), 32 + (2 + TAG_LEN) + (payload.len() + TAG_LEN));
+
+        // Verify we can decrypt the legacy format
+        let dec_cipher = CipherCore::new(cipher, subkey);
+        let mut dec_nonce = NonceCounter::new();
+
+        // Decrypt length
+        let mut len_data = buf[32..32 + 2 + TAG_LEN].to_vec();
+        dec_cipher
+            .decrypt_in_place(dec_nonce.current(), &mut len_data)
+            .expect("decrypt legacy length");
+        dec_nonce.increment();
+
+        let payload_len = ((len_data[0] as usize) << 8) | (len_data[1] as usize);
+        assert_eq!(payload_len, payload.len());
+
+        // Decrypt payload
+        let payload_start = 32 + 2 + TAG_LEN;
+        let mut payload_data = buf[payload_start..].to_vec();
+        dec_cipher
+            .decrypt_in_place(dec_nonce.current(), &mut payload_data)
+            .expect("decrypt legacy payload");
+
+        assert_eq!(&payload_data, payload);
+    }
+
+    #[tokio::test]
+    async fn ss2022_stream_roundtrip_write_read() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let cipher = AeadCipher::Blake3Aes256Gcm;
+        let key = vec![0x42u8; 32];
+        let addr = Address::Domain("example.com".to_string(), 443);
+        let addr_header = encode_address(&addr);
+
+        // Create a duplex (in-memory) stream pair
+        let (client_io, server_io) = tokio::io::duplex(16384);
+
+        // Create the client SsStream (writes SS2022 request)
+        let mut client = SsStream::new(client_io, cipher, key.clone(), addr_header.clone(), None);
+
+        // Write some data through the client
+        let test_data = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        client.write_all(test_data).await.expect("write test data");
+        client.flush().await.expect("flush");
+
+        // Now simulate reading on the server side:
+        // The server would see: [salt][encrypted_header+tag][enc_len+tag][enc_payload+tag]
+        // We verify the wire format is correct by reading raw bytes
+        let mut server_reader = tokio::io::BufReader::new(server_io);
+        let mut raw = Vec::new();
+        // Read what's available (non-blocking won't work, use timeout)
+        let read_task = tokio::time::timeout(std::time::Duration::from_millis(100), async {
+            let mut buf = [0u8; 8192];
+            let n = server_reader.read(&mut buf).await.unwrap();
+            raw.extend_from_slice(&buf[..n]);
+            // Try to read more
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                server_reader.read(&mut buf),
+            )
+            .await
+            {
+                Ok(Ok(n)) if n > 0 => raw.extend_from_slice(&buf[..n]),
+                _ => {}
+            }
+        });
+        read_task.await.ok();
+
+        // Verify: starts with 32-byte salt
+        assert!(raw.len() >= 32, "raw data too short: {} bytes", raw.len());
+
+        let salt = &raw[..32];
+
+        // Derive subkey and decrypt the header
+        let subkey = cipher.derive_subkey(&key, salt);
+        let dec = CipherCore::new(cipher, subkey);
+        let mut nonce = NonceCounter::new();
+
+        // Header plaintext: type(1) + ts(8) + var_len(2) + addr(15) + padding_len(2) = 28
+        let header_pt_len = 1 + 8 + 2 + addr_header.len() + 2;
+        let header_enc_len = header_pt_len + TAG_LEN;
+
+        // Decrypt request header
+        let mut header_data = raw[32..32 + header_enc_len].to_vec();
+        dec.decrypt_in_place(nonce.current(), &mut header_data)
+            .expect("decrypt ss2022 header from wire");
+        nonce.increment();
+
+        // Verify type byte
+        assert_eq!(header_data[0], 0x00);
+
+        // After the header, there should be length-prefixed chunk(s) with our test data
+        let chunk_start = 32 + header_enc_len;
+        if raw.len() > chunk_start {
+            // Decrypt length
+            let mut len_buf = raw[chunk_start..chunk_start + 2 + TAG_LEN].to_vec();
+            dec.decrypt_in_place(nonce.current(), &mut len_buf)
+                .expect("decrypt chunk length");
+            nonce.increment();
+
+            let payload_len = ((len_buf[0] as usize) << 8) | (len_buf[1] as usize);
+            assert_eq!(payload_len, test_data.len());
+
+            // Decrypt payload
+            let payload_start = chunk_start + 2 + TAG_LEN;
+            let mut payload_data =
+                raw[payload_start..payload_start + payload_len + TAG_LEN].to_vec();
+            dec.decrypt_in_place(nonce.current(), &mut payload_data)
+                .expect("decrypt chunk payload");
+
+            assert_eq!(&payload_data, test_data);
+        }
+    }
+
+    #[test]
+    fn ss2022_nonce_increments_correctly_after_header() {
+        // After building the SS2022 request buffer, nonce should be at 1
+        // (one increment for the header encryption).
+        // Subsequent writes should continue from nonce 1.
+        let cipher = AeadCipher::Blake3Aes256Gcm;
+        let key = vec![0x42u8; 32];
+        let salt = generate_salt(cipher.salt_len());
+        let subkey = cipher.derive_subkey(&key, &salt);
+        let enc_cipher = CipherCore::new(cipher, subkey);
+        let mut nonce = NonceCounter::new();
+
+        let addr = Address::Domain("test.com".to_string(), 80);
+        let addr_header = encode_address(&addr);
+
+        let _ = build_ss2022_request_buffer(
+            &salt,
+            &enc_cipher,
+            &mut nonce,
+            &addr_header,
+            AeadCipher::Blake3Aes256Gcm,
+            None,
+            None,
+        );
+
+        // After building the SS2022 request header, nonce should be 1
+        let mut expected = [0u8; NONCE_LEN];
+        expected[0] = 1;
+        assert_eq!(nonce.current(), &expected);
+    }
+
+    #[test]
+    fn legacy_nonce_increments_twice_per_chunk() {
+        // Legacy format: each chunk uses 2 nonce values (one for length, one for payload)
+        let cipher = AeadCipher::Aes256Gcm;
+        let key = evp_bytes_to_key(b"pass", cipher.key_len());
+        let salt = generate_salt(cipher.salt_len());
+        let subkey = cipher.derive_subkey(&key, &salt);
+        let enc_cipher = CipherCore::new(cipher, subkey);
+        let mut nonce = NonceCounter::new();
+
+        let payload = b"test data";
+        let _ = build_initial_buffer(&salt, &enc_cipher, &mut nonce, payload);
+
+        // After one chunk, nonce should be 2 (one for length, one for payload)
+        let mut expected = [0u8; NONCE_LEN];
+        expected[0] = 2;
+        assert_eq!(nonce.current(), &expected);
+    }
 }
 
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncRead for SsStream<T> {
@@ -585,12 +1131,128 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncRead for SsStream<T> {
                         }
                     }
 
-                    // Derive decryption subkey from master key + received salt
-                    let dec_subkey = me.cipher_type.derive_subkey(me.master_key, salt_buf);
+                    // Derive decryption subkey from session key + received salt
+                    // For multi-user, session_key is the user_key; for single-user, it's master_key.
+                    let dec_subkey = me.cipher_type.derive_subkey(me.session_key, salt_buf);
                     *me.dec_cipher = Some(CipherCore::new(*me.cipher_type, dec_subkey));
 
-                    // Transition to reading length
-                    *me.read_state = ReadState::WaitingLength { buf: Vec::new() };
+                    if *me.is_ss2022 {
+                        // SS2022 response format (per shadowsocks-rust):
+                        //   [salt][AEAD_header (nonce=0)][AEAD_data (nonce=1)][standard chunks...]
+                        //
+                        // Header plaintext: [type(1)=0x01][timestamp(8)][request_salt(key_len)][data_length(2)]
+                        // The header is a fixed-size AEAD chunk (no length prefix).
+                        let header_plaintext_len = 1 + 8 + me.cipher_type.salt_len() + 2;
+                        *me.read_state = ReadState::WaitingSs2022ResponseHeader {
+                            buf: Vec::new(),
+                            header_len: header_plaintext_len,
+                        };
+                    } else {
+                        // Legacy: transition to reading length-prefixed chunks
+                        *me.read_state = ReadState::WaitingLength { buf: Vec::new() };
+                    }
+                }
+
+                ReadState::WaitingSs2022ResponseHeader {
+                    buf: ref mut hdr_buf,
+                    header_len,
+                } => {
+                    // SS2022 response: [salt][AEAD_header(nonce=0)][AEAD_data(nonce=1)][std chunks...]
+                    // Header is a fixed-size AEAD block (header_len + TAG_LEN bytes, no length prefix).
+                    // Header plaintext: [type(1)][timestamp(8)][request_salt(key_len)][data_length(2)]
+
+                    let need = *header_len + TAG_LEN;
+                    while hdr_buf.len() < need {
+                        let mut tmp = [0u8; 128];
+                        let remaining = need - hdr_buf.len();
+                        let to_read = std::cmp::min(remaining, tmp.len());
+                        let mut read_buf = ReadBuf::new(&mut tmp[..to_read]);
+                        match me.inner.as_mut().poll_read(cx, &mut read_buf) {
+                            Poll::Ready(Ok(())) => {
+                                let n = read_buf.filled().len();
+                                if n == 0 {
+                                    return Poll::Ready(Err(io::Error::new(
+                                        io::ErrorKind::UnexpectedEof,
+                                        "connection closed reading SS2022 response header",
+                                    )));
+                                }
+                                hdr_buf.extend_from_slice(read_buf.filled());
+                            }
+                            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                            Poll::Pending => return Poll::Pending,
+                        }
+                    }
+
+                    // Decrypt header (nonce=0)
+                    let dec = me
+                        .dec_cipher
+                        .as_ref()
+                        .ok_or_else(|| io::Error::other("decryption cipher not initialized"))?;
+                    dec.decrypt_in_place(me.dec_nonce.current(), hdr_buf)?;
+                    me.dec_nonce.increment();
+
+                    // Validate type byte
+                    if hdr_buf.is_empty() || hdr_buf[0] != 0x01 {
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "ss2022: invalid response header type (expected 0x01)",
+                        )));
+                    }
+
+                    // Validate timestamp (bytes 1..9)
+                    let resp_ts = u64::from_be_bytes(
+                        hdr_buf[1..9].try_into().expect("8 bytes for timestamp"),
+                    );
+                    let now_ts = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .expect("system time before epoch")
+                        .as_secs();
+                    let ts_diff = if now_ts >= resp_ts {
+                        now_ts - resp_ts
+                    } else {
+                        resp_ts - now_ts
+                    };
+                    if ts_diff > 30 {
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("ss2022: response timestamp too far off (diff={}s)", ts_diff),
+                        )));
+                    }
+
+                    // Validate request salt echo (bytes 9..9+key_len)
+                    let salt_len = me.cipher_type.salt_len();
+                    let echoed_salt = &hdr_buf[9..9 + salt_len];
+                    if echoed_salt != me.request_salt.as_slice() {
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "ss2022: response header request salt mismatch",
+                        )));
+                    }
+
+                    // Read data_length from header (bytes 9+key_len..9+key_len+2)
+                    let dl_offset = 9 + salt_len;
+                    let data_length =
+                        u16::from_be_bytes([hdr_buf[dl_offset], hdr_buf[dl_offset + 1]]) as usize;
+
+                    // Now read the AEAD data chunk (nonce=1): data_length + TAG_LEN bytes
+                    // This data chunk is the server's first response payload.
+                    // After this, subsequent data uses standard [enc_len(18)][enc_payload] chunks.
+                    if data_length > 0 {
+                        // Read and decrypt the data chunk, buffer it as response data
+                        // We need to read this in the next poll_read iteration.
+                        // For now, transition to a state that reads this chunk.
+                        // Use WaitingPayload with the known size.
+                        *me.read_state = ReadState::WaitingPayload {
+                            buf: Vec::new(),
+                            payload_len: data_length,
+                        };
+                    } else {
+                        // No initial data from server; skip to standard chunks
+                        // Still need to consume nonce=1 for the empty data chunk
+                        // Actually, if data_length is 0, the server sends no data chunk
+                        // Transition to standard length-prefixed chunks
+                        *me.read_state = ReadState::WaitingLength { buf: Vec::new() };
+                    }
                 }
 
                 ReadState::WaitingLength {
@@ -717,7 +1379,80 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncWrite for SsStream<T> {
     ) -> Poll<io::Result<usize>> {
         let mut me = self.project();
 
-        // First, flush any pending data
+        // SS2022: if this is the first write, build the initial request
+        // bundling user data with the address header.
+        if let WriteState::WaitingFirstData { .. } = me.write_state {
+            // Take ownership of the state data
+            let (salt, addr_header, id_sk, id_uk) =
+                if let WriteState::WaitingFirstData {
+                    salt,
+                    addr_header,
+                    identity_server_key,
+                    identity_user_key,
+                } = std::mem::replace(me.write_state, WriteState::Ready)
+                {
+                    (salt, addr_header, identity_server_key, identity_user_key)
+                } else {
+                    unreachable!()
+                };
+
+            let enc = me
+                .enc_cipher
+                .as_ref()
+                .ok_or_else(|| io::Error::other("encryption cipher not initialized"))?;
+
+            let initial_buf = build_ss2022_request_buffer(
+                &salt,
+                enc,
+                me.enc_nonce,
+                &addr_header,
+                *me.cipher_type,
+                id_sk.as_deref(),
+                id_uk.as_deref(),
+                data, // Bundle first user data!
+            );
+
+            let consumed = data.len(); // All user data consumed into the initial buffer
+            *me.write_state = WriteState::Flushing {
+                buf: initial_buf,
+                pos: 0,
+            };
+
+            // Fall through to the Flushing handler below, but report all
+            // user data as consumed
+            // First try to flush what we can
+            while let WriteState::Flushing {
+                ref buf,
+                ref mut pos,
+            } = me.write_state
+            {
+                if *pos < buf.len() {
+                    match me.inner.as_mut().poll_write(cx, &buf[*pos..]) {
+                        Poll::Ready(Ok(n)) => {
+                            if n == 0 {
+                                return Poll::Ready(Err(io::Error::new(
+                                    io::ErrorKind::WriteZero,
+                                    "write zero",
+                                )));
+                            }
+                            *pos += n;
+                            if *pos < buf.len() {
+                                continue;
+                            }
+                        }
+                        Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                        Poll::Pending => {
+                            // Data is buffered, will flush later. Report user data consumed.
+                            return Poll::Ready(Ok(consumed));
+                        }
+                    }
+                }
+                *me.write_state = WriteState::Ready;
+            }
+            return Poll::Ready(Ok(consumed));
+        }
+
+        // Flush any pending data
         while let WriteState::Flushing {
             ref buf,
             ref mut pos,
@@ -754,8 +1489,13 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncWrite for SsStream<T> {
             .as_ref()
             .ok_or_else(|| io::Error::other("encryption cipher not initialized"))?;
 
-        // Take at most MAX_PAYLOAD_SIZE bytes
-        let chunk_len = std::cmp::min(MAX_PAYLOAD_SIZE, data.len());
+        // Take at most MAX_PAYLOAD_SIZE bytes (SS2022 allows larger chunks)
+        let max_size = if *me.is_ss2022 {
+            MAX_PAYLOAD_SIZE_2022
+        } else {
+            MAX_PAYLOAD_SIZE
+        };
+        let chunk_len = std::cmp::min(max_size, data.len());
         let chunk = &data[..chunk_len];
 
         let mut out = Vec::with_capacity(2 + TAG_LEN + chunk_len + TAG_LEN);

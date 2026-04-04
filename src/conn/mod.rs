@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tracing::debug;
+use tracing::{debug, info, warn};
 
 use crate::common::addr::Address;
 use crate::rules::{process, Action, RuleMetadata};
@@ -230,14 +230,40 @@ impl ConnectionManager {
         self.handle_tcp_typed(src, dst, stream, "tun").await
     }
 
+    /// Handle a TCP connection with an explicit host override (for HTTP/SOCKS
+    /// proxies where the domain is already known from the request).
+    pub async fn handle_tcp_with_host(
+        &self,
+        src: SocketAddr,
+        dst: SocketAddr,
+        stream: impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+        conn_type: &str,
+        host_override: Option<String>,
+    ) -> Result<()> {
+        self.handle_tcp_inner(src, dst, stream, conn_type, host_override)
+            .await
+    }
+
     /// Inner implementation that also accepts a connection-type tag (e.g. "tun",
     /// "http-proxy", "socks5").
     pub async fn handle_tcp_typed(
         &self,
         src: SocketAddr,
         dst: SocketAddr,
+        stream: impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+        conn_type: &str,
+    ) -> Result<()> {
+        self.handle_tcp_inner(src, dst, stream, conn_type, None)
+            .await
+    }
+
+    async fn handle_tcp_inner(
+        &self,
+        src: SocketAddr,
+        dst: SocketAddr,
         mut stream: impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
         conn_type: &str,
+        host_override: Option<String>,
     ) -> Result<()> {
         // Snapshot current state from AppState (cheap Arc clones).
         // Existing connections keep their snapshot; new connections get the latest.
@@ -253,8 +279,9 @@ impl ConnectionManager {
             rt.mode.clone()
         };
 
-        // Resolve domain from FakeIP
-        let mut domain = dns.reverse_lookup(&dst.ip());
+        // Use host_override if provided (from HTTP CONNECT / SOCKS5),
+        // otherwise try FakeIP reverse lookup
+        let mut domain = host_override.or_else(|| dns.reverse_lookup(&dst.ip()));
 
         // ---- Sniff: peek first bytes for TLS SNI / HTTP Host ----
         // Read up to SNIFF_PEEK_SIZE bytes from the client without consuming them.
@@ -349,7 +376,7 @@ impl ConnectionManager {
             rules.match_rules_detailed(&rule_meta)
         };
 
-        debug!(
+        info!(
             "TCP {} -> {} ({}) => {:?} [{}]",
             src,
             target,
@@ -390,7 +417,22 @@ impl ConnectionManager {
         let rule_str = rule_type;
 
         // Connect through proxy
-        let remote = handler.connect_stream(&target, &dns).await?;
+        info!(
+            "Connecting via [{}] {} to {}",
+            handler.proto(),
+            proxy_name,
+            target
+        );
+        let remote = match handler.connect_stream(&target, &dns).await {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(
+                    "Proxy connect failed [{}] {} -> {}: {}",
+                    proxy_name, src, target, e
+                );
+                return Err(e);
+            }
+        };
 
         // --- Per-connection byte counters ---
         let conn_id = uuid::Uuid::new_v4().to_string();

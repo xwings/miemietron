@@ -27,5 +27,8 @@ Thumbs.db
 # Logs
 *.log
 
+# test
+openclash/
+
 # Claude Code
 .claude/

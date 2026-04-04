@@ -74,6 +74,19 @@ impl DnsResolver {
         upstream::resolve(domain, &self.config).await
     }
 
+    /// Resolve a proxy server hostname using only direct/bootstrap DNS.
+    ///
+    /// Uses `proxy-server-nameserver` or `default-nameserver` from config
+    /// (set by OpenClash). Avoids DoH/DoT which may require a proxy that
+    /// hasn't been connected yet.
+    pub async fn resolve_proxy_server(&self, domain: &str) -> Result<IpAddr> {
+        // If it's already an IP literal, just parse it
+        if let Ok(ip) = domain.parse::<IpAddr>() {
+            return Ok(ip);
+        }
+        upstream::resolve_proxy_server(domain, &self.config).await
+    }
+
     /// Check if an IP is in the fake IP range.
     pub fn is_fake_ip(&self, ip: &IpAddr) -> bool {
         if let Some(ref pool) = self.fakeip {
