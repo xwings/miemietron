@@ -51,7 +51,7 @@ impl ShadowsocksOutbound {
             .ok_or_else(|| anyhow!("ss: missing password"))?;
 
         let cipher = AeadCipher::from_name(cipher_name)
-            .ok_or_else(|| anyhow!("ss: unsupported cipher '{}'", cipher_name))?;
+            .ok_or_else(|| anyhow!("ss: unsupported cipher '{cipher_name}'"))?;
 
         // Derive the master key:
         // - SS2022 ciphers: password is base64-encoded raw key
@@ -68,7 +68,7 @@ impl ShadowsocksOutbound {
                     .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(s))
                     .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(s))
                     .or_else(|_| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(s))
-                    .map_err(|e| anyhow!("ss2022: invalid base64 key '{}': {}", s, e))
+                    .map_err(|e| anyhow!("ss2022: invalid base64 key '{s}': {e}"))
             };
 
             if password.contains(':') {
@@ -148,14 +148,26 @@ impl ShadowsocksOutbound {
             std::net::SocketAddr::new(ip, self.port)
         };
 
-        info!("ss: connecting to server {} ({}:{})", self.server, addr.ip(), addr.port());
+        info!(
+            "ss: connecting to server {} ({}:{})",
+            self.server,
+            addr.ip(),
+            addr.port()
+        );
         let stream = tokio::time::timeout(
             std::time::Duration::from_secs(10),
             connect(addr, &self.connect_opts),
         )
         .await
         .map_err(|_| anyhow!("ss: TCP connect timeout to {}:{}", addr.ip(), addr.port()))?
-        .map_err(|e| anyhow!("ss: TCP connect failed to {}:{}: {}", addr.ip(), addr.port(), e))?;
+        .map_err(|e| {
+            anyhow!(
+                "ss: TCP connect failed to {}:{}: {}",
+                addr.ip(),
+                addr.port(),
+                e
+            )
+        })?;
         info!("ss: TCP connected to {}:{}", addr.ip(), addr.port());
         Ok(stream)
     }
@@ -235,7 +247,7 @@ impl OutboundHandler for ShadowsocksOutbound {
                 let transport =
                     plugin::connect_v2ray_plugin(tcp_stream, &self.plugin_opts, &self.server)
                         .await
-                        .map_err(|e| anyhow!("ss: v2ray-plugin setup failed: {}", e))?;
+                        .map_err(|e| anyhow!("ss: v2ray-plugin setup failed: {e}"))?;
 
                 let ss = SsStream::new(
                     transport,
@@ -254,7 +266,7 @@ impl OutboundHandler for ShadowsocksOutbound {
                 let stls_stream =
                     plugin::connect_shadow_tls(tcp_stream, &self.plugin_opts, &self.server)
                         .await
-                        .map_err(|e| anyhow!("ss: shadow-tls setup failed: {}", e))?;
+                        .map_err(|e| anyhow!("ss: shadow-tls setup failed: {e}"))?;
 
                 let ss = SsStream::new(
                     stls_stream,

@@ -77,7 +77,7 @@ impl GeoSiteMatcher {
                 }
                 DomainType::Domain => {
                     // Suffix: domain ends with ".value" or equals "value".
-                    if domain_lower == *value || domain_lower.ends_with(&format!(".{}", value)) {
+                    if domain_lower == *value || domain_lower.ends_with(&format!(".{value}")) {
                         return true;
                     }
                 }

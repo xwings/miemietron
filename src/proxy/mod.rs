@@ -316,9 +316,9 @@ impl ProxyManager {
                 let path = config
                     .path
                     .as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("file provider '{}' has no path", name))?;
+                    .ok_or_else(|| anyhow::anyhow!("file provider '{name}' has no path"))?;
                 tokio::fs::read_to_string(path).await.map_err(|e| {
-                    anyhow::anyhow!("failed to read proxy provider file '{}': {}", path, e)
+                    anyhow::anyhow!("failed to read proxy provider file '{path}': {e}")
                 })?
             }
             "http" => {
@@ -328,9 +328,10 @@ impl ProxyManager {
                     if pb.exists() {
                         tokio::fs::read_to_string(&pb).await.unwrap_or_default()
                     } else {
-                        let url = config.url.as_ref().ok_or_else(|| {
-                            anyhow::anyhow!("HTTP provider '{}' has no URL", name)
-                        })?;
+                        let url = config
+                            .url
+                            .as_ref()
+                            .ok_or_else(|| anyhow::anyhow!("HTTP provider '{name}' has no URL"))?;
                         let resp = reqwest::get(url).await?;
                         let text = resp.text().await?;
                         // Cache to disk
@@ -344,15 +345,13 @@ impl ProxyManager {
                     let url = config
                         .url
                         .as_ref()
-                        .ok_or_else(|| anyhow::anyhow!("HTTP provider '{}' has no URL", name))?;
+                        .ok_or_else(|| anyhow::anyhow!("HTTP provider '{name}' has no URL"))?;
                     reqwest::get(url).await?.text().await?
                 }
             }
             other => {
                 return Err(anyhow::anyhow!(
-                    "unknown proxy provider type '{}' for '{}'",
-                    other,
-                    name
+                    "unknown proxy provider type '{other}' for '{name}'"
                 ));
             }
         };
@@ -365,9 +364,8 @@ impl ProxyManager {
             proxies: Vec<ProxyConfig>,
         }
 
-        let parsed: ProviderYaml = serde_yaml::from_str(&content).map_err(|e| {
-            anyhow::anyhow!("failed to parse proxy provider '{}' YAML: {}", name, e)
-        })?;
+        let parsed: ProviderYaml = serde_yaml::from_str(&content)
+            .map_err(|e| anyhow::anyhow!("failed to parse proxy provider '{name}' YAML: {e}"))?;
 
         Ok(parsed.proxies)
     }
@@ -494,12 +492,12 @@ impl ProxyManager {
         let config = self
             .provider_configs
             .get(name)
-            .ok_or_else(|| anyhow::anyhow!("provider '{}' not found", name))?;
+            .ok_or_else(|| anyhow::anyhow!("provider '{name}' not found"))?;
 
         let url = config
             .url
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("provider '{}' has no URL configured", name))?;
+            .ok_or_else(|| anyhow::anyhow!("provider '{name}' has no URL configured"))?;
 
         info!("Updating proxy provider '{}' from {}", name, url);
 

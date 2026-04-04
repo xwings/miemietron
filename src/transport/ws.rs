@@ -93,7 +93,7 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     // Build the upgrade request.
-    let url = format!("ws://{}{}", host, path);
+    let url = format!("ws://{host}{path}");
     let mut request = url.into_client_request()?;
 
     {
@@ -102,8 +102,7 @@ where
         // Override Host in case the URL-derived one differs (common behind CDN).
         hdrs.insert(
             HeaderName::from_static("host"),
-            HeaderValue::from_str(host)
-                .map_err(|e| anyhow::anyhow!("invalid host header: {}", e))?,
+            HeaderValue::from_str(host).map_err(|e| anyhow::anyhow!("invalid host header: {e}"))?,
         );
 
         // Caller-supplied headers.
@@ -128,7 +127,7 @@ where
             hdrs.insert(
                 HeaderName::from_static("sec-websocket-protocol"),
                 HeaderValue::from_str(&encoded)
-                    .map_err(|e| anyhow::anyhow!("early-data header encoding failed: {}", e))?,
+                    .map_err(|e| anyhow::anyhow!("early-data header encoding failed: {e}"))?,
             );
         }
     }

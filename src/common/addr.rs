@@ -47,8 +47,8 @@ impl Address {
 impl fmt::Display for Address {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Address::Domain(host, port) => write!(f, "{}:{}", host, port),
-            Address::Ip(addr) => write!(f, "{}", addr),
+            Address::Domain(host, port) => write!(f, "{host}:{port}"),
+            Address::Ip(addr) => write!(f, "{addr}"),
         }
     }
 }

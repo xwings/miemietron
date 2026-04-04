@@ -159,14 +159,14 @@ where
         .uri(path)
         .header("host", host)
         .body(())
-        .map_err(|e| anyhow::anyhow!("failed to build h2 request: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("failed to build h2 request: {e}"))?;
 
     let (response_future, send_stream) = client.send_request(request, false)?;
 
     let response = response_future.await?;
     let status = response.status();
     if !status.is_success() {
-        anyhow::bail!("h2 server returned HTTP {}", status);
+        anyhow::bail!("h2 server returned HTTP {status}");
     }
 
     let recv_stream = response.into_body();

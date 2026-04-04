@@ -656,7 +656,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncWrite for ShadowTlsStream<T>
             type HmacSha256 = hmac::Hmac<sha2::Sha256>;
 
             let mut mac = HmacSha256::new_from_slice(this.hmac_key)
-                .map_err(|e| io::Error::other(format!("shadow-tls hmac init: {}", e)))?;
+                .map_err(|e| io::Error::other(format!("shadow-tls hmac init: {e}")))?;
             mac.update(data);
             let tag = mac.finalize().into_bytes();
 

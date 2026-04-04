@@ -46,8 +46,7 @@ impl VmessOutbound {
         let server = config.server.clone().context("VMess: missing 'server'")?;
         let port = config.port.context("VMess: missing 'port'")?;
         let uuid_str = config.uuid.as_deref().context("VMess: missing 'uuid'")?;
-        let uuid =
-            parse_uuid(uuid_str).map_err(|e| anyhow::anyhow!("VMess: invalid UUID: {}", e))?;
+        let uuid = parse_uuid(uuid_str).map_err(|e| anyhow::anyhow!("VMess: invalid UUID: {e}"))?;
 
         // Check alterId -- we only support 0 (AEAD mode).
         let alter_id = config.alter_id.unwrap_or(0);

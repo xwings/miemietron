@@ -112,7 +112,7 @@ fn detect_common_prefix(archive: &mut zip::ZipArchive<std::io::Cursor<&[u8]>>) -
             continue;
         }
 
-        let dir_prefix = format!("{}/", first_component);
+        let dir_prefix = format!("{first_component}/");
 
         match &prefix {
             None => prefix = Some(dir_prefix),

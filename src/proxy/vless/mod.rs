@@ -44,8 +44,7 @@ impl VlessOutbound {
         let server = config.server.clone().context("VLESS: missing 'server'")?;
         let port = config.port.context("VLESS: missing 'port'")?;
         let uuid_str = config.uuid.as_deref().context("VLESS: missing 'uuid'")?;
-        let uuid =
-            parse_uuid(uuid_str).map_err(|e| anyhow::anyhow!("VLESS: invalid UUID: {}", e))?;
+        let uuid = parse_uuid(uuid_str).map_err(|e| anyhow::anyhow!("VLESS: invalid UUID: {e}"))?;
 
         let tls = config.tls.unwrap_or(false);
         let sni = config

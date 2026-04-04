@@ -228,7 +228,7 @@ fn set_address(dev: &str, addr_cidr: &str) -> Result<()> {
         let stderr = String::from_utf8_lossy(&output.stderr);
         // Ignore "already exists" errors
         if !stderr.contains("RTNETLINK answers: File exists") {
-            return Err(anyhow::anyhow!("ip addr add failed: {}", stderr));
+            return Err(anyhow::anyhow!("ip addr add failed: {stderr}"));
         }
     }
     Ok(())

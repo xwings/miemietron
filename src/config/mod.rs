@@ -194,7 +194,7 @@ impl MiemieConfig {
     /// Parse a config from a YAML string.
     pub fn parse_str(yaml: &str) -> Result<Self> {
         let config: Self = serde_yaml::from_str(yaml)
-            .map_err(|e| anyhow::anyhow!("failed to parse config: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("failed to parse config: {e}"))?;
         Ok(config)
     }
 }

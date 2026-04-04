@@ -20,7 +20,7 @@ pub async fn auth_middleware(
     // Check Authorization header
     if let Some(auth) = request.headers().get("Authorization") {
         if let Ok(auth_str) = auth.to_str() {
-            let expected = format!("Bearer {}", secret);
+            let expected = format!("Bearer {secret}");
             if constant_time_eq(auth_str.as_bytes(), expected.as_bytes()) {
                 return next.run(request).await;
             }

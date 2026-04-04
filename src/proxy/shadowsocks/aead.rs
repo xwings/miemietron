@@ -207,19 +207,19 @@ impl CipherCore {
                 let cipher = Aes128Gcm::new(GenericArray::from_slice(&self.key));
                 cipher
                     .encrypt_in_place(nonce_ga, b"", data)
-                    .map_err(|e| io::Error::other(format!("aes-128-gcm encrypt: {}", e)))
+                    .map_err(|e| io::Error::other(format!("aes-128-gcm encrypt: {e}")))
             }
             AeadCipher::Aes256Gcm | AeadCipher::Blake3Aes256Gcm => {
                 let cipher = Aes256Gcm::new(GenericArray::from_slice(&self.key));
                 cipher
                     .encrypt_in_place(nonce_ga, b"", data)
-                    .map_err(|e| io::Error::other(format!("aes-256-gcm encrypt: {}", e)))
+                    .map_err(|e| io::Error::other(format!("aes-256-gcm encrypt: {e}")))
             }
             AeadCipher::ChaCha20Poly1305 | AeadCipher::Blake3ChaCha20Poly1305 => {
                 let cipher = ChaCha20Poly1305::new(GenericArray::from_slice(&self.key));
                 cipher
                     .encrypt_in_place(nonce_ga, b"", data)
-                    .map_err(|e| io::Error::other(format!("chacha20-poly1305 encrypt: {}", e)))
+                    .map_err(|e| io::Error::other(format!("chacha20-poly1305 encrypt: {e}")))
             }
         }
     }
@@ -237,7 +237,7 @@ impl CipherCore {
                 cipher.decrypt_in_place(nonce_ga, b"", data).map_err(|e| {
                     io::Error::new(
                         io::ErrorKind::InvalidData,
-                        format!("aes-128-gcm decrypt: {}", e),
+                        format!("aes-128-gcm decrypt: {e}"),
                     )
                 })
             }
@@ -246,7 +246,7 @@ impl CipherCore {
                 cipher.decrypt_in_place(nonce_ga, b"", data).map_err(|e| {
                     io::Error::new(
                         io::ErrorKind::InvalidData,
-                        format!("aes-256-gcm decrypt: {}", e),
+                        format!("aes-256-gcm decrypt: {e}"),
                     )
                 })
             }
@@ -255,7 +255,7 @@ impl CipherCore {
                 cipher.decrypt_in_place(nonce_ga, b"", data).map_err(|e| {
                     io::Error::new(
                         io::ErrorKind::InvalidData,
-                        format!("chacha20-poly1305 decrypt: {}", e),
+                        format!("chacha20-poly1305 decrypt: {e}"),
                     )
                 })
             }
@@ -634,7 +634,8 @@ fn build_identity_header(
         }
         32 => {
             use aes::cipher::KeyInit as _;
-            let aes_key = aes::cipher::generic_array::GenericArray::from_slice(&identity_subkey[..32]);
+            let aes_key =
+                aes::cipher::generic_array::GenericArray::from_slice(&identity_subkey[..32]);
             aes::Aes256::new(aes_key).encrypt_block(&mut block);
         }
         _ => {
@@ -826,55 +827,47 @@ mod tests {
             AeadCipher::Blake3Aes256Gcm,
             None,
             None,
+            b"",
         );
 
         // Buffer should start with the salt
         assert_eq!(&buf[..32], &salt[..]);
 
-        // After the salt: encrypted header
-        // Header plaintext: type(1) + timestamp(8) + variable_len(2) + addr(15) + padding_len(2) = 28 bytes
-        // Encrypted: 28 + TAG_LEN(16) = 44 bytes
-        let header_plaintext_len = 1 + 8 + 2 + addr_header.len() + 2;
-        let encrypted_header_len = header_plaintext_len + TAG_LEN;
-        assert_eq!(buf.len(), 32 + encrypted_header_len);
+        // SS2022 format: [salt(32)][AEAD_header(11+16=27)][AEAD_data(variable+16)]
+        // Data includes random padding when no first_data, so size varies
+        let header_enc_len = 11 + TAG_LEN; // 27
+        assert!(buf.len() >= 32 + header_enc_len + TAG_LEN);
 
-        // Verify we can decrypt the header
+        // Verify we can decrypt the header chunk (nonce=0)
         let dec_cipher = CipherCore::new(cipher, subkey);
         let mut dec_nonce = NonceCounter::new();
-        let mut header_data = buf[32..].to_vec();
+        let mut header_data = buf[32..32 + header_enc_len].to_vec();
         dec_cipher
             .decrypt_in_place(dec_nonce.current(), &mut header_data)
-            .expect("decrypt ss2022 request header");
+            .expect("decrypt ss2022 header");
         dec_nonce.increment();
 
-        // Verify header structure
         assert_eq!(header_data[0], 0x00); // client type
-                                          // Bytes 1..9 = timestamp (8 bytes big-endian)
         let ts = u64::from_be_bytes(header_data[1..9].try_into().unwrap());
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs();
-        assert!(
-            ts.abs_diff(now) < 5,
-            "timestamp should be within 5 seconds of now"
-        );
+        assert!(ts.abs_diff(now) < 5);
 
-        // Bytes 9..11 = variable_length (addr + padding_len)
-        let var_len = u16::from_be_bytes(header_data[9..11].try_into().unwrap()) as usize;
-        assert_eq!(var_len, addr_header.len() + 2); // addr + padding_len(2)
+        let data_len = u16::from_be_bytes(header_data[9..11].try_into().unwrap()) as usize;
+        // data_len >= addr + padding_len(2) + padding(0-900)
+        assert!(data_len >= addr_header.len() + 2);
 
-        // Bytes 11..11+addr_len = SOCKS address
-        let addr_end = 11 + addr_header.len();
-        assert_eq!(&header_data[11..addr_end], &addr_header[..]);
+        // Verify data chunk (nonce=1)
+        let mut data_data = buf[32 + header_enc_len..].to_vec();
+        dec_cipher
+            .decrypt_in_place(dec_nonce.current(), &mut data_data)
+            .expect("decrypt ss2022 data");
+        assert_eq!(&data_data[..addr_header.len()], &addr_header[..]);
 
-        // Bytes addr_end..addr_end+2 = padding length (should be 0)
-        let padding_len =
-            u16::from_be_bytes(header_data[addr_end..addr_end + 2].try_into().unwrap());
-        assert_eq!(padding_len, 0);
-
-        // Nonce should have been incremented once (for the header chunk)
-        assert_eq!(nonce.current()[0], 1);
+        // Nonce should be 2 (header + data)
+        assert_eq!(nonce.current()[0], 2);
     }
 
     #[test]
@@ -900,18 +893,20 @@ mod tests {
             AeadCipher::Blake3Aes128Gcm,
             None,
             None,
+            b"",
         );
 
         // Salt is 16 bytes for AES-128
         assert_eq!(&buf[..16], &salt[..]);
 
-        // Verify decryption
+        // Verify header chunk decryption (nonce=0)
         let dec_cipher = CipherCore::new(cipher, subkey);
-        let dec_nonce = NonceCounter::new();
-        let mut header_data = buf[16..].to_vec();
+        let mut dec_nonce = NonceCounter::new();
+        let header_enc_len = 11 + TAG_LEN;
+        let mut header_data = buf[16..16 + header_enc_len].to_vec();
         dec_cipher
             .decrypt_in_place(dec_nonce.current(), &mut header_data)
-            .expect("decrypt ss2022 request header");
+            .expect("decrypt ss2022 header");
 
         assert_eq!(header_data[0], 0x00); // client type
     }
@@ -1003,44 +998,36 @@ mod tests {
 
         let salt = &raw[..32];
 
-        // Derive subkey and decrypt the header
+        // Derive subkey and decrypt
         let subkey = cipher.derive_subkey(&key, salt);
         let dec = CipherCore::new(cipher, subkey);
         let mut nonce = NonceCounter::new();
 
-        // Header plaintext: type(1) + ts(8) + var_len(2) + addr(15) + padding_len(2) = 28
-        let header_pt_len = 1 + 8 + 2 + addr_header.len() + 2;
-        let header_enc_len = header_pt_len + TAG_LEN;
+        // SS2022: [salt(32)][AEAD_header(11+16=27)][AEAD_data(addr+padding+test_data+16)]
+        let header_enc_len = 11 + TAG_LEN;
 
-        // Decrypt request header
+        // Decrypt header chunk (nonce=0)
         let mut header_data = raw[32..32 + header_enc_len].to_vec();
         dec.decrypt_in_place(nonce.current(), &mut header_data)
             .expect("decrypt ss2022 header from wire");
         nonce.increment();
 
-        // Verify type byte
-        assert_eq!(header_data[0], 0x00);
+        assert_eq!(header_data[0], 0x00); // type
 
-        // After the header, there should be length-prefixed chunk(s) with our test data
-        let chunk_start = 32 + header_enc_len;
-        if raw.len() > chunk_start {
-            // Decrypt length
-            let mut len_buf = raw[chunk_start..chunk_start + 2 + TAG_LEN].to_vec();
-            dec.decrypt_in_place(nonce.current(), &mut len_buf)
-                .expect("decrypt chunk length");
-            nonce.increment();
+        // Decrypt data chunk (nonce=1) — contains addr+padding_len+test_data
+        let data_start = 32 + header_enc_len;
+        if raw.len() > data_start {
+            let mut data_chunk = raw[data_start..].to_vec();
+            dec.decrypt_in_place(nonce.current(), &mut data_chunk)
+                .expect("decrypt ss2022 data from wire");
 
-            let payload_len = ((len_buf[0] as usize) << 8) | (len_buf[1] as usize);
-            assert_eq!(payload_len, test_data.len());
-
-            // Decrypt payload
-            let payload_start = chunk_start + 2 + TAG_LEN;
-            let mut payload_data =
-                raw[payload_start..payload_start + payload_len + TAG_LEN].to_vec();
-            dec.decrypt_in_place(nonce.current(), &mut payload_data)
-                .expect("decrypt chunk payload");
-
-            assert_eq!(&payload_data, test_data);
+            // Data: [addr(15)][padding_len(2)=0][test_data]
+            let expected_prefix_len = addr_header.len() + 2;
+            assert!(data_chunk.len() >= expected_prefix_len);
+            assert_eq!(&data_chunk[..addr_header.len()], &addr_header[..]);
+            // Remaining bytes should be our test data
+            let actual_data = &data_chunk[expected_prefix_len..];
+            assert_eq!(actual_data, test_data);
         }
     }
 
@@ -1067,11 +1054,12 @@ mod tests {
             AeadCipher::Blake3Aes256Gcm,
             None,
             None,
+            b"",
         );
 
-        // After building the SS2022 request header, nonce should be 1
+        // After building the SS2022 request, nonce should be 2 (header + data)
         let mut expected = [0u8; NONCE_LEN];
-        expected[0] = 1;
+        expected[0] = 2;
         assert_eq!(nonce.current(), &expected);
     }
 
@@ -1207,15 +1195,11 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncRead for SsStream<T> {
                         .duration_since(std::time::UNIX_EPOCH)
                         .expect("system time before epoch")
                         .as_secs();
-                    let ts_diff = if now_ts >= resp_ts {
-                        now_ts - resp_ts
-                    } else {
-                        resp_ts - now_ts
-                    };
+                    let ts_diff = now_ts.abs_diff(resp_ts);
                     if ts_diff > 30 {
                         return Poll::Ready(Err(io::Error::new(
                             io::ErrorKind::InvalidData,
-                            format!("ss2022: response timestamp too far off (diff={}s)", ts_diff),
+                            format!("ss2022: response timestamp too far off (diff={ts_diff}s)"),
                         )));
                     }
 
@@ -1298,8 +1282,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncRead for SsStream<T> {
                         return Poll::Ready(Err(io::Error::new(
                             io::ErrorKind::InvalidData,
                             format!(
-                                "payload length {} exceeds maximum {}",
-                                payload_len, MAX_PAYLOAD_SIZE
+                                "payload length {payload_len} exceeds maximum {MAX_PAYLOAD_SIZE}"
                             ),
                         )));
                     }
@@ -1383,18 +1366,18 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncWrite for SsStream<T> {
         // bundling user data with the address header.
         if let WriteState::WaitingFirstData { .. } = me.write_state {
             // Take ownership of the state data
-            let (salt, addr_header, id_sk, id_uk) =
-                if let WriteState::WaitingFirstData {
-                    salt,
-                    addr_header,
-                    identity_server_key,
-                    identity_user_key,
-                } = std::mem::replace(me.write_state, WriteState::Ready)
-                {
-                    (salt, addr_header, identity_server_key, identity_user_key)
-                } else {
-                    unreachable!()
-                };
+            let (salt, addr_header, id_sk, id_uk) = if let WriteState::WaitingFirstData {
+                salt,
+                addr_header,
+                identity_server_key,
+                identity_user_key,
+            } =
+                std::mem::replace(me.write_state, WriteState::Ready)
+            {
+                (salt, addr_header, identity_server_key, identity_user_key)
+            } else {
+                unreachable!()
+            };
 
             let enc = me
                 .enc_cipher

@@ -181,7 +181,7 @@ where
 
     let tls_config = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
         .with_safe_default_protocol_versions()
-        .map_err(|e| anyhow::anyhow!("Reality: TLS version config error: {}", e))?
+        .map_err(|e| anyhow::anyhow!("Reality: TLS version config error: {e}"))?
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(super::tls::NoVerifier::new()))
         .with_no_client_auth();
@@ -203,7 +203,7 @@ where
     let mut tls_stream = connector
         .connect(server_name, stream)
         .await
-        .map_err(|e| anyhow::anyhow!("Reality: TLS handshake failed: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Reality: TLS handshake failed: {e}"))?;
 
     // --- Step 3: Send Reality auth header ---
     let auth_header = build_auth_header(

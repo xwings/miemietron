@@ -254,7 +254,7 @@ fn parse_address(data: &[u8]) -> Result<(Address, usize)> {
                 19,
             ))
         }
-        other => Err(anyhow!("SS UDP: unknown address type 0x{:02x}", other)),
+        other => Err(anyhow!("SS UDP: unknown address type 0x{other:02x}")),
     }
 }
 
@@ -276,17 +276,17 @@ fn encrypt_in_place(
         AeadCipher::Aes128Gcm | AeadCipher::Blake3Aes128Gcm => {
             let c = Aes128Gcm::new(GenericArray::from_slice(key));
             c.encrypt_in_place(nonce_ga, b"", data)
-                .map_err(|e| anyhow!("aes-128-gcm encrypt: {}", e))
+                .map_err(|e| anyhow!("aes-128-gcm encrypt: {e}"))
         }
         AeadCipher::Aes256Gcm | AeadCipher::Blake3Aes256Gcm => {
             let c = Aes256Gcm::new(GenericArray::from_slice(key));
             c.encrypt_in_place(nonce_ga, b"", data)
-                .map_err(|e| anyhow!("aes-256-gcm encrypt: {}", e))
+                .map_err(|e| anyhow!("aes-256-gcm encrypt: {e}"))
         }
         AeadCipher::ChaCha20Poly1305 | AeadCipher::Blake3ChaCha20Poly1305 => {
             let c = ChaCha20Poly1305::new(GenericArray::from_slice(key));
             c.encrypt_in_place(nonce_ga, b"", data)
-                .map_err(|e| anyhow!("chacha20-poly1305 encrypt: {}", e))
+                .map_err(|e| anyhow!("chacha20-poly1305 encrypt: {e}"))
         }
     }
 }
@@ -309,17 +309,17 @@ fn decrypt_in_place(
         AeadCipher::Aes128Gcm | AeadCipher::Blake3Aes128Gcm => {
             let c = Aes128Gcm::new(GenericArray::from_slice(key));
             c.decrypt_in_place(nonce_ga, b"", data)
-                .map_err(|e| anyhow!("aes-128-gcm decrypt: {}", e))
+                .map_err(|e| anyhow!("aes-128-gcm decrypt: {e}"))
         }
         AeadCipher::Aes256Gcm | AeadCipher::Blake3Aes256Gcm => {
             let c = Aes256Gcm::new(GenericArray::from_slice(key));
             c.decrypt_in_place(nonce_ga, b"", data)
-                .map_err(|e| anyhow!("aes-256-gcm decrypt: {}", e))
+                .map_err(|e| anyhow!("aes-256-gcm decrypt: {e}"))
         }
         AeadCipher::ChaCha20Poly1305 | AeadCipher::Blake3ChaCha20Poly1305 => {
             let c = ChaCha20Poly1305::new(GenericArray::from_slice(key));
             c.decrypt_in_place(nonce_ga, b"", data)
-                .map_err(|e| anyhow!("chacha20-poly1305 decrypt: {}", e))
+                .map_err(|e| anyhow!("chacha20-poly1305 decrypt: {e}"))
         }
     }
 }

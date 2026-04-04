@@ -563,9 +563,7 @@ async fn create_udp_session(
         Action::Reject | Action::RejectDrop => {
             // Drop the packet by returning an error
             Err(anyhow::anyhow!(
-                "UDP packet rejected by rule engine: {} -> {}",
-                src,
-                dst
+                "UDP packet rejected by rule engine: {src} -> {dst}"
             ))
         }
 
@@ -713,7 +711,7 @@ async fn create_ss_udp_session(
     // then check if it reports as Shadowsocks.
     let handler = proxies
         .resolve(proxy_name)
-        .ok_or_else(|| anyhow::anyhow!("proxy '{}' not found", proxy_name))?;
+        .ok_or_else(|| anyhow::anyhow!("proxy '{proxy_name}' not found"))?;
 
     if handler.proto() != "Shadowsocks" {
         return Err(anyhow::anyhow!(

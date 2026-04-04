@@ -104,24 +104,20 @@ async fn try_setup_nftables(tun_dev: &str, tcp_port: u16, udp_port: u16, mark: &
 table inet miemietron {{
     chain prerouting {{
         type nat hook prerouting priority dstnat; policy accept;
-        iifname != "{dev}" return
+        iifname != "{tun_dev}" return
         mark {mark} return
         ip daddr {{ 0.0.0.0/8, 10.0.0.0/8, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 240.0.0.0/4 }} return
         meta l4proto tcp redirect to :{tcp_port}
     }}
     chain prerouting_udp {{
         type filter hook prerouting priority mangle; policy accept;
-        iifname != "{dev}" return
+        iifname != "{tun_dev}" return
         mark {mark} return
         ip daddr {{ 0.0.0.0/8, 10.0.0.0/8, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 240.0.0.0/4 }} return
         meta l4proto udp tproxy to :{udp_port} meta mark set {mark}
     }}
 }}
 "#,
-        dev = tun_dev,
-        mark = mark,
-        tcp_port = tcp_port,
-        udp_port = udp_port,
     );
 
     // Delete old table if it exists
@@ -138,7 +134,7 @@ table inet miemietron {{
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(anyhow::anyhow!("nft failed: {}", stderr));
+        return Err(anyhow::anyhow!("nft failed: {stderr}"));
     }
 
     Ok(())

@@ -220,7 +220,7 @@ fn parse_yaml_format(content: &str) -> Result<Vec<String>> {
     }
 
     let parsed: YamlRules = serde_yaml::from_str(content)
-        .map_err(|e| anyhow::anyhow!("failed to parse YAML rule provider: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("failed to parse YAML rule provider: {e}"))?;
 
     Ok(parsed
         .payload

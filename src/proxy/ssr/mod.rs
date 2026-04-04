@@ -66,7 +66,7 @@ impl SsrOutbound {
             .ok_or_else(|| anyhow!("ssr: missing password"))?;
 
         let cipher = SsrCipher::from_name(cipher_name)
-            .ok_or_else(|| anyhow!("ssr: unsupported cipher '{}'", cipher_name))?;
+            .ok_or_else(|| anyhow!("ssr: unsupported cipher '{cipher_name}'"))?;
 
         // SSR-specific fields: obfs, obfs-param, protocol, protocol-param.
         // These come from the `extra` catch-all map in ProxyConfig since they
@@ -77,7 +77,7 @@ impl SsrOutbound {
             .and_then(|v| v.as_str())
             .unwrap_or("plain");
         let obfs = SsrObfs::from_name(obfs_name)
-            .ok_or_else(|| anyhow!("ssr: unsupported obfs plugin '{}'", obfs_name))?;
+            .ok_or_else(|| anyhow!("ssr: unsupported obfs plugin '{obfs_name}'"))?;
 
         let obfs_param = config
             .extra
@@ -92,7 +92,7 @@ impl SsrOutbound {
             .and_then(|v| v.as_str())
             .unwrap_or("origin");
         let protocol = SsrProtocol::from_name(protocol_name)
-            .ok_or_else(|| anyhow!("ssr: unsupported protocol plugin '{}'", protocol_name))?;
+            .ok_or_else(|| anyhow!("ssr: unsupported protocol plugin '{protocol_name}'"))?;
 
         let protocol_param = config
             .extra
@@ -191,11 +191,11 @@ impl OutboundHandler for SsrOutbound {
         stream
             .write_all(&addr_header)
             .await
-            .map_err(|e| anyhow!("ssr: failed to send address header: {}", e))?;
+            .map_err(|e| anyhow!("ssr: failed to send address header: {e}"))?;
         stream
             .flush()
             .await
-            .map_err(|e| anyhow!("ssr: failed to flush address header: {}", e))?;
+            .map_err(|e| anyhow!("ssr: failed to flush address header: {e}"))?;
 
         Ok(Box::new(stream))
     }

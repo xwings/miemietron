@@ -66,7 +66,7 @@ impl TlsConnector {
         fingerprint_str: Option<String>,
     ) -> Result<Self> {
         let server_name: ServerName<'static> = ServerName::try_from(sni.clone())
-            .map_err(|e| anyhow::anyhow!("invalid SNI '{}': {}", sni, e))?
+            .map_err(|e| anyhow::anyhow!("invalid SNI '{sni}': {e}"))?
             .to_owned();
 
         // Parse the fingerprint and build a customised CryptoProvider.
@@ -80,7 +80,7 @@ impl TlsConnector {
             );
             ClientConfig::builder_with_provider(Arc::new(provider))
                 .with_safe_default_protocol_versions()
-                .map_err(|e| anyhow::anyhow!("TLS protocol version error: {}", e))?
+                .map_err(|e| anyhow::anyhow!("TLS protocol version error: {e}"))?
                 .dangerous()
                 .with_custom_certificate_verifier(Arc::new(NoVerifier::new()))
                 .with_no_client_auth()
@@ -90,7 +90,7 @@ impl TlsConnector {
             root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
             ClientConfig::builder_with_provider(Arc::new(provider))
                 .with_safe_default_protocol_versions()
-                .map_err(|e| anyhow::anyhow!("TLS protocol version error: {}", e))?
+                .map_err(|e| anyhow::anyhow!("TLS protocol version error: {e}"))?
                 .with_root_certificates(root_store)
                 .with_no_client_auth()
         };
@@ -124,7 +124,7 @@ impl TlsConnector {
             .inner
             .connect(self.sni.clone(), stream)
             .await
-            .map_err(|e| anyhow::anyhow!("TLS handshake failed: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("TLS handshake failed: {e}"))?;
         Ok(tls_stream)
     }
 }

@@ -47,7 +47,7 @@ fn find_socket_inode(src_ip: &IpAddr, src_port: u16) -> Option<u64> {
     };
 
     let content = std::fs::read_to_string(proc_path).ok()?;
-    let target_hex_port = format!("{:04X}", src_port);
+    let target_hex_port = format!("{src_port:04X}");
     let target_hex_ip = ip_to_proc_hex(src_ip);
 
     for line in content.lines().skip(1) {
@@ -102,7 +102,7 @@ fn ip_to_proc_hex(ip: &IpAddr) -> String {
 
 #[cfg(target_os = "linux")]
 fn find_pid_by_inode(target_inode: u64) -> Option<u32> {
-    let target_link = format!("socket:[{}]", target_inode);
+    let target_link = format!("socket:[{target_inode}]");
 
     let proc_dir = match std::fs::read_dir("/proc") {
         Ok(d) => d,
@@ -119,7 +119,7 @@ fn find_pid_by_inode(target_inode: u64) -> Option<u32> {
             Err(_) => continue,
         };
 
-        let fd_dir = format!("/proc/{}/fd", pid);
+        let fd_dir = format!("/proc/{pid}/fd");
         let fd_entries = match std::fs::read_dir(&fd_dir) {
             Ok(d) => d,
             Err(_) => continue, // Permission denied or process exited
@@ -139,7 +139,7 @@ fn find_pid_by_inode(target_inode: u64) -> Option<u32> {
 
 #[cfg(target_os = "linux")]
 fn read_process_exe(pid: u32) -> Option<String> {
-    let exe_path = format!("/proc/{}/exe", pid);
+    let exe_path = format!("/proc/{pid}/exe");
     match std::fs::read_link(&exe_path) {
         Ok(path) => {
             let path_str = path.to_string_lossy().to_string();

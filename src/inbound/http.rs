@@ -62,7 +62,7 @@ async fn handle_http_connection(
 
     let parts: Vec<&str> = request_line.split_whitespace().collect();
     if parts.len() < 2 {
-        return Err(anyhow!("malformed request line: {}", request_line));
+        return Err(anyhow!("malformed request line: {request_line}"));
     }
 
     let method = parts[0].to_uppercase();
@@ -116,7 +116,7 @@ async fn handle_http_connection(
                       Content-Length: 0\r\n\r\n",
                 )
                 .await?;
-            return Err(anyhow!("HTTP proxy auth failed from {}", peer));
+            return Err(anyhow!("HTTP proxy auth failed from {peer}"));
         }
     }
 
@@ -207,7 +207,6 @@ fn base64_decode(input: &str) -> Result<String> {
     use base64::Engine as _;
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(input)
-        .map_err(|e| anyhow!("base64 decode error: {}", e))?;
-    String::from_utf8(bytes).map_err(|e| anyhow!("UTF-8 decode error: {}", e))
+        .map_err(|e| anyhow!("base64 decode error: {e}"))?;
+    String::from_utf8(bytes).map_err(|e| anyhow!("UTF-8 decode error: {e}"))
 }
-

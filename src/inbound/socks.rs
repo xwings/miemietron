@@ -66,7 +66,7 @@ async fn handle_socks5(
     // --- Auth negotiation ---
     let version = stream.read_u8().await?;
     if version != SOCKS5_VERSION {
-        return Err(anyhow!("unsupported SOCKS version: {}", version));
+        return Err(anyhow!("unsupported SOCKS version: {version}"));
     }
 
     let n_methods = stream.read_u8().await? as usize;
@@ -118,13 +118,11 @@ async fn handle_socks5(
         if require_auth {
             // Validate against the configured authentication list
             // Each entry is "username:password"
-            let credential = format!("{}:{}", username, password);
+            let credential = format!("{username}:{password}");
             if !auth_list.iter().any(|entry| entry == &credential) {
                 stream.write_all(&[0x01, 0x01]).await?; // failure
                 return Err(anyhow!(
-                    "SOCKS5 auth failed for user '{}' from {}",
-                    username,
-                    peer
+                    "SOCKS5 auth failed for user '{username}' from {peer}"
                 ));
             }
         }
@@ -135,7 +133,7 @@ async fn handle_socks5(
     // --- Request ---
     let ver = stream.read_u8().await?;
     if ver != SOCKS5_VERSION {
-        return Err(anyhow!("unexpected version in request: {}", ver));
+        return Err(anyhow!("unexpected version in request: {ver}"));
     }
     let cmd = stream.read_u8().await?;
     let _rsv = stream.read_u8().await?; // reserved
@@ -176,7 +174,7 @@ async fn handle_socks5(
         }
         _ => {
             send_reply(&mut stream, REP_CMD_NOT_SUPPORTED, &dst).await?;
-            return Err(anyhow!("unsupported SOCKS5 command: {}", cmd));
+            return Err(anyhow!("unsupported SOCKS5 command: {cmd}"));
         }
     }
 
@@ -208,7 +206,7 @@ async fn read_address(stream: &mut TcpStream, atyp: u8) -> Result<(String, u16)>
             let port = stream.read_u16().await?;
             Ok((ip.to_string(), port))
         }
-        _ => Err(anyhow!("unsupported SOCKS5 address type: {}", atyp)),
+        _ => Err(anyhow!("unsupported SOCKS5 address type: {atyp}")),
     }
 }
 

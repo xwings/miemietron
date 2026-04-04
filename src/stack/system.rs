@@ -58,7 +58,7 @@ impl SystemStack {
         let bind_addr = SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), tcp_port);
         socket
             .bind(&socket2::SockAddr::from(bind_addr))
-            .with_context(|| format!("failed to bind TCP listener on port {}", tcp_port))?;
+            .with_context(|| format!("failed to bind TCP listener on port {tcp_port}"))?;
         socket.listen(1024)?;
 
         let std_listener: std::net::TcpListener = socket.into();
@@ -215,7 +215,7 @@ pub async fn create_udp_tproxy_socket(port: u16) -> Result<UdpSocket> {
     let bind_addr = SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), port);
     socket
         .bind(&socket2::SockAddr::from(bind_addr))
-        .with_context(|| format!("failed to bind UDP tproxy socket on port {}", port))?;
+        .with_context(|| format!("failed to bind UDP tproxy socket on port {port}"))?;
 
     let std_socket: std::net::UdpSocket = socket.into();
     let udp = UdpSocket::from_std(std_socket).context("failed to convert to tokio UdpSocket")?;

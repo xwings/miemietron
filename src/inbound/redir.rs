@@ -61,7 +61,7 @@ pub async fn run_redir_listener(port: u16, conn_manager: Arc<ConnectionManager>)
     let bind_addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port);
     socket
         .bind(&socket2::SockAddr::from(bind_addr))
-        .with_context(|| format!("failed to bind redir listener on port {}", port))?;
+        .with_context(|| format!("failed to bind redir listener on port {port}"))?;
     socket.listen(1024)?;
 
     let std_listener: std::net::TcpListener = socket.into();

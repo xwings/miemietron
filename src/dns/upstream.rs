@@ -96,14 +96,10 @@ pub async fn resolve_proxy_server(domain: &str, config: &DnsConfig) -> Result<Ip
 
     // 3. Fall back to system resolver (like mihomo's SystemResolver)
     // This uses the OS /etc/resolv.conf DNS
-    match tokio::net::lookup_host(format!("{}:0", domain)).await {
+    match tokio::net::lookup_host(format!("{domain}:0")).await {
         Ok(mut addrs) => {
             if let Some(addr) = addrs.next() {
-                debug!(
-                    "DNS system resolver resolved {} -> {}",
-                    domain,
-                    addr.ip()
-                );
+                debug!("DNS system resolver resolved {} -> {}", domain, addr.ip());
                 return Ok(addr.ip());
             }
         }
@@ -113,9 +109,8 @@ pub async fn resolve_proxy_server(domain: &str, config: &DnsConfig) -> Result<Ip
     }
 
     Err(anyhow::anyhow!(
-        "all DNS servers failed for proxy server '{}' \
-         (proxy-server-nameserver, default-nameserver, and system resolver all failed)",
-        domain
+        "all DNS servers failed for proxy server '{domain}' \
+         (proxy-server-nameserver, default-nameserver, and system resolver all failed)"
     ))
 }
 
@@ -179,7 +174,7 @@ pub async fn resolve(domain: &str, config: &DnsConfig) -> Result<IpAddr> {
         }
     }
 
-    Err(anyhow::anyhow!("all DNS servers failed for {}", domain))
+    Err(anyhow::anyhow!("all DNS servers failed for {domain}"))
 }
 
 /// Check whether the primary DNS result looks suspicious and fallback should
@@ -262,7 +257,7 @@ fn should_use_fallback(ip: &IpAddr, domain: &str, config: &DnsConfig) -> bool {
                 if domain.ends_with(suffix) {
                     return true;
                 }
-            } else if domain == d || domain.ends_with(&format!(".{}", d)) {
+            } else if domain == d || domain.ends_with(&format!(".{d}")) {
                 return true;
             }
         }
@@ -310,7 +305,7 @@ fn is_private_ip(ip: &IpAddr) -> bool {
 fn parse_cidr_simple(cidr: &str) -> Result<(u32, u32)> {
     let parts: Vec<&str> = cidr.split('/').collect();
     if parts.len() != 2 {
-        return Err(anyhow::anyhow!("invalid CIDR: {}", cidr));
+        return Err(anyhow::anyhow!("invalid CIDR: {cidr}"));
     }
     let ip: Ipv4Addr = parts[0].parse()?;
     let prefix_len: u32 = parts[1].parse()?;
@@ -327,7 +322,7 @@ async fn query_server(domain: &str, server: &str) -> Result<IpAddr> {
         let addr = if server.contains(':') {
             server.to_string()
         } else {
-            format!("{}:53", server)
+            format!("{server}:53")
         };
         resolve_udp(domain, &addr).await
     }
@@ -341,7 +336,7 @@ async fn query_server(domain: &str, server: &str) -> Result<IpAddr> {
 async fn resolve_udp(domain: &str, server: &str) -> Result<IpAddr> {
     let addr: SocketAddr = server
         .parse()
-        .map_err(|e| anyhow::anyhow!("invalid DNS server address {}: {}", server, e))?;
+        .map_err(|e| anyhow::anyhow!("invalid DNS server address {server}: {e}"))?;
 
     let socket = UdpSocket::bind("0.0.0.0:0").await?;
     socket.connect(addr).await?;
@@ -367,7 +362,7 @@ async fn resolve_doh(domain: &str, url: &str) -> Result<IpAddr> {
     let query = build_dns_query(domain, 1);
     let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&query);
 
-    let request_url = format!("{}?dns={}", url, encoded);
+    let request_url = format!("{url}?dns={encoded}");
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
@@ -427,7 +422,7 @@ async fn resolve_dot(domain: &str, server: &str) -> Result<IpAddr> {
     };
 
     let port: u16 = port_str.parse().unwrap_or(853);
-    let sock_addr = format!("{}:{}", host, port);
+    let sock_addr = format!("{host}:{port}");
     let sni = host.to_string();
 
     // Try to reuse a pooled connection
@@ -502,7 +497,7 @@ async fn dot_query_on_stream(
 
     let resp_len = u16::from_be_bytes(resp_len_buf) as usize;
     if resp_len == 0 || resp_len > 65535 {
-        return Err(anyhow::anyhow!("invalid DoT response length: {}", resp_len));
+        return Err(anyhow::anyhow!("invalid DoT response length: {resp_len}"));
     }
 
     // Read the DNS response
@@ -637,7 +632,7 @@ fn match_nameserver_policy(
 
         let matches = if let Some(suffix) = pattern_lower.strip_prefix("+.") {
             // "+.domain.com" matches "domain.com" and "*.domain.com"
-            domain_lower == suffix || domain_lower.ends_with(&format!(".{}", suffix))
+            domain_lower == suffix || domain_lower.ends_with(&format!(".{suffix}"))
         } else {
             domain_lower == pattern_lower
         };

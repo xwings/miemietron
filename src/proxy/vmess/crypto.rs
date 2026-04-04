@@ -91,10 +91,10 @@ impl VmessCipher {
         match self {
             VmessCipher::Aes128Gcm(cipher) => cipher
                 .encrypt(AesNonce::from_slice(nonce), plaintext)
-                .map_err(|e| io::Error::other(format!("encrypt error: {}", e))),
+                .map_err(|e| io::Error::other(format!("encrypt error: {e}"))),
             VmessCipher::Chacha20Poly1305(cipher) => cipher
                 .encrypt(ChaNonce::from_slice(nonce), plaintext)
-                .map_err(|e| io::Error::other(format!("encrypt error: {}", e))),
+                .map_err(|e| io::Error::other(format!("encrypt error: {e}"))),
             VmessCipher::None => Ok(plaintext.to_vec()),
         }
     }
@@ -103,10 +103,10 @@ impl VmessCipher {
         match self {
             VmessCipher::Aes128Gcm(cipher) => cipher
                 .decrypt(AesNonce::from_slice(nonce), ciphertext)
-                .map_err(|e| io::Error::other(format!("decrypt error: {}", e))),
+                .map_err(|e| io::Error::other(format!("decrypt error: {e}"))),
             VmessCipher::Chacha20Poly1305(cipher) => cipher
                 .decrypt(ChaNonce::from_slice(nonce), ciphertext)
-                .map_err(|e| io::Error::other(format!("decrypt error: {}", e))),
+                .map_err(|e| io::Error::other(format!("decrypt error: {e}"))),
             VmessCipher::None => Ok(ciphertext.to_vec()),
         }
     }

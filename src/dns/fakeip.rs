@@ -196,7 +196,7 @@ impl FakeIpPool {
 fn parse_cidr(cidr: &str) -> Result<(u32, u32)> {
     let parts: Vec<&str> = cidr.split('/').collect();
     if parts.len() != 2 {
-        return Err(anyhow::anyhow!("invalid CIDR: {}", cidr));
+        return Err(anyhow::anyhow!("invalid CIDR: {cidr}"));
     }
     let ip: Ipv4Addr = parts[0].parse()?;
     let prefix_len: u32 = parts[1].parse()?;

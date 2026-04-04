@@ -153,7 +153,7 @@ impl RuleEngine {
                             // Also store for inline expansion
                             provider_rules
                                 .entry(name.clone())
-                                .or_insert_with(Vec::new)
+                                .or_default()
                                 .push(ParsedRule {
                                     rule_type: "DOMAIN-SUFFIX".to_string(),
                                     payload: domain_val,
@@ -166,7 +166,7 @@ impl RuleEngine {
                         cidrs.push((payload.to_string(), target.clone()));
                         provider_rules
                             .entry(name.clone())
-                            .or_insert_with(Vec::new)
+                            .or_default()
                             .push(ParsedRule {
                                 rule_type: "IP-CIDR".to_string(),
                                 payload: payload.to_string(),
@@ -179,16 +179,13 @@ impl RuleEngine {
                         let full_rule = if payload.matches(',').count() >= 2 {
                             payload.to_string()
                         } else {
-                            format!("{},{}", payload, target)
+                            format!("{payload},{target}")
                         };
 
                         if let Ok(parsed) = parse_rule(&full_rule) {
                             // Store in provider_rules for later inline expansion
                             // at the RULE-SET position in the main rules list
-                            provider_rules
-                                .entry(name.clone())
-                                .or_insert_with(Vec::new)
-                                .push(parsed);
+                            provider_rules.entry(name.clone()).or_default().push(parsed);
                         }
                     }
                     other => {
@@ -258,7 +255,13 @@ impl RuleEngine {
         // Log the first 20 rules for debugging rule order
         tracing::info!("Rule engine: {} total sequential rules", rules.len());
         for (i, rule) in rules.iter().take(20).enumerate() {
-            tracing::info!("  Rule[{}]: {},{},{}", i, rule.rule_type, rule.payload, rule.target);
+            tracing::info!(
+                "  Rule[{}]: {},{},{}",
+                i,
+                rule.rule_type,
+                rule.payload,
+                rule.target
+            );
         }
         if rules.len() > 20 {
             tracing::info!("  ... ({} more rules)", rules.len() - 20);
@@ -439,7 +442,7 @@ impl RuleEngine {
                 if let Some(ref domain) = metadata.domain {
                     let d = domain.to_lowercase();
                     let s = rule.payload.to_lowercase();
-                    if d == s || d.ends_with(&format!(".{}", s)) {
+                    if d == s || d.ends_with(&format!(".{s}")) {
                         return Some(target_to_action(&rule.target));
                     }
                 }
@@ -530,7 +533,7 @@ fn parse_rule(rule_str: &str) -> Result<ParsedRule> {
                     .collect(),
             })
         }
-        _ => Err(anyhow::anyhow!("invalid rule format: {}", rule_str)),
+        _ => Err(anyhow::anyhow!("invalid rule format: {rule_str}")),
     }
 }
 
@@ -541,7 +544,7 @@ fn parse_logical_rule(rule_str: &str) -> Result<ParsedRule> {
     // Find the rule type
     let first_comma = rule_str
         .find(',')
-        .ok_or_else(|| anyhow::anyhow!("invalid logical rule: {}", rule_str))?;
+        .ok_or_else(|| anyhow::anyhow!("invalid logical rule: {rule_str}"))?;
     let rule_type = rule_str[..first_comma].trim().to_string();
     let rest = &rule_str[first_comma + 1..];
 
@@ -551,8 +554,7 @@ fn parse_logical_rule(rule_str: &str) -> Result<ParsedRule> {
     let rest = rest.trim();
     if !rest.starts_with('(') {
         return Err(anyhow::anyhow!(
-            "logical rule payload must start with '(': {}",
-            rule_str
+            "logical rule payload must start with '(': {rule_str}"
         ));
     }
 
@@ -574,8 +576,7 @@ fn parse_logical_rule(rule_str: &str) -> Result<ParsedRule> {
 
     if depth != 0 {
         return Err(anyhow::anyhow!(
-            "unbalanced parentheses in logical rule: {}",
-            rule_str
+            "unbalanced parentheses in logical rule: {rule_str}"
         ));
     }
 
@@ -731,7 +732,7 @@ fn eval_condition(condition: &str, metadata: &RuleMetadata, engine: &RuleEngine)
             if let Some(ref domain) = metadata.domain {
                 let d = domain.to_lowercase();
                 let p = payload.to_lowercase();
-                d.ends_with(&format!(".{}", p)) || d == p
+                d.ends_with(&format!(".{p}")) || d == p
             } else {
                 false
             }

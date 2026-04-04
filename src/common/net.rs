@@ -26,5 +26,5 @@ pub fn get_interface_ip(iface: &str) -> Result<IpAddr> {
             }
         }
     }
-    Err(anyhow::anyhow!("no IP found for interface {}", iface))
+    Err(anyhow::anyhow!("no IP found for interface {iface}"))
 }

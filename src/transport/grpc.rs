@@ -237,7 +237,7 @@ where
         }
     });
 
-    let path = format!("/{}/Tun", service_name);
+    let path = format!("/{service_name}/Tun");
     let request = Request::builder()
         .method("POST")
         .uri(&path)
@@ -246,7 +246,7 @@ where
         .header("te", "trailers")
         .header("user-agent", "grpc-go/1.64.0")
         .body(())
-        .map_err(|e| anyhow::anyhow!("failed to build gRPC request: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("failed to build gRPC request: {e}"))?;
 
     let (response_future, send_stream) = client.send_request(request, false)?;
 
@@ -254,7 +254,7 @@ where
     let response = response_future.await?;
     let status = response.status();
     if !status.is_success() {
-        anyhow::bail!("gRPC server returned HTTP {}", status);
+        anyhow::bail!("gRPC server returned HTTP {status}");
     }
 
     let recv_stream = response.into_body();
