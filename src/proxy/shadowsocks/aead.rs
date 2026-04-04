@@ -497,6 +497,7 @@ fn build_initial_buffer(
 ///   `server_key` = Some(server PSK) -- used to derive the identity subkey
 ///   `user_key` = Some(user PSK) -- its hash is encrypted as the identity header
 ///   The session cipher (passed in `cipher`) must already be derived from the user_key.
+#[allow(clippy::too_many_arguments)]
 fn build_ss2022_request_buffer(
     salt: &[u8],
     cipher: &CipherCore,
