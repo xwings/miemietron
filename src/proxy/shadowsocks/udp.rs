@@ -12,7 +12,10 @@ use anyhow::{anyhow, Result};
 use tokio::net::UdpSocket;
 use tracing::debug;
 
-use super::aead::{encode_address, AeadCipher};
+use super::aead::{
+    decrypt_in_place_standalone, encrypt_in_place_standalone, encode_address, generate_salt,
+    AeadCipher,
+};
 use crate::common::addr::Address;
 
 /// AEAD tag size for all supported ciphers (16 bytes).
@@ -24,9 +27,11 @@ const ZERO_NONCE: [u8; 12] = [0u8; 12];
 /// Shadowsocks UDP socket — wraps a `UdpSocket` and encrypts/decrypts with AEAD.
 pub struct SsUdpSocket {
     inner: UdpSocket,
+    #[allow(dead_code)]
     server_addr: SocketAddr,
     cipher: AeadCipher,
     master_key: Vec<u8>,
+    recv_buf: tokio::sync::Mutex<Vec<u8>>,
 }
 
 impl SsUdpSocket {
@@ -52,6 +57,7 @@ impl SsUdpSocket {
             server_addr,
             cipher,
             master_key,
+            recv_buf: tokio::sync::Mutex::new(vec![0u8; 65535]),
         })
     }
 
@@ -71,7 +77,7 @@ impl SsUdpSocket {
         plaintext.extend_from_slice(data);
 
         // Encrypt in place (appends tag)
-        encrypt_in_place(&self.cipher, &subkey, &ZERO_NONCE, &mut plaintext)?;
+        encrypt_in_place_standalone(&self.cipher, &subkey, &ZERO_NONCE, &mut plaintext)?;
 
         // Build wire packet: salt + ciphertext_with_tag
         let mut packet = Vec::with_capacity(salt.len() + plaintext.len());
@@ -94,7 +100,7 @@ impl SsUdpSocket {
     /// Returns `(data, address)` where address is the remote sender's address
     /// as encoded in the SS packet header.
     pub async fn recv_from(&self, buf: &mut [u8]) -> Result<(usize, Address)> {
-        let mut recv_buf = vec![0u8; 65535];
+        let mut recv_buf = self.recv_buf.lock().await;
         let n = self.inner.recv(&mut recv_buf).await?;
         if n == 0 {
             return Err(anyhow!("SS UDP: received empty packet"));
@@ -116,7 +122,7 @@ impl SsUdpSocket {
         let subkey = self.cipher.derive_subkey(&self.master_key, salt);
 
         // Decrypt in place (removes tag)
-        decrypt_in_place(&self.cipher, &subkey, &ZERO_NONCE, &mut ciphertext)?;
+        decrypt_in_place_standalone(&self.cipher, &subkey, &ZERO_NONCE, &mut ciphertext)?;
 
         // Parse the address header from the decrypted payload
         let (addr, header_len) = parse_address(&ciphertext)?;
@@ -133,10 +139,6 @@ impl SsUdpSocket {
         Ok((copy_len, addr))
     }
 
-    /// Get the raw inner UDP socket (for polling readability, etc.).
-    pub fn inner(&self) -> &UdpSocket {
-        &self.inner
-    }
 }
 
 /// Implement `OutboundPacketConn` for `SsUdpSocket` — delegates to existing methods.
@@ -153,58 +155,6 @@ impl crate::proxy::OutboundPacketConn for SsUdpSocket {
     async fn close(&self) -> Result<()> {
         Ok(())
     }
-}
-
-/// Shadowsocks UDP relay — holds the configuration needed to create `SsUdpSocket`s.
-pub struct SsUdpRelay {
-    server: String,
-    port: u16,
-    cipher: AeadCipher,
-    master_key: Vec<u8>,
-}
-
-impl SsUdpRelay {
-    /// Create a new UDP relay instance.
-    pub fn new(server: String, port: u16, cipher: AeadCipher, master_key: Vec<u8>) -> Self {
-        Self {
-            server,
-            port,
-            cipher,
-            master_key,
-        }
-    }
-
-    /// Server address.
-    pub fn server(&self) -> &str {
-        &self.server
-    }
-
-    /// Server port.
-    pub fn port(&self) -> u16 {
-        self.port
-    }
-
-    /// Cipher type.
-    pub fn cipher(&self) -> AeadCipher {
-        self.cipher
-    }
-
-    /// Master key (cloned).
-    pub fn master_key(&self) -> &[u8] {
-        &self.master_key
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Internal helpers
-// ---------------------------------------------------------------------------
-
-/// Generate a random salt of the given length.
-fn generate_salt(len: usize) -> Vec<u8> {
-    use rand::RngCore;
-    let mut salt = vec![0u8; len];
-    rand::thread_rng().fill_bytes(&mut salt);
-    salt
 }
 
 /// Parse a Shadowsocks address header from `data`.
@@ -259,72 +209,6 @@ fn parse_address(data: &[u8]) -> Result<(Address, usize)> {
             ))
         }
         other => Err(anyhow!("SS UDP: unknown address type 0x{other:02x}")),
-    }
-}
-
-/// Encrypt data in-place using the given cipher, key, and nonce.
-/// Appends the AEAD tag to the data.
-fn encrypt_in_place(
-    cipher: &AeadCipher,
-    key: &[u8],
-    nonce: &[u8; 12],
-    data: &mut Vec<u8>,
-) -> Result<()> {
-    use aes_gcm::aead::generic_array::GenericArray;
-    use aes_gcm::aead::{AeadInPlace, KeyInit};
-    use aes_gcm::{Aes128Gcm, Aes256Gcm};
-    use chacha20poly1305::ChaCha20Poly1305;
-
-    let nonce_ga = GenericArray::from_slice(nonce);
-    match cipher {
-        AeadCipher::Aes128Gcm | AeadCipher::Blake3Aes128Gcm => {
-            let c = Aes128Gcm::new(GenericArray::from_slice(key));
-            c.encrypt_in_place(nonce_ga, b"", data)
-                .map_err(|e| anyhow!("aes-128-gcm encrypt: {e}"))
-        }
-        AeadCipher::Aes256Gcm | AeadCipher::Blake3Aes256Gcm => {
-            let c = Aes256Gcm::new(GenericArray::from_slice(key));
-            c.encrypt_in_place(nonce_ga, b"", data)
-                .map_err(|e| anyhow!("aes-256-gcm encrypt: {e}"))
-        }
-        AeadCipher::ChaCha20Poly1305 | AeadCipher::Blake3ChaCha20Poly1305 => {
-            let c = ChaCha20Poly1305::new(GenericArray::from_slice(key));
-            c.encrypt_in_place(nonce_ga, b"", data)
-                .map_err(|e| anyhow!("chacha20-poly1305 encrypt: {e}"))
-        }
-    }
-}
-
-/// Decrypt data in-place using the given cipher, key, and nonce.
-/// The data must include the appended AEAD tag; on success the tag is removed.
-fn decrypt_in_place(
-    cipher: &AeadCipher,
-    key: &[u8],
-    nonce: &[u8; 12],
-    data: &mut Vec<u8>,
-) -> Result<()> {
-    use aes_gcm::aead::generic_array::GenericArray;
-    use aes_gcm::aead::{AeadInPlace, KeyInit};
-    use aes_gcm::{Aes128Gcm, Aes256Gcm};
-    use chacha20poly1305::ChaCha20Poly1305;
-
-    let nonce_ga = GenericArray::from_slice(nonce);
-    match cipher {
-        AeadCipher::Aes128Gcm | AeadCipher::Blake3Aes128Gcm => {
-            let c = Aes128Gcm::new(GenericArray::from_slice(key));
-            c.decrypt_in_place(nonce_ga, b"", data)
-                .map_err(|e| anyhow!("aes-128-gcm decrypt: {e}"))
-        }
-        AeadCipher::Aes256Gcm | AeadCipher::Blake3Aes256Gcm => {
-            let c = Aes256Gcm::new(GenericArray::from_slice(key));
-            c.decrypt_in_place(nonce_ga, b"", data)
-                .map_err(|e| anyhow!("aes-256-gcm decrypt: {e}"))
-        }
-        AeadCipher::ChaCha20Poly1305 | AeadCipher::Blake3ChaCha20Poly1305 => {
-            let c = ChaCha20Poly1305::new(GenericArray::from_slice(key));
-            c.decrypt_in_place(nonce_ga, b"", data)
-                .map_err(|e| anyhow!("chacha20-poly1305 decrypt: {e}"))
-        }
     }
 }
 
@@ -391,11 +275,11 @@ mod tests {
         let original = b"hello world".to_vec();
 
         let mut data = original.clone();
-        encrypt_in_place(&cipher, &key, &nonce, &mut data).unwrap();
+        encrypt_in_place_standalone(&cipher, &key, &nonce, &mut data).unwrap();
         assert_ne!(data, original); // encrypted != plaintext
         assert_eq!(data.len(), original.len() + TAG_LEN); // tag appended
 
-        decrypt_in_place(&cipher, &key, &nonce, &mut data).unwrap();
+        decrypt_in_place_standalone(&cipher, &key, &nonce, &mut data).unwrap();
         assert_eq!(data, original); // back to original
     }
 
@@ -407,8 +291,8 @@ mod tests {
         let original = b"test data for chacha".to_vec();
 
         let mut data = original.clone();
-        encrypt_in_place(&cipher, &key, &nonce, &mut data).unwrap();
-        decrypt_in_place(&cipher, &key, &nonce, &mut data).unwrap();
+        encrypt_in_place_standalone(&cipher, &key, &nonce, &mut data).unwrap();
+        decrypt_in_place_standalone(&cipher, &key, &nonce, &mut data).unwrap();
         assert_eq!(data, original);
     }
 
@@ -420,8 +304,8 @@ mod tests {
         let original = b"aes128 test".to_vec();
 
         let mut data = original.clone();
-        encrypt_in_place(&cipher, &key, &nonce, &mut data).unwrap();
-        decrypt_in_place(&cipher, &key, &nonce, &mut data).unwrap();
+        encrypt_in_place_standalone(&cipher, &key, &nonce, &mut data).unwrap();
+        decrypt_in_place_standalone(&cipher, &key, &nonce, &mut data).unwrap();
         assert_eq!(data, original);
     }
 
@@ -444,11 +328,11 @@ mod tests {
 
         let original_plaintext = plaintext.clone();
 
-        encrypt_in_place(&cipher, &subkey, &ZERO_NONCE, &mut plaintext).unwrap();
+        encrypt_in_place_standalone(&cipher, &subkey, &ZERO_NONCE, &mut plaintext).unwrap();
 
         // Now decrypt
         let subkey2 = cipher.derive_subkey(&master_key, &salt);
-        decrypt_in_place(&cipher, &subkey2, &ZERO_NONCE, &mut plaintext).unwrap();
+        decrypt_in_place_standalone(&cipher, &subkey2, &ZERO_NONCE, &mut plaintext).unwrap();
         assert_eq!(plaintext, original_plaintext);
 
         // Parse the address back

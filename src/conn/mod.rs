@@ -14,10 +14,6 @@ use crate::rules::{process, Action, RuleMetadata};
 use crate::sniffer;
 use crate::AppState;
 
-// ---------------------------------------------------------------------------
-// CountingStream — wraps any AsyncRead+AsyncWrite and counts bytes transferred
-// ---------------------------------------------------------------------------
-
 pin_project! {
     pub struct CountingStream<T> {
         #[pin]
@@ -36,13 +32,6 @@ impl<T> CountingStream<T> {
         }
     }
 
-    pub fn upload_bytes(&self) -> u64 {
-        self.upload.load(Ordering::Relaxed)
-    }
-
-    pub fn download_bytes(&self) -> u64 {
-        self.download.load(Ordering::Relaxed)
-    }
 }
 
 impl<T: AsyncRead> AsyncRead for CountingStream<T> {
@@ -88,10 +77,6 @@ impl<T: AsyncWrite> AsyncWrite for CountingStream<T> {
         self.project().inner.poll_shutdown(cx)
     }
 }
-
-// ---------------------------------------------------------------------------
-// PeekableStream — replays buffered prefix bytes then delegates to the inner stream
-// ---------------------------------------------------------------------------
 
 pin_project! {
     /// A stream wrapper that replays `prefix` bytes before reading from `inner`.
@@ -364,7 +349,6 @@ impl ConnectionManager {
         let mut domain = host_override.or_else(|| dns.reverse_lookup(&dst.ip()));
         let mut pre_handle_failed = domain.is_none() && dns.is_fake_ip(&dst.ip());
 
-        // ---- Sniff: peek first bytes for TLS SNI / HTTP Host ----
         let sniff_cfg = config.sniffer.as_ref();
         let sniff_override = sniff_cfg.and_then(|s| s.should_sniff(dst.port()));
 
@@ -372,7 +356,7 @@ impl ConnectionManager {
         // If so, never skip sniffing and never cache failures.
         // Matches mihomo's `forceSniffer := sd.forceSniff(metadata)`.
         let force_sniffer = sniff_cfg
-            .map(|s| domain.as_deref().map_or(false, |d| s.is_force_domain(d)))
+            .map(|s| domain.as_deref().is_some_and(|d| s.is_force_domain(d)))
             .unwrap_or(false);
 
         // mihomo compat: skip list check — skip sniffing for destinations that
@@ -711,7 +695,6 @@ impl ConnectionManager {
             }
         };
 
-        // --- Per-connection byte counters ---
         let conn_id = uuid::Uuid::new_v4().to_string();
         let up_counter = Arc::new(AtomicU64::new(0));
         let down_counter = Arc::new(AtomicU64::new(0));
@@ -963,8 +946,6 @@ mod tests {
     use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    // ---- PeekableStream tests ----
-
     #[tokio::test]
     async fn peekable_stream_replays_prefix_then_inner() {
         let prefix = b"hello".to_vec();
@@ -1005,8 +986,6 @@ mod tests {
         let n = stream.read(&mut buf).await.unwrap();
         assert_eq!(&buf[..n], b"data");
     }
-
-    // ---- CountingStream tests ----
 
     #[tokio::test]
     async fn counting_stream_tracks_download_bytes() {
@@ -1056,8 +1035,6 @@ mod tests {
         assert_eq!(down.load(Ordering::Relaxed), 8); // 3 + 5
         assert_eq!(up.load(Ordering::Relaxed), 6); // 2 + 4
     }
-
-    // ---- ConnectionInfo / ConnectionSnapshot serialization tests ----
 
     #[test]
     fn connection_info_serializes_correctly() {
@@ -1123,8 +1100,6 @@ mod tests {
         assert!(json["connections"].as_array().unwrap().is_empty());
         assert_eq!(json["memory"], 4096);
     }
-
-    // ---- StatsManager tests ----
 
     #[test]
     fn stats_manager_tracks_traffic() {

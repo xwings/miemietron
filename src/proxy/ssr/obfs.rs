@@ -16,10 +16,6 @@ use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tracing::warn;
 
-// ---------------------------------------------------------------------------
-// Obfs plugin type
-// ---------------------------------------------------------------------------
-
 /// Supported SSR obfuscation plugin types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SsrObfs {
@@ -41,10 +37,6 @@ impl SsrObfs {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// ObfsStream: wraps a stream with SSR obfuscation
-// ---------------------------------------------------------------------------
 
 /// SSR obfuscation stream wrapper.
 ///
@@ -122,10 +114,6 @@ impl<T> SsrObfsStream<T> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// HTTP simple obfuscation helpers
-// ---------------------------------------------------------------------------
-
 /// Build a fake HTTP request header for http_simple obfs.
 ///
 /// Format:
@@ -178,10 +166,6 @@ fn build_http_simple_request(param: &str, payload: &[u8]) -> Vec<u8> {
 fn find_header_end(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4)
 }
-
-// ---------------------------------------------------------------------------
-// AsyncRead
-// ---------------------------------------------------------------------------
 
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncRead for SsrObfsStream<T> {
     fn poll_read(
@@ -250,10 +234,6 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncRead for SsrObfsStream<T> {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// AsyncWrite
-// ---------------------------------------------------------------------------
 
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncWrite for SsrObfsStream<T> {
     fn poll_write(
@@ -367,10 +347,6 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncWrite for SsrObfsStream<T> {
         Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
     }
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {

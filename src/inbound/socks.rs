@@ -29,7 +29,6 @@ const ATYP_IPV4: u8 = 0x01;
 const ATYP_DOMAIN: u8 = 0x03;
 const ATYP_IPV6: u8 = 0x04;
 const REP_SUCCESS: u8 = 0x00;
-const REP_GENERAL_FAILURE: u8 = 0x01;
 const REP_CMD_NOT_SUPPORTED: u8 = 0x07;
 
 /// Start a SOCKS5 proxy listener on `addr`.
@@ -68,7 +67,6 @@ async fn handle_socks5(
 ) -> Result<()> {
     let require_auth = !auth_list.is_empty();
 
-    // --- Auth negotiation ---
     let version = stream.read_u8().await?;
     if version != SOCKS5_VERSION {
         return Err(anyhow!("unsupported SOCKS version: {version}"));
@@ -135,7 +133,6 @@ async fn handle_socks5(
         stream.write_all(&[0x01, 0x00]).await?; // success
     }
 
-    // --- Request ---
     let ver = stream.read_u8().await?;
     if ver != SOCKS5_VERSION {
         return Err(anyhow!("unexpected version in request: {ver}"));
@@ -277,7 +274,7 @@ async fn handle_socks5(
                         )
                     };
 
-                    let nat_key = (src, format!("{}:{}", host, port));
+                    let nat_key = (src, format!("{host}:{port}"));
 
                     // Check if we already have a session for this (src, target) pair
                     if let Some(mut session) = nat_table.get_mut(&nat_key) {
@@ -576,8 +573,6 @@ mod tests {
     use super::*;
     use std::net::SocketAddrV4;
 
-    // ---- SOCKS5 constants tests ----
-
     #[test]
     fn socks5_constants_match_rfc1928() {
         assert_eq!(SOCKS5_VERSION, 0x05);
@@ -590,11 +585,8 @@ mod tests {
         assert_eq!(ATYP_DOMAIN, 0x03);
         assert_eq!(ATYP_IPV6, 0x04);
         assert_eq!(REP_SUCCESS, 0x00);
-        assert_eq!(REP_GENERAL_FAILURE, 0x01);
         assert_eq!(REP_CMD_NOT_SUPPORTED, 0x07);
     }
-
-    // ---- send_reply serialization test ----
 
     #[tokio::test]
     async fn send_reply_ipv4_format() {

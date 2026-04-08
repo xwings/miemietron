@@ -21,10 +21,6 @@ use tokio_tungstenite::WebSocketStream;
 /// mihomo / clash.meta use 2048 bytes by default.
 const DEFAULT_MAX_EARLY_DATA: usize = 2048;
 
-// ---------------------------------------------------------------------------
-// WsOptions / wrap_ws -- compatibility API used by proxy adapters
-// ---------------------------------------------------------------------------
-
 /// Options for WebSocket connections.
 #[derive(Debug, Clone, Default)]
 pub struct WsOptions {
@@ -47,10 +43,6 @@ where
     };
     connect(stream, &opts.path, &opts.host, hdr_ref).await
 }
-
-// ---------------------------------------------------------------------------
-// Primary connect functions
-// ---------------------------------------------------------------------------
 
 /// Connect over WebSocket, performing the HTTP upgrade on `stream`.
 ///
@@ -136,10 +128,6 @@ where
 
     Ok(WsStream::new(ws_stream))
 }
-
-// ---------------------------------------------------------------------------
-// WsStream: AsyncRead + AsyncWrite adapter over WebSocket binary frames
-// ---------------------------------------------------------------------------
 
 /// A bidirectional byte stream layered on top of a WebSocket connection.
 ///

@@ -72,11 +72,13 @@ impl FallbackGroup {
         self.interval
     }
 
+    #[allow(dead_code)]
     pub fn test_url(&self) -> &str {
         &self.test_url
     }
 
     /// Get a reference to the state store (for API reporting).
+    #[allow(dead_code)]
     pub fn state_store(&self) -> &Arc<ProxyStateStore> {
         &self.state_store
     }
@@ -128,6 +130,7 @@ impl FallbackGroup {
     }
 
     /// Get alive proxies with their delays (for API reporting).
+    #[allow(dead_code)]
     pub fn get_alive(&self) -> HashMap<String, u64> {
         let mut result = HashMap::new();
         for name in &self.proxy_names {

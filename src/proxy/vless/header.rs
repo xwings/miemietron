@@ -12,6 +12,7 @@ const VLESS_VERSION: u8 = 0x00;
 
 /// VLESS command types.
 pub const CMD_TCP: u8 = 0x01;
+#[allow(dead_code)]
 pub const CMD_UDP: u8 = 0x02;
 
 /// VLESS address types (SOCKS5 compatible).
@@ -66,6 +67,7 @@ pub fn encode_address(addr: &Address) -> Vec<u8> {
 /// [version: 1]  [uuid: 16]  [addon_len: 1]  [addons: variable]
 /// [command: 1]  [address: variable]
 /// ```
+#[allow(dead_code)]
 pub fn encode_request(uuid: &[u8; 16], cmd: u8, addr: &Address) -> Vec<u8> {
     encode_request_with_flow(uuid, cmd, addr, None)
 }

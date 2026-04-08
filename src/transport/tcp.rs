@@ -11,61 +11,24 @@ pub struct ConnectOpts {
     pub interface: Option<String>,
     pub routing_mark: Option<u32>,
     pub tfo: bool,
-    pub mptcp: bool,
-    pub tcp_concurrent: bool,
     /// mihomo compat: keepalive settings from config.
     pub keep_alive_idle: Duration,
     pub keep_alive_interval: Duration,
     pub disable_keep_alive: bool,
 }
 
-/// Connect with Happy Eyeballs (RFC 8305): race multiple addresses with a
-/// 250ms stagger. Returns the first successful connection.
-pub async fn connect_concurrent(addrs: &[SocketAddr], opts: &ConnectOpts) -> Result<TcpStream> {
-    if addrs.is_empty() {
-        return Err(anyhow::anyhow!("no addresses to connect to"));
-    }
-    if addrs.len() == 1 || !opts.tcp_concurrent {
-        return connect(addrs[0], opts).await;
-    }
-
-    use tokio::time::{sleep, Duration};
-
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<TcpStream>>(addrs.len());
-
-    for (i, &addr) in addrs.iter().enumerate() {
-        let tx = tx.clone();
-        let opts_mark = opts.routing_mark;
-        let opts_iface = opts.interface.clone();
-        let opts_tfo = opts.tfo;
-
-        tokio::spawn(async move {
-            // Stagger: 250ms delay per attempt after the first
-            if i > 0 {
-                sleep(Duration::from_millis(250 * i as u64)).await;
-            }
-            let co = ConnectOpts {
-                routing_mark: opts_mark,
-                interface: opts_iface,
-                tfo: opts_tfo,
-                ..Default::default()
-            };
-            let result = connect(addr, &co).await;
-            let _ = tx.send(result).await;
-        });
-    }
-
-    drop(tx); // Drop our sender so the channel closes when all spawned tasks are done
-
-    // Return the first successful result
-    let mut last_err = anyhow::anyhow!("all connection attempts failed");
-    while let Some(result) = rx.recv().await {
-        match result {
-            Ok(stream) => return Ok(stream),
-            Err(e) => last_err = e,
+impl ConnectOpts {
+    /// Build ConnectOpts from a proxy config's common fields.
+    pub fn from_proxy_config(config: &crate::config::proxy::ProxyConfig) -> Self {
+        Self {
+            routing_mark: config.routing_mark,
+            interface: config.interface_name.clone(),
+            tfo: config.tfo.unwrap_or(false),
+            keep_alive_idle: Duration::from_secs(config.keep_alive_idle.unwrap_or(0)),
+            keep_alive_interval: Duration::from_secs(config.keep_alive_interval.unwrap_or(0)),
+            disable_keep_alive: config.disable_keep_alive.unwrap_or(false),
         }
     }
-    Err(last_err)
 }
 
 /// Create a TCP connection with the given options.

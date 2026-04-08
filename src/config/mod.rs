@@ -44,7 +44,6 @@ pub struct MiemieConfig {
     #[serde(default = "default_mode")]
     pub mode: String,
 
-    // --- Inbound ports ---
     #[serde(default, deserialize_with = "deserialize_flex_u16")]
     pub port: u16,
     #[serde(default, deserialize_with = "deserialize_flex_u16")]
@@ -60,13 +59,11 @@ pub struct MiemieConfig {
     #[serde(default = "default_bind_address")]
     pub bind_address: String,
 
-    // --- Authentication ---
     /// List of "username:password" pairs for inbound proxy authentication.
     /// When non-empty, SOCKS5 and HTTP proxy inbound connections must authenticate.
     #[serde(default)]
     pub authentication: Vec<String>,
 
-    // --- External controller ---
     #[serde(default)]
     pub external_controller: Option<String>,
     #[serde(default)]
@@ -84,11 +81,9 @@ pub struct MiemieConfig {
     #[serde(default)]
     pub external_ui_name: Option<String>,
 
-    // --- Logging ---
     #[serde(default = "default_log_level")]
     pub log_level: String,
 
-    // --- Network ---
     #[serde(default)]
     pub ipv6: bool,
     #[serde(default)]
@@ -106,68 +101,53 @@ pub struct MiemieConfig {
     #[serde(default)]
     pub disable_keep_alive: bool,
 
-    // --- Fingerprint ---
     #[serde(default)]
     pub global_client_fingerprint: Option<String>,
     #[serde(default)]
     pub global_ua: Option<String>,
 
-    // --- Find process ---
     #[serde(default)]
     pub find_process_mode: Option<String>,
 
-    // --- DNS ---
     #[serde(default)]
     pub dns: DnsConfig,
 
-    // --- TUN ---
     #[serde(default)]
     pub tun: TunConfig,
 
-    // --- Proxies ---
     #[serde(default)]
     pub proxies: Vec<ProxyConfig>,
 
-    // --- Proxy Groups ---
     #[serde(default, rename = "proxy-groups")]
     pub proxy_groups: Vec<ProxyGroupConfig>,
 
-    // --- Rules ---
     #[serde(default)]
     pub rules: Vec<RuleString>,
 
-    // --- Sub-rules ---
     #[serde(default, rename = "sub-rules")]
     pub sub_rules: HashMap<String, Vec<RuleString>>,
 
-    // --- Providers ---
     #[serde(default, rename = "proxy-providers")]
     pub proxy_providers: HashMap<String, ProxyProviderConfig>,
 
     #[serde(default, rename = "rule-providers")]
     pub rule_providers: HashMap<String, RuleProviderConfig>,
 
-    // --- Hosts ---
     #[serde(default)]
     pub hosts: HashMap<String, String>,
 
-    // --- Sniffer ---
     #[serde(default)]
     pub sniffer: Option<SnifferConfig>,
 
-    // --- Profile ---
     #[serde(default)]
     pub profile: Option<ProfileConfig>,
 
-    // --- NTP ---
     #[serde(default)]
     pub ntp: crate::ntp::NtpConfig,
 
-    // --- GeoX URLs ---
     #[serde(default, rename = "geox-url")]
     pub geox_url: Option<HashMap<String, String>>,
 
-    // --- Geodata ---
     #[serde(default)]
     pub geodata_mode: bool,
     #[serde(default)]
@@ -177,23 +157,18 @@ pub struct MiemieConfig {
     #[serde(default)]
     pub geo_update_interval: Option<u64>,
 
-    // --- Tunnels (TCP/UDP port forwarding) ---
     #[serde(default)]
     pub tunnels: Vec<serde_yaml::Value>,
 
-    // --- IPTables config ---
     #[serde(default)]
     pub iptables: Option<IptablesConfig>,
 
-    // --- Global TLS ---
     #[serde(default)]
     pub tls: Option<GlobalTlsConfig>,
 
-    // --- Experimental ---
     #[serde(default)]
     pub experimental: Option<serde_yaml::Value>,
 
-    // --- Inbound options ---
     #[serde(default, rename = "inbound-tfo")]
     pub inbound_tfo: bool,
     #[serde(default, rename = "inbound-mptcp")]
@@ -256,7 +231,7 @@ impl SnifferConfig {
             // No per-protocol config — sniff all ports, use top-level override
             return Some(self.override_destination);
         }
-        for (_proto, pcfg) in &self.sniff {
+        for pcfg in self.sniff.values() {
             if port_matches(&pcfg.ports, dst_port) {
                 let ovr = pcfg.override_destination.unwrap_or(self.override_destination);
                 return Some(ovr);
@@ -313,11 +288,11 @@ fn domain_matches_list(domain: &str, list: &[String]) -> bool {
     for pattern in list {
         let p = pattern.to_lowercase();
         if let Some(suffix) = p.strip_prefix("+.") {
-            if d == suffix || d.ends_with(&format!(".{}", suffix)) {
+            if d == suffix || d.ends_with(&format!(".{suffix}")) {
                 return true;
             }
         } else if let Some(suffix) = p.strip_prefix("*.") {
-            if d.ends_with(&format!(".{}", suffix)) {
+            if d.ends_with(&format!(".{suffix}")) {
                 return true;
             }
         } else if d == p {

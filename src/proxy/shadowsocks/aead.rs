@@ -301,6 +301,7 @@ enum WriteState {
     Flushing { buf: Vec<u8>, pos: usize },
     /// SS2022: waiting for first user data to bundle with the address header.
     /// The first poll_write builds the complete initial request including user data.
+    #[allow(dead_code)]
     WaitingFirstData {
         salt: Vec<u8>,
         addr_header: Vec<u8>,
@@ -487,7 +488,7 @@ fn build_initial_buffer(
         let chunk = &payload[offset..offset + chunk_len];
 
         // Encrypt length (2 bytes big-endian)
-        let mut len_buf = vec![((chunk_len >> 8) & 0xFF) as u8, (chunk_len & 0xFF) as u8];
+        let mut len_buf = Vec::from([(chunk_len >> 8) as u8, (chunk_len & 0xFF) as u8]);
         cipher
             .encrypt_in_place(nonce.current(), &mut len_buf)
             .expect("encrypt length");
@@ -674,11 +675,67 @@ fn build_identity_header(
 }
 
 /// Generate a random salt of the given length.
-fn generate_salt(len: usize) -> Vec<u8> {
+pub(super) fn generate_salt(len: usize) -> Vec<u8> {
     use rand::RngCore;
     let mut salt = vec![0u8; len];
     rand::thread_rng().fill_bytes(&mut salt);
     salt
+}
+
+/// Standalone AEAD encrypt for UDP packets (each packet uses a fresh key/nonce).
+pub(super) fn encrypt_in_place_standalone(
+    cipher: &AeadCipher,
+    key: &[u8],
+    nonce: &[u8; NONCE_LEN],
+    data: &mut Vec<u8>,
+) -> anyhow::Result<()> {
+    use aes_gcm::aead::{AeadInPlace, KeyInit};
+    let nonce_ga = GenericArray::from_slice(nonce);
+    match cipher {
+        AeadCipher::Aes128Gcm | AeadCipher::Blake3Aes128Gcm => {
+            let c = Aes128Gcm::new(GenericArray::from_slice(key));
+            c.encrypt_in_place(nonce_ga, b"", data)
+                .map_err(|e| anyhow::anyhow!("aes-128-gcm encrypt: {e}"))
+        }
+        AeadCipher::Aes256Gcm | AeadCipher::Blake3Aes256Gcm => {
+            let c = Aes256Gcm::new(GenericArray::from_slice(key));
+            c.encrypt_in_place(nonce_ga, b"", data)
+                .map_err(|e| anyhow::anyhow!("aes-256-gcm encrypt: {e}"))
+        }
+        AeadCipher::ChaCha20Poly1305 | AeadCipher::Blake3ChaCha20Poly1305 => {
+            let c = ChaCha20Poly1305::new(GenericArray::from_slice(key));
+            c.encrypt_in_place(nonce_ga, b"", data)
+                .map_err(|e| anyhow::anyhow!("chacha20-poly1305 encrypt: {e}"))
+        }
+    }
+}
+
+/// Standalone AEAD decrypt for UDP packets (each packet uses a fresh key/nonce).
+pub(super) fn decrypt_in_place_standalone(
+    cipher: &AeadCipher,
+    key: &[u8],
+    nonce: &[u8; NONCE_LEN],
+    data: &mut Vec<u8>,
+) -> anyhow::Result<()> {
+    use aes_gcm::aead::{AeadInPlace, KeyInit};
+    let nonce_ga = GenericArray::from_slice(nonce);
+    match cipher {
+        AeadCipher::Aes128Gcm | AeadCipher::Blake3Aes128Gcm => {
+            let c = Aes128Gcm::new(GenericArray::from_slice(key));
+            c.decrypt_in_place(nonce_ga, b"", data)
+                .map_err(|e| anyhow::anyhow!("aes-128-gcm decrypt: {e}"))
+        }
+        AeadCipher::Aes256Gcm | AeadCipher::Blake3Aes256Gcm => {
+            let c = Aes256Gcm::new(GenericArray::from_slice(key));
+            c.decrypt_in_place(nonce_ga, b"", data)
+                .map_err(|e| anyhow::anyhow!("aes-256-gcm decrypt: {e}"))
+        }
+        AeadCipher::ChaCha20Poly1305 | AeadCipher::Blake3ChaCha20Poly1305 => {
+            let c = ChaCha20Poly1305::new(GenericArray::from_slice(key));
+            c.decrypt_in_place(nonce_ga, b"", data)
+                .map_err(|e| anyhow::anyhow!("chacha20-poly1305 decrypt: {e}"))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1521,7 +1578,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncWrite for SsStream<T> {
         let mut out = Vec::with_capacity(2 + TAG_LEN + chunk_len + TAG_LEN);
 
         // Encrypt length
-        let mut len_buf = vec![((chunk_len >> 8) & 0xFF) as u8, (chunk_len & 0xFF) as u8];
+        let mut len_buf = Vec::from([(chunk_len >> 8) as u8, (chunk_len & 0xFF) as u8]);
         enc.encrypt_in_place(me.enc_nonce.current(), &mut len_buf)?;
         me.enc_nonce.increment();
         out.extend_from_slice(&len_buf);

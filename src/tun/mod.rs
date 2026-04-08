@@ -43,11 +43,9 @@ pub async fn run_tun(
     dns: Arc<DnsResolver>,
     dns_listen: Option<String>,
 ) -> Result<()> {
-    // ---- Step 1: Open TUN device ----
     let tun_dev = TunDevice::open(&config)?;
     info!("TUN device {} opened (MTU {})", config.device, config.mtu);
 
-    // ---- Step 1b: Auto-detect outbound interface ----
     if config.auto_detect_interface {
         if let Some(iface) = route::detect_default_interface().await {
             info!("Auto-detected outbound interface: {}", iface);
@@ -58,7 +56,6 @@ pub async fn run_tun(
         }
     }
 
-    // ---- Step 2: Set up ip routes and iptables ----
     // Only set up routes and firewall rules when auto-route is enabled.
     // When auto-route is false, an external manager (e.g. OpenClash) handles
     // all firewall rules and redirects traffic to redir-port/tproxy-port instead.
@@ -74,7 +71,6 @@ pub async fn run_tun(
         );
     }
 
-    // ---- Dispatch based on stack type ----
     let stack_type = config.stack.to_lowercase();
     match stack_type.as_str() {
         "gvisor" | "mixed" => {
@@ -378,10 +374,6 @@ struct UdpSession {
     outbound: Arc<dyn OutboundPacketConn>,
     /// Last time a datagram was seen on this session.
     last_active: Instant,
-    /// Original source address of the client.
-    src: SocketAddr,
-    /// Original destination address the client intended to reach.
-    dst: SocketAddr,
     /// The target address for the proxy (domain or IP).
     target: Address,
 }
@@ -561,8 +553,6 @@ async fn run_udp_relay(
                         UdpSession {
                             outbound,
                             last_active: Instant::now(),
-                            src: src_addr,
-                            dst: orig_dst,
                             target: target.clone(),
                         },
                     );

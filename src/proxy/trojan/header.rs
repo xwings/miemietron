@@ -10,6 +10,7 @@ use crate::proxy::vless::header::encode_address;
 
 /// Trojan command types.
 pub const CMD_TCP: u8 = 0x01;
+#[allow(dead_code)]
 pub const CMD_UDP: u8 = 0x03;
 
 const CRLF: &[u8] = b"\r\n";

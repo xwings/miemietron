@@ -15,6 +15,7 @@ pub struct RuleProvider {
     format: RuleFormat,
     url: Option<String>,
     path: Option<PathBuf>,
+    #[allow(dead_code)]
     interval: u64,
     rules: Arc<RwLock<Vec<String>>>,
 }
@@ -98,6 +99,7 @@ impl RuleProvider {
     }
 
     /// Update rules by fetching from the remote URL (HTTP providers only).
+    #[allow(dead_code)]
     pub async fn update(&self) -> Result<()> {
         if self.provider_type != ProviderType::Http {
             return Ok(());
@@ -131,6 +133,7 @@ impl RuleProvider {
 
     /// Start a background task that auto-updates on the configured interval.
     /// Returns a JoinHandle that can be used to cancel the task.
+    #[allow(dead_code)]
     pub fn start_auto_update(self: Arc<Self>) -> tokio::task::JoinHandle<()> {
         let interval_secs = if self.interval > 0 {
             self.interval
@@ -154,11 +157,13 @@ impl RuleProvider {
     }
 
     /// Get the provider name.
+    #[allow(dead_code)]
     pub fn name(&self) -> &str {
         &self.name
     }
 
     /// Get the configured update interval in seconds.
+    #[allow(dead_code)]
     pub fn interval(&self) -> u64 {
         self.interval
     }
@@ -311,8 +316,6 @@ fn parse_mrs_format(data: &[u8]) -> Result<Vec<String>> {
 mod tests {
     use super::*;
 
-    // ---- parse_text_format tests (domain behavior) ----
-
     #[test]
     fn parse_text_domain_one_per_line() {
         let content = "example.com\ngoogle.com\nyoutube.com\n";
@@ -348,8 +351,6 @@ mod tests {
         assert!(rules.is_empty());
     }
 
-    // ---- parse_text_format tests (ipcidr behavior) ----
-
     #[test]
     fn parse_text_ipcidr_behavior() {
         let content = "192.168.0.0/16\n10.0.0.0/8\n172.16.0.0/12\n";
@@ -363,8 +364,6 @@ mod tests {
         let rules = parse_text_format(content);
         assert_eq!(rules, vec!["fc00::/7", "::1/128"]);
     }
-
-    // ---- parse_text_format tests (classical behavior) ----
 
     #[test]
     fn parse_text_classical_full_rule_strings() {
@@ -400,8 +399,6 @@ DOMAIN-KEYWORD,tracker
             vec!["DOMAIN-SUFFIX,ads.example.com", "DOMAIN-KEYWORD,tracker"]
         );
     }
-
-    // ---- parse_yaml_format tests ----
 
     #[test]
     fn parse_yaml_domain_payload() {
@@ -477,8 +474,6 @@ payload:
         let content = "this is: [not: valid yaml: {{";
         assert!(parse_yaml_format(content).is_err());
     }
-
-    // ---- RuleProvider construction tests ----
 
     #[test]
     fn rule_provider_new_http() {

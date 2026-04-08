@@ -34,10 +34,6 @@ use super::tls::TlsOptions;
 
 type HmacSha256 = Hmac<Sha256>;
 
-// ---------------------------------------------------------------------------
-// Config
-// ---------------------------------------------------------------------------
-
 /// Configuration for a Reality connection, parsed from proxy config.
 #[derive(Debug, Clone)]
 pub struct RealityConfig {
@@ -90,10 +86,6 @@ impl RealityConfig {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Auth header construction
-// ---------------------------------------------------------------------------
-
 /// Build the Reality authentication header.
 ///
 /// This is sent as the first application-data record after the TLS
@@ -132,10 +124,6 @@ fn build_auth_header(
     header
 }
 
-// ---------------------------------------------------------------------------
-// Public API
-// ---------------------------------------------------------------------------
-
 /// Establish a Reality connection over a raw TCP stream.
 ///
 /// 1. Performs a genuine TLS handshake with the camouflage SNI and the
@@ -154,13 +142,11 @@ where
         config.server_name, config.fingerprint
     );
 
-    // --- Step 1: x25519 key exchange ---
     let client_secret = EphemeralSecret::random_from_rng(rand::thread_rng());
     let client_public = PublicKey::from(&client_secret);
     let server_public = PublicKey::from(config.public_key);
     let shared_secret = client_secret.diffie_hellman(&server_public);
 
-    // --- Step 2: TLS handshake with camouflage SNI and fingerprint ---
     let fp = config.fingerprint;
     let provider = fingerprint::make_crypto_provider(fp);
 
@@ -205,7 +191,6 @@ where
         .await
         .map_err(|e| anyhow::anyhow!("Reality: TLS handshake failed: {e}"))?;
 
-    // --- Step 3: Send Reality auth header ---
     let auth_header = build_auth_header(
         client_public.as_bytes(),
         shared_secret.as_bytes(),
@@ -221,7 +206,6 @@ where
         .await
         .context("Reality: failed to flush auth header")?;
 
-    // --- Step 4: Read server acknowledgment ---
     // The server responds with a single byte: 0x00 = success.
     let mut ack = [0u8; 1];
     tls_stream

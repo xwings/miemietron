@@ -2,6 +2,7 @@ use axum::{
     extract::{ws, FromRequestParts, Request, State},
     response::{IntoResponse, Response},
 };
+use std::collections::VecDeque;
 use std::sync::Arc;
 use tokio::sync::broadcast;
 use tracing_subscriber::Layer;
@@ -21,7 +22,7 @@ pub struct LogEntry {
 #[derive(Clone)]
 pub struct LogBroadcast {
     sender: broadcast::Sender<LogEntry>,
-    recent: Arc<parking_lot::RwLock<Vec<LogEntry>>>,
+    recent: Arc<parking_lot::RwLock<VecDeque<LogEntry>>>,
     max_recent: usize,
 }
 
@@ -30,7 +31,7 @@ impl LogBroadcast {
         let (sender, _) = broadcast::channel(capacity);
         Self {
             sender,
-            recent: Arc::new(parking_lot::RwLock::new(Vec::with_capacity(capacity))),
+            recent: Arc::new(parking_lot::RwLock::new(VecDeque::with_capacity(capacity))),
             max_recent: capacity,
         }
     }
@@ -44,25 +45,29 @@ impl LogBroadcast {
         {
             let mut recent = self.recent.write();
             if recent.len() >= self.max_recent {
-                recent.remove(0);
+                recent.pop_front();
             }
-            recent.push(entry.clone());
+            recent.push_back(entry.clone());
         }
         let _ = self.sender.send(entry);
     }
 
+    #[allow(dead_code)]
     pub fn info(&self, msg: &str) {
         self.send("info", msg);
     }
 
+    #[allow(dead_code)]
     pub fn warning(&self, msg: &str) {
         self.send("warning", msg);
     }
 
+    #[allow(dead_code)]
     pub fn error(&self, msg: &str) {
         self.send("error", msg);
     }
 
+    #[allow(dead_code)]
     pub fn debug(&self, msg: &str) {
         self.send("debug", msg);
     }
@@ -72,14 +77,10 @@ impl LogBroadcast {
     }
 
     /// Get the last N log entries.
+    #[allow(dead_code)]
     pub fn recent_entries(&self, max: usize) -> Vec<LogEntry> {
         let recent = self.recent.read();
-        let start = if recent.len() > max {
-            recent.len() - max
-        } else {
-            0
-        };
-        recent[start..].to_vec()
+        recent.iter().rev().take(max).rev().cloned().collect()
     }
 }
 
@@ -89,10 +90,6 @@ static LOG_BROADCAST: once_cell::sync::Lazy<Arc<LogBroadcast>> =
 pub fn global_log_broadcast() -> Arc<LogBroadcast> {
     LOG_BROADCAST.clone()
 }
-
-// ---------------------------------------------------------------------------
-// tracing Layer that forwards log events to LogBroadcast
-// ---------------------------------------------------------------------------
 
 /// A `tracing_subscriber::Layer` that sends every tracing event to the
 /// global `LogBroadcast` channel, making logs available via the REST API
@@ -158,10 +155,6 @@ impl tracing::field::Visit for MessageVisitor {
     }
 }
 
-// ---------------------------------------------------------------------------
-// API handlers
-// ---------------------------------------------------------------------------
-
 /// GET /logs - handles both WebSocket and plain HTTP requests.
 ///
 /// Checks for WebSocket upgrade headers manually and dispatches accordingly.
@@ -206,7 +199,7 @@ pub async fn get_logs(State(state): State<ApiState>, request: Request) -> Respon
                             if let Ok(json) = serde_json::to_string(&entry) {
                                 return Some((
                                     Ok::<_, std::io::Error>(bytes::Bytes::from(format!(
-                                        "{}\n", json
+                                        "{json}\n"
                                     ))),
                                     rx,
                                 ));

@@ -6,10 +6,6 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-// ---------------------------------------------------------------------------
-// H2Stream: AsyncRead + AsyncWrite over plain HTTP/2
-// ---------------------------------------------------------------------------
-
 /// A bidirectional byte stream layered on top of an HTTP/2 connection.
 ///
 /// Unlike gRPC, this does not add any extra framing -- data flows directly
@@ -129,10 +125,6 @@ impl AsyncWrite for H2Stream {
     }
 }
 
-// ---------------------------------------------------------------------------
-// connect_h2 -- establish an HTTP/2 stream over an existing transport
-// ---------------------------------------------------------------------------
-
 /// Establish an HTTP/2 stream over an existing async transport (typically TLS
 /// with ALPN=h2).
 ///
@@ -173,10 +165,6 @@ where
 
     Ok(H2Stream::new(send_stream, recv_stream))
 }
-
-// ---------------------------------------------------------------------------
-// TokioIo adapter (same as grpc.rs)
-// ---------------------------------------------------------------------------
 
 struct TokioIo<S>(S);
 

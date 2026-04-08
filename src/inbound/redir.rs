@@ -14,7 +14,7 @@ use std::mem::MaybeUninit;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::os::unix::io::AsRawFd;
 use std::sync::Arc;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpListener;
 use tracing::{debug, info, warn};
 
 use crate::conn::ConnectionManager;
@@ -31,7 +31,7 @@ pub async fn run_redir_listener(port: u16, conn_manager: Arc<ConnectionManager>)
     // mihomo compat: simple TCP listener, no IP_TRANSPARENT (that's for TPROXY).
     // iptables REDIRECT changes the destination to localhost:port, so a regular
     // TCP listener is sufficient. SO_ORIGINAL_DST recovers the original destination.
-    let addr = format!("0.0.0.0:{}", port);
+    let addr = format!("0.0.0.0:{port}");
     let listener = TcpListener::bind(&addr)
         .await
         .with_context(|| format!("failed to bind redir listener on {addr}"))?;
@@ -206,24 +206,4 @@ fn get_original_dst(fd: std::os::unix::io::RawFd) -> std::io::Result<SocketAddr>
     }
 
     Err(std::io::Error::last_os_error())
-}
-
-/// Set SO_MARK on a TcpStream to bypass TUN routing.
-fn set_socket_mark(stream: &TcpStream, mark: u32) {
-    let fd = stream.as_raw_fd();
-    let ret = unsafe {
-        libc::setsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_MARK,
-            &mark as *const u32 as *const libc::c_void,
-            std::mem::size_of::<u32>() as libc::socklen_t,
-        )
-    };
-    if ret != 0 {
-        debug!(
-            "setsockopt SO_MARK on redir socket failed: {}",
-            std::io::Error::last_os_error()
-        );
-    }
 }

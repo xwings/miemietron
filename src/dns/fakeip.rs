@@ -43,9 +43,7 @@ impl FakeIpPool {
         let last = base + total; // one past the last IP in the prefix
         if first >= last {
             return Err(anyhow::anyhow!(
-                "fake-ip-range {} is too small (need at least /29, got /{})",
-                cidr,
-                prefix_len
+                "fake-ip-range {cidr} is too small (need at least /29, got /{prefix_len})"
             ));
         }
         let size = last - first; // number of usable addresses
@@ -110,11 +108,6 @@ impl FakeIpPool {
         self.ip_to_domain.get(ip).map(|v| v.value().clone())
     }
 
-    /// Look up the fake IP for a domain.
-    pub fn lookup_ip(&self, domain: &str) -> Option<IpAddr> {
-        self.domain_to_ip.get(domain).map(|v| *v.value())
-    }
-
     /// Check if an IP is within the full fake IP CIDR range.
     /// This covers the entire prefix including gateway and reserved addresses.
     pub fn contains(&self, ip: &IpAddr) -> bool {
@@ -151,10 +144,6 @@ impl FakeIpPool {
         self.ip_to_domain.clear();
         self.domain_to_ip.clear();
         self.offset.store(0, Ordering::Relaxed);
-    }
-
-    pub fn size(&self) -> usize {
-        self.ip_to_domain.len()
     }
 
     /// Save the current domain<->IP mappings to disk as JSON.
@@ -296,7 +285,6 @@ mod tests {
         let ip5 = pool.allocate("e.com");
         assert_eq!(ip5, ip1);
         assert_eq!(pool.lookup_domain(&ip1), Some("e.com".to_string()));
-        assert_eq!(pool.lookup_ip("a.com"), None);
         // Others should still be there
         assert_eq!(pool.lookup_domain(&ip2), Some("b.com".to_string()));
         assert_eq!(pool.lookup_domain(&ip3), Some("c.com".to_string()));
@@ -351,23 +339,11 @@ mod tests {
     #[test]
     fn clear_resets_pool() {
         let pool = make_pool();
-        pool.allocate("a.com");
+        let ip_a = pool.allocate("a.com");
         pool.allocate("b.com");
-        assert_eq!(pool.size(), 2);
         pool.clear();
-        assert_eq!(pool.size(), 0);
-        assert_eq!(pool.lookup_ip("a.com"), None);
+        assert_eq!(pool.lookup_domain(&ip_a), None);
     }
-
-    #[test]
-    fn lookup_ip_works() {
-        let pool = make_pool();
-        let ip = pool.allocate("test.com");
-        assert_eq!(pool.lookup_ip("test.com"), Some(ip));
-        assert_eq!(pool.lookup_ip("nonexistent.com"), None);
-    }
-
-    // ---- Additional wildcard filter tests ----
 
     #[test]
     fn wildcard_filter_matches_subdomain() {
@@ -434,8 +410,6 @@ mod tests {
         assert!(!pool.should_bypass("google.com"));
     }
 
-    // ---- Whitelist mode tests ----
-
     #[test]
     fn whitelist_only_matching_domains_get_fakeip() {
         let filter = vec!["*.example.com".to_string(), "specific.org".to_string()];
@@ -467,8 +441,6 @@ mod tests {
         assert!(!pool.should_bypass("example.com"));
     }
 
-    // ---- Multiple filters combined ----
-
     #[test]
     fn multiple_filters_blacklist() {
         let filter = vec![
@@ -486,8 +458,6 @@ mod tests {
         assert!(!pool.should_bypass("example.com"));
     }
 
-    // ---- Save/Load persistence ----
-
     #[test]
     fn save_and_load_round_trip() {
         let pool = make_pool();
@@ -503,8 +473,6 @@ mod tests {
 
         assert_eq!(pool2.lookup_domain(&ip1), Some("a.com".to_string()));
         assert_eq!(pool2.lookup_domain(&ip2), Some("b.com".to_string()));
-        assert_eq!(pool2.lookup_ip("a.com"), Some(ip1));
-        assert_eq!(pool2.lookup_ip("b.com"), Some(ip2));
 
         // Clean up
         std::fs::remove_file(&tmp).ok();
@@ -515,6 +483,5 @@ mod tests {
         let pool = make_pool();
         let result = pool.load(Path::new("/tmp/nonexistent_fakeip_test_12345.json"));
         assert!(result.is_ok());
-        assert_eq!(pool.size(), 0);
     }
 }

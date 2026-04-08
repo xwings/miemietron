@@ -68,15 +68,7 @@ impl Socks5Outbound {
             sni: config.sni.clone(),
             skip_cert_verify: config.skip_cert_verify.unwrap_or(false),
             udp: config.udp.unwrap_or(false),
-            connect_opts: ConnectOpts {
-                routing_mark: config.routing_mark,
-                interface: config.interface_name.clone(),
-                tcp_concurrent: config.tcp_concurrent.unwrap_or(false),
-                keep_alive_idle: std::time::Duration::from_secs(config.keep_alive_idle.unwrap_or(0)),
-                keep_alive_interval: std::time::Duration::from_secs(config.keep_alive_interval.unwrap_or(0)),
-                disable_keep_alive: config.disable_keep_alive.unwrap_or(false),
-                ..Default::default()
-            },
+            connect_opts: ConnectOpts::from_proxy_config(config),
         })
     }
 }
@@ -129,7 +121,6 @@ impl Socks5Outbound {
     where
         S: ProxyStream + 'static,
     {
-        // --- Auth method negotiation ---
         let has_auth = self.username.is_some();
         if has_auth {
             // Offer both no-auth and user/pass
@@ -180,11 +171,10 @@ impl Socks5Outbound {
                 return Err(anyhow!("SOCKS5 server: no acceptable auth methods"));
             }
             other => {
-                return Err(anyhow!("SOCKS5 server chose unsupported auth method: {}", other));
+                return Err(anyhow!("SOCKS5 server chose unsupported auth method: {other}"));
             }
         }
 
-        // --- CONNECT request ---
         let mut connect_req = Vec::with_capacity(64);
         connect_req.extend_from_slice(&[SOCKS5_VERSION, CMD_CONNECT, 0x00]); // ver, cmd, rsv
 
@@ -212,7 +202,6 @@ impl Socks5Outbound {
         stream.write_all(&connect_req).await?;
         stream.flush().await?;
 
-        // --- Read reply ---
         let mut reply_head = [0u8; 4];
         stream.read_exact(&mut reply_head).await?;
 
@@ -240,7 +229,7 @@ impl Socks5Outbound {
                 stream.read_exact(&mut buf).await?;
             }
             other => {
-                return Err(anyhow!("SOCKS5 reply has unknown ATYP: {}", other));
+                return Err(anyhow!("SOCKS5 reply has unknown ATYP: {other}"));
             }
         }
 
@@ -249,7 +238,7 @@ impl Socks5Outbound {
             self.server,
             self.port,
             match target {
-                Address::Domain(h, p) => format!("{}:{}", h, p),
+                Address::Domain(h, p) => format!("{h}:{p}"),
                 Address::Ip(a) => a.to_string(),
             }
         );

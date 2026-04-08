@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use parking_lot::RwLock;
@@ -15,15 +15,18 @@ use super::ProxyGroup;
 pub struct SelectorGroup {
     group_name: String,
     proxy_names: Vec<String>,
+    proxy_name_set: HashSet<String>,
     current: RwLock<String>,
 }
 
 impl SelectorGroup {
     pub fn new(name: String, proxies: Vec<String>) -> Self {
         let initial = proxies.first().cloned().unwrap_or_default();
+        let proxy_name_set: HashSet<String> = proxies.iter().cloned().collect();
         Self {
             group_name: name,
             proxy_names: proxies,
+            proxy_name_set,
             current: RwLock::new(initial),
         }
     }
@@ -47,7 +50,7 @@ impl ProxyGroup for SelectorGroup {
     }
 
     fn select(&self, name: &str) -> bool {
-        if self.proxy_names.iter().any(|n| n == name) {
+        if self.proxy_name_set.contains(name) {
             *self.current.write() = name.to_string();
             true
         } else {

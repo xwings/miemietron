@@ -47,6 +47,7 @@ const VMESS_HEADER_VERSION: u8 = 1;
 
 /// VMess command types.
 pub const CMD_TCP: u8 = 0x01;
+#[allow(dead_code)]
 pub const CMD_UDP: u8 = 0x02;
 
 /// Address types.
@@ -183,14 +184,11 @@ pub fn encode_request_header(
         .unwrap()
         .as_secs();
 
-    // --- Auth Info (16 bytes) ---
     let auth_info = create_auth_info(uuid, timestamp);
 
-    // --- Random connection nonce (8 bytes) ---
     let mut connection_nonce = [0u8; 8];
     rng.fill(&mut connection_nonce);
 
-    // --- Build header plaintext ---
     let mut body_iv = [0u8; 16];
     let mut body_key = [0u8; 16];
     rng.fill(&mut body_iv);
@@ -230,7 +228,6 @@ pub fn encode_request_header(
     let checksum = fnv1a32(&header_plaintext);
     header_plaintext.extend_from_slice(&checksum.to_be_bytes());
 
-    // --- AEAD header encryption ---
     // Derive the "cmd key" from UUID: MD5(uuid_bytes)
     let cmd_key = {
         let mut hasher = Md5::new();
@@ -330,7 +327,6 @@ pub fn encode_request_header(
         )
         .expect("AES-128-GCM encryption should not fail");
 
-    // --- Assemble final wire bytes ---
     // [auth_info: 16][connection_nonce: 8][encrypted_length: 2+16][encrypted_payload: N+16]
     let mut wire = Vec::with_capacity(16 + 8 + encrypted_length.len() + encrypted_payload.len());
     wire.extend_from_slice(&auth_info);

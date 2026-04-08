@@ -19,10 +19,6 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::proxy::shadowsocks::aead::evp_bytes_to_key;
 
-// ---------------------------------------------------------------------------
-// SSR stream cipher descriptor
-// ---------------------------------------------------------------------------
-
 /// Supported SSR stream cipher types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SsrCipher {
@@ -68,10 +64,6 @@ impl SsrCipher {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// Cipher core: encrypt/decrypt bytes in-place using stream ciphers
-// ---------------------------------------------------------------------------
 
 /// A stream cipher instance that can encrypt or decrypt data in-place.
 ///
@@ -174,10 +166,6 @@ impl CipherInstance {
     }
 }
 
-// ---------------------------------------------------------------------------
-// RC4-MD5: RC4 with MD5-derived key from (key || iv)
-// ---------------------------------------------------------------------------
-
 /// Derive the RC4 key by hashing (key || iv) with MD5.
 fn rc4_md5_key(key: &[u8], iv: &[u8]) -> Vec<u8> {
     use digest::Digest;
@@ -221,10 +209,6 @@ impl Rc4State {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// SsrStream: wraps an async stream with SSR stream cipher
-// ---------------------------------------------------------------------------
 
 /// SSR stream cipher wrapper.
 ///
@@ -292,6 +276,7 @@ impl<T> SsrStream<T> {
     }
 
     /// Derive the master key for external use (protocol plugins may need it).
+    #[allow(dead_code)]
     pub fn key(&self) -> &[u8] {
         &self.key
     }
@@ -306,10 +291,6 @@ fn generate_iv(len: usize) -> Vec<u8> {
     }
     iv
 }
-
-// ---------------------------------------------------------------------------
-// AsyncRead: read from inner, strip IV, decrypt
-// ---------------------------------------------------------------------------
 
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncRead for SsrStream<T> {
     fn poll_read(
@@ -373,10 +354,6 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncRead for SsrStream<T> {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// AsyncWrite: encrypt data, prepend IV on first write
-// ---------------------------------------------------------------------------
 
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncWrite for SsrStream<T> {
     fn poll_write(
@@ -516,10 +493,6 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncWrite for SsrStream<T> {
         Pin::new(&mut this.inner).poll_shutdown(cx)
     }
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {

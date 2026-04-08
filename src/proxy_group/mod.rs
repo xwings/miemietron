@@ -1,28 +1,13 @@
-// Proxy group implementations.
-// Phase 6: select, url-test, fallback, load-balance, relay.
-
-#[allow(unused_imports)]
 mod fallback;
 pub mod health;
-#[allow(unused_imports)]
 mod load_balance;
 pub mod proxy_state;
-#[allow(unused_imports)]
-mod relay;
-#[allow(unused_imports)]
 mod selector;
-#[allow(unused_imports)]
 mod url_test;
 
-#[allow(unused_imports)]
 pub use fallback::FallbackGroup;
-#[allow(unused_imports)]
 pub use load_balance::{LoadBalanceGroup, LoadBalanceStrategy};
-#[allow(unused_imports)]
-pub use relay::RelayGroup;
-#[allow(unused_imports)]
 pub use selector::SelectorGroup;
-#[allow(unused_imports)]
 pub use url_test::UrlTestGroup;
 
 use std::collections::HashMap;
@@ -59,7 +44,6 @@ pub trait ProxyGroup: Send + Sync {
     ) -> Option<Arc<dyn OutboundHandler>>;
 
     /// Called when a connection through this group's proxy fails.
-    /// May trigger an immediate health check after repeated failures.
     /// mihomo compat: matches GroupBase.onDialFailed() in groupbase.go
     fn on_dial_failed(&self, _proxy_type: &str, _err: &str) {}
 

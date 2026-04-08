@@ -75,11 +75,6 @@ async fn handle_memory_ws(mut socket: ws::WebSocket) {
     }
 }
 
-pub async fn get_gc() -> StatusCode {
-    // Rust has no GC, but we honor the endpoint for compatibility
-    StatusCode::OK
-}
-
 pub async fn post_restart(State(state): State<ApiState>) -> Json<Value> {
     let _ = state.app.restart_tx.try_send(());
     tracing::info!("Restart requested via API");

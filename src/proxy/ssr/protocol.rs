@@ -16,10 +16,6 @@ use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tracing::warn;
 
-// ---------------------------------------------------------------------------
-// Protocol plugin type
-// ---------------------------------------------------------------------------
-
 /// Supported SSR protocol plugin types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SsrProtocol {
@@ -49,10 +45,6 @@ impl SsrProtocol {
     }
 }
 
-// ---------------------------------------------------------------------------
-// SsrProtocolStream: wraps a stream with SSR protocol plugin
-// ---------------------------------------------------------------------------
-
 /// SSR protocol plugin stream wrapper.
 ///
 /// Currently only `origin` is implemented. All other protocol plugins
@@ -60,6 +52,7 @@ impl SsrProtocol {
 ///
 /// This is a transparent wrapper — for `origin`, it simply delegates all
 /// reads and writes to the inner stream without modification.
+#[allow(dead_code)]
 pub struct SsrProtocolStream<T> {
     inner: T,
     protocol: SsrProtocol,
@@ -84,14 +77,11 @@ impl<T> SsrProtocolStream<T> {
     }
 
     /// Get the effective protocol type (for diagnostics).
+    #[allow(dead_code)]
     pub fn protocol(&self) -> SsrProtocol {
         self.protocol
     }
 }
-
-// ---------------------------------------------------------------------------
-// AsyncRead: passthrough (origin protocol = no modification)
-// ---------------------------------------------------------------------------
 
 impl<T: AsyncRead + Unpin + Send> AsyncRead for SsrProtocolStream<T> {
     fn poll_read(
@@ -104,10 +94,6 @@ impl<T: AsyncRead + Unpin + Send> AsyncRead for SsrProtocolStream<T> {
         Pin::new(&mut self.get_mut().inner).poll_read(cx, buf)
     }
 }
-
-// ---------------------------------------------------------------------------
-// AsyncWrite: passthrough (origin protocol = no modification)
-// ---------------------------------------------------------------------------
 
 impl<T: AsyncWrite + Unpin + Send> AsyncWrite for SsrProtocolStream<T> {
     fn poll_write(
@@ -126,10 +112,6 @@ impl<T: AsyncWrite + Unpin + Send> AsyncWrite for SsrProtocolStream<T> {
         Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
     }
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {

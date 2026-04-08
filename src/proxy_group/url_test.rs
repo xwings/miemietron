@@ -87,11 +87,13 @@ impl UrlTestGroup {
     }
 
     /// The configured test URL.
+    #[allow(dead_code)]
     pub fn test_url(&self) -> &str {
         &self.test_url
     }
 
     /// Get a reference to the state store (for API reporting).
+    #[allow(dead_code)]
     pub fn state_store(&self) -> &Arc<ProxyStateStore> {
         &self.state_store
     }
@@ -149,6 +151,7 @@ impl UrlTestGroup {
     }
 
     /// Get the current delay results (for API reporting).
+    #[allow(dead_code)]
     pub fn get_delays(&self) -> HashMap<String, u64> {
         let mut result = HashMap::new();
         for name in &self.proxy_names {
@@ -383,8 +386,7 @@ pub(crate) async fn measure_unified_delay(
         // Send HTTP HEAD request
         // mihomo compat: uses Go's http.NewRequest(HEAD, url, nil) which adds standard headers
         let req = format!(
-            "HEAD {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: clash\r\nConnection: close\r\n\r\n",
-            path, host
+            "HEAD {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: clash\r\nConnection: close\r\n\r\n"
         );
         stream.write_all(req.as_bytes()).await?;
 

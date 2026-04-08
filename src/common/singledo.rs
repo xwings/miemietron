@@ -11,11 +11,13 @@ use std::time::{Duration, Instant};
 use parking_lot::Mutex;
 use tokio::sync::Notify;
 
+#[allow(dead_code)]
 struct Call<T: Clone + Send> {
     notify: Arc<Notify>,
     result: Mutex<Option<(T, Option<String>)>>,
 }
 
+#[allow(dead_code)]
 struct CachedResult<T> {
     val: T,
     err: Option<String>,
@@ -23,6 +25,7 @@ struct CachedResult<T> {
 }
 
 pub struct SingleDo<T: Clone + Send> {
+    #[allow(dead_code)]
     wait: Duration,
     inner: Mutex<SingleDoInner<T>>,
 }
@@ -49,6 +52,7 @@ impl<T: Clone + Send> SingleDo<T> {
     /// was reused from cache or from another in-flight call.
     ///
     /// Matches mihomo's `Single.Do()` signature.
+    #[allow(dead_code)]
     pub async fn do_once<F, Fut>(
         &self,
         f: F,
@@ -72,11 +76,7 @@ impl<T: Clone + Send> SingleDo<T> {
             inner.result = None;
 
             // Check if another call is in flight
-            if let Some(ref call_m) = inner.call {
-                Some(call_m.clone())
-            } else {
-                None
-            }
+            inner.call.as_ref().map(|call_m| call_m.clone())
         };
 
         // If there's an in-flight call, wait for it (outside the lock)

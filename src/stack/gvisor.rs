@@ -106,6 +106,7 @@ impl AsyncWrite for GvisorTcpStream {
 }
 
 /// Information about a pending TCP connection
+#[allow(dead_code)]
 struct PendingTcp {
     src: SocketAddr,
     dst: SocketAddr,
@@ -256,6 +257,7 @@ struct ParsedPacket {
     dst_ip: IpAddr,
     protocol: u8,
     payload: Vec<u8>, // TCP/UDP header + data
+    #[allow(dead_code)]
     raw: Vec<u8>,     // Full raw IP packet (for building replies)
 }
 
@@ -470,14 +472,8 @@ fn build_tcp_response(
     packet[8] = 64; // TTL
     packet[9] = 6; // TCP
 
-    match src_ip {
-        IpAddr::V4(ip) => packet[12..16].copy_from_slice(&ip.octets()),
-        _ => {}
-    }
-    match dst_ip {
-        IpAddr::V4(ip) => packet[16..20].copy_from_slice(&ip.octets()),
-        _ => {}
-    }
+    if let IpAddr::V4(ip) = src_ip { packet[12..16].copy_from_slice(&ip.octets()) }
+    if let IpAddr::V4(ip) = dst_ip { packet[16..20].copy_from_slice(&ip.octets()) }
 
     // IPv4 header checksum
     let cksum = ipv4_checksum(&packet[..20]);

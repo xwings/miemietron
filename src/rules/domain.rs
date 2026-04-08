@@ -2,6 +2,7 @@ use aho_corasick::AhoCorasick;
 use std::collections::HashMap;
 
 /// Domain matcher using exact match, suffix trie, and keyword Aho-Corasick.
+#[allow(dead_code)]
 pub struct DomainMatcher {
     exact: HashMap<String, String>,
     suffixes: Vec<(String, String)>, // (suffix, target) - reversed domain segments
@@ -9,6 +10,7 @@ pub struct DomainMatcher {
     keyword_targets: Vec<String>,
 }
 
+#[allow(dead_code)]
 impl DomainMatcher {
     pub fn new(
         exact: HashMap<String, String>,

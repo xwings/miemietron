@@ -29,6 +29,7 @@ const SO_ORIGINAL_DST: libc::c_int = 80;
 /// System stack that accepts redirected TCP connections and TPROXY'd UDP datagrams.
 pub struct SystemStack {
     tcp_listener: TcpListener,
+    #[allow(dead_code)]
     tun_device: String,
 }
 
@@ -96,6 +97,7 @@ impl SystemStack {
     }
 
     /// Get the TUN device name this stack is bound to.
+    #[allow(dead_code)]
     pub fn tun_device(&self) -> &str {
         &self.tun_device
     }

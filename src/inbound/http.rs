@@ -166,7 +166,7 @@ async fn handle_http_connection(
         //   "GET http://www.google.com/search?q=test HTTP/1.1" -> "GET /search?q=test HTTP/1.1"
         let path = extract_path(target_str);
         let version = parts.get(2).unwrap_or(&"HTTP/1.1");
-        let mut reconstructed = format!("{} {} {}\r\n", method, path, version);
+        let mut reconstructed = format!("{method} {path} {version}\r\n");
         for hdr in &kept_headers {
             reconstructed.push_str(hdr);
         }

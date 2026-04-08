@@ -51,6 +51,7 @@ impl DelayQueue {
 
     /// Remove and return the oldest entry.
     /// Matches mihomo's `Queue.Pop()`.
+    #[allow(dead_code)]
     pub fn pop(&self) -> Option<DelayHistory> {
         let mut items = self.inner.write();
         if items.is_empty() {
@@ -76,11 +77,13 @@ impl DelayQueue {
 
     /// Return the number of entries.
     /// Matches mihomo's `Queue.Len()`.
+    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         let items = self.inner.read();
         items.len()
     }
 
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }

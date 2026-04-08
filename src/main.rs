@@ -1,7 +1,3 @@
-// Many modules have scaffolded code for protocols/features not yet fully wired
-// (UDP relay, gRPC/H2 transports, some proxy group methods, etc.)
-#![allow(dead_code)]
-
 use anyhow::Result;
 use clap::Parser;
 use std::path::PathBuf;
@@ -73,7 +69,7 @@ struct MessageVisitor<'a, W: std::fmt::Write>(&'a mut W);
 impl<'a, W: std::fmt::Write> tracing::field::Visit for MessageVisitor<'a, W> {
     fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
         if field.name() == "message" {
-            let _ = write!(self.0, "{:?}", value);
+            let _ = write!(self.0, "{value:?}");
         } else {
             let _ = write!(self.0, " {}={:?}", field.name(), value);
         }
@@ -81,7 +77,7 @@ impl<'a, W: std::fmt::Write> tracing::field::Visit for MessageVisitor<'a, W> {
 
     fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
         if field.name() == "message" {
-            let _ = write!(self.0, "{}", value);
+            let _ = write!(self.0, "{value}");
         } else {
             let _ = write!(self.0, " {}={}", field.name(), value);
         }
@@ -324,8 +320,7 @@ fn main() -> Result<()> {
             let ret = unsafe { libc::setgid(PROXY_GID) };
             if ret != 0 {
                 eprintln!(
-                    "Warning: Running as GID {} but need GID {} for OpenClash firewall bypass.",
-                    current_gid, PROXY_GID
+                    "Warning: Running as GID {current_gid} but need GID {PROXY_GID} for OpenClash firewall bypass."
                 );
                 eprintln!(
                     "OpenClash should launch this binary with group 'nogroup'. \
@@ -366,8 +361,7 @@ async fn async_main() -> Result<()> {
         let uid = unsafe { libc::getuid() };
         let egid = unsafe { libc::getegid() };
         eprintln!(
-            "Process identity: uid={} gid={} egid={} (need gid=65534 for OpenClash bypass)",
-            uid, gid, egid
+            "Process identity: uid={uid} gid={gid} egid={egid} (need gid=65534 for OpenClash bypass)"
         );
     }
 
@@ -598,7 +592,7 @@ impl Engine {
             // which would intercept traffic that should go through nftables REDIRECT.
             if config.dns.enhanced_mode == "fake-ip" && !config.dns.fake_ip_range.is_empty() {
                 if let Some(addr) = config.dns.fake_ip_range.split('/').next() {
-                    let tun_addr = format!("{}/30", addr);
+                    let tun_addr = format!("{addr}/30");
                     tun_config.inet4_address = vec![tun_addr];
                 }
             }

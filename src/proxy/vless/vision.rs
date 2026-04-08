@@ -16,6 +16,7 @@ use pin_project_lite::pin_project;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 /// The flow identifier sent in the VLESS header addon.
+#[allow(dead_code)]
 pub const VISION_FLOW: &str = "xtls-rprx-vision";
 
 /// State of the Vision stream.
@@ -25,6 +26,7 @@ pub const VISION_FLOW: &str = "xtls-rprx-vision";
 /// For now, we always stay in `Passthrough` which is protocol-correct:
 /// the server sees the flow addon and applies its own optimisation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 enum VisionState {
     /// Still seeing TLS handshake records -- encrypt normally via outer TLS.
     /// `client_hello_seen` tracks whether we have observed the inner
@@ -58,6 +60,7 @@ const DIRECT_THRESHOLD: usize = 2;
 
 impl<T> VisionStream<T> {
     /// Create a new Vision stream wrapping an inner transport.
+    #[allow(dead_code)]
     pub fn new(inner: T) -> Self {
         Self {
             inner,
@@ -74,6 +77,7 @@ impl<T> VisionStream<T> {
     /// - 0x16 = Handshake (ClientHello, etc.)
     /// - 0x17 = Application Data
     /// - 0x14 = ChangeCipherSpec
+    #[allow(dead_code)]
     fn observe_write(&mut self, data: &[u8]) {
         if data.is_empty() {
             return;

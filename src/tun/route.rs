@@ -87,8 +87,6 @@ pub async fn cleanup_iptables(tun_dev: &str) -> Result<()> {
     Ok(())
 }
 
-// --- nftables implementation ---
-
 async fn try_setup_nftables(tun_dev: &str, tcp_port: u16, udp_port: u16, mark: &str) -> Result<()> {
     // Check if nft is available
     let check = tokio::process::Command::new("nft")
@@ -145,8 +143,6 @@ async fn cleanup_nftables() -> Result<()> {
     Ok(())
 }
 
-// --- iptables-legacy implementation ---
-
 async fn try_setup_iptables_legacy(
     tun_dev: &str,
     tcp_port: u16,
@@ -163,8 +159,6 @@ async fn try_setup_iptables_legacy(
     }
     setup_iptables_impl("iptables-legacy", tun_dev, tcp_port, udp_port, mark).await
 }
-
-// --- shared iptables implementation ---
 
 async fn setup_iptables_impl(
     cmd: &str,

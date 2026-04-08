@@ -9,10 +9,6 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 /// gRPC frame header size: 1 byte compressed flag + 4 bytes payload length.
 const GRPC_HEADER_LEN: usize = 5;
 
-// ---------------------------------------------------------------------------
-// GrpcStream: AsyncRead + AsyncWrite over gRPC/HTTP2
-// ---------------------------------------------------------------------------
-
 /// A bidirectional byte stream layered on top of a gRPC (HTTP/2) connection.
 ///
 /// gRPC framing: each message is prefixed with a 5-byte header:
@@ -211,10 +207,6 @@ impl AsyncWrite for GrpcStream {
     }
 }
 
-// ---------------------------------------------------------------------------
-// connect_grpc -- establish a gRPC stream over an existing transport
-// ---------------------------------------------------------------------------
-
 /// Establish a gRPC stream over an existing async transport (typically TLS).
 ///
 /// This performs the HTTP/2 handshake, sends a POST request to
@@ -261,10 +253,6 @@ where
 
     Ok(GrpcStream::new(send_stream, recv_stream))
 }
-
-// ---------------------------------------------------------------------------
-// TokioIo adapter: bridge tokio::io traits to h2's I/O requirements
-// ---------------------------------------------------------------------------
 
 /// Adapter that implements `h2`'s required I/O traits (tokio AsyncRead/AsyncWrite)
 /// by delegating to the inner stream. This is needed because `h2::client::handshake`

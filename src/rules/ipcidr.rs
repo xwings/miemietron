@@ -2,12 +2,14 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 /// CIDR matcher using a simple sorted prefix list.
 /// TODO: Replace with BART (Balanced Routing Table) or LC-Trie for O(1) lookups.
+#[allow(dead_code)]
 pub struct CidrMatcher {
     v4_entries: Vec<CidrEntry>,
     v6_entries: Vec<CidrEntry>,
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct CidrEntry {
     network: u128, // IP as u128 (works for both v4 and v6)
     mask: u128,
@@ -15,6 +17,7 @@ struct CidrEntry {
     target: String,
 }
 
+#[allow(dead_code)]
 impl CidrMatcher {
     pub fn new(cidrs: Vec<(String, String)>) -> Self {
         let mut v4_entries = Vec::new();
@@ -141,6 +144,7 @@ mod tests {
     }
 }
 
+#[allow(dead_code)]
 fn parse_cidr_entry(cidr: &str, target: &str) -> Option<CidrEntry> {
     let parts: Vec<&str> = cidr.split('/').collect();
     if parts.len() != 2 {

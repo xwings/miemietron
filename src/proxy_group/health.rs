@@ -26,6 +26,7 @@ enum HealthCheckable {
 }
 
 impl HealthCheckable {
+    #[allow(dead_code)]
     fn name(&self) -> &str {
         match self {
             HealthCheckable::UrlTest(g) => g.name(),

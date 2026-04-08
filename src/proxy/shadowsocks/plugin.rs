@@ -12,10 +12,6 @@ use pin_project_lite::pin_project;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tracing::debug;
 
-// ---------------------------------------------------------------------------
-// Plugin options helper
-// ---------------------------------------------------------------------------
-
 /// Parsed plugin options extracted from the config `plugin-opts` map.
 #[derive(Debug, Clone, Default)]
 pub struct PluginOpts {
@@ -24,6 +20,7 @@ pub struct PluginOpts {
     pub path: Option<String>,
     pub tls: bool,
     pub password: Option<String>,
+    #[allow(dead_code)]
     pub version: Option<u32>,
 }
 
@@ -63,10 +60,6 @@ impl PluginOpts {
         }
     }
 }
-
-// ===========================================================================
-// simple-obfs (obfs-local): HTTP and TLS obfuscation modes
-// ===========================================================================
 
 /// Wraps a stream with simple-obfs HTTP or TLS obfuscation.
 ///
@@ -239,10 +232,6 @@ fn find_header_end(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4)
 }
 
-// ---------------------------------------------------------------------------
-// AsyncRead for ObfsStream (T: Unpin, so we use get_mut + Pin::new)
-// ---------------------------------------------------------------------------
-
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncRead for ObfsStream<T> {
     fn poll_read(
         self: Pin<&mut Self>,
@@ -382,10 +371,6 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncRead for ObfsStream<T> {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// AsyncWrite for ObfsStream
-// ---------------------------------------------------------------------------
 
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncWrite for ObfsStream<T> {
     fn poll_write(
@@ -527,10 +512,6 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncWrite for ObfsStream<T> {
     }
 }
 
-// ===========================================================================
-// v2ray-plugin (WebSocket mode)
-// ===========================================================================
-
 /// Connect through v2ray-plugin (WebSocket transport, optionally over TLS).
 ///
 /// Returns a stream suitable for wrapping in `SsStream`.
@@ -571,10 +552,6 @@ where
         Ok(Box::new(ws_stream))
     }
 }
-
-// ===========================================================================
-// shadow-tls v2 (stub + working TLS handshake)
-// ===========================================================================
 
 /// Connect through shadow-tls v2.
 ///
@@ -691,122 +668,6 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncWrite for ShadowTlsStream<T>
         self.project().inner.poll_shutdown(cx)
     }
 }
-
-// ===========================================================================
-// shadow-tls v3 (strict mode with per-frame HMAC)
-// ===========================================================================
-
-/// Connect through shadow-tls v3 (strict mode).
-///
-/// V3 extends v2 by adding HMAC authentication to every TLS Application Data
-/// frame, not just the first write. The HMAC covers the frame payload and uses
-/// a per-connection counter as additional data to prevent replay.
-pub async fn connect_shadow_tls_v3<S>(
-    stream: S,
-    opts: &PluginOpts,
-    server_host: &str,
-) -> anyhow::Result<ShadowTlsV3Stream<S>>
-where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
-    let sni = opts.host.as_deref().unwrap_or(server_host);
-    let password = opts.password.as_deref().unwrap_or("");
-
-    debug!("shadow-tls v3: TLS handshake to SNI={}", sni);
-
-    let tls_opts = crate::transport::tls::TlsOptions {
-        sni: sni.to_string(),
-        skip_cert_verify: true,
-        alpn: vec!["h2".to_string(), "http/1.1".to_string()],
-        fingerprint: None,
-    };
-    let tls_stream = crate::transport::tls::wrap_tls(stream, &tls_opts).await?;
-
-    Ok(ShadowTlsV3Stream {
-        inner: tls_stream,
-        hmac_key: derive_shadow_tls_key(password.as_bytes()),
-        write_counter: 0,
-    })
-}
-
-pin_project! {
-    /// Stream wrapper for shadow-tls v3 (strict mode).
-    ///
-    /// Every write is prefixed with an 8-byte HMAC tag that covers the data
-    /// and a monotonic counter. This prevents replay and ensures integrity
-    /// of each frame.
-    pub struct ShadowTlsV3Stream<T> {
-        #[pin]
-        inner: tokio_rustls::client::TlsStream<T>,
-        hmac_key: [u8; 32],
-        write_counter: u64,
-    }
-}
-
-impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncRead for ShadowTlsV3Stream<T> {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        self.project().inner.poll_read(cx, buf)
-    }
-}
-
-impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncWrite for ShadowTlsV3Stream<T> {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        data: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        let this = self.project();
-
-        use hmac::Mac;
-        type HmacSha256 = hmac::Hmac<sha2::Sha256>;
-
-        let mut mac = match HmacSha256::new_from_slice(this.hmac_key) {
-            Ok(m) => m,
-            Err(e) => return Poll::Ready(Err(io::Error::other(format!("hmac init: {e}")))),
-        };
-
-        // Include counter in HMAC to prevent replay
-        mac.update(&this.write_counter.to_be_bytes());
-        mac.update(data);
-        let tag = mac.finalize().into_bytes();
-        *this.write_counter += 1;
-
-        // Prefix data with 8-byte HMAC tag
-        let mut buf = Vec::with_capacity(8 + data.len());
-        buf.extend_from_slice(&tag[..8]);
-        buf.extend_from_slice(data);
-
-        let data_len = data.len();
-        match this.inner.poll_write(cx, &buf) {
-            Poll::Ready(Ok(n)) => {
-                if n >= 8 {
-                    let user_written = (n - 8).min(data_len);
-                    Poll::Ready(Ok(user_written.max(1).min(data_len)))
-                } else {
-                    Poll::Ready(Ok(0))
-                }
-            }
-            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
-            Poll::Pending => Poll::Pending,
-        }
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.project().inner.poll_flush(cx)
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.project().inner.poll_shutdown(cx)
-    }
-}
-
-// ===========================================================================
-// Tests
-// ===========================================================================
 
 #[cfg(test)]
 mod tests {

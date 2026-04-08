@@ -26,6 +26,12 @@ pub struct SniffCache {
     skip_list: DashMap<String, (AtomicU8, Instant)>,
 }
 
+impl Default for SniffCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SniffCache {
     pub fn new() -> Self {
         Self {
@@ -446,8 +452,6 @@ mod tests {
         assert_eq!(extract_tls_sni(data), None);
     }
 
-    // --- HTTP Host header extraction tests ---
-
     #[test]
     fn extract_http_host_get() {
         let data = b"GET / HTTP/1.1\r\nHost: example.com\r\nAccept: */*\r\n\r\n";
@@ -484,8 +488,6 @@ mod tests {
         assert_eq!(extract_http_host(data), Some("example.com".to_string()));
     }
 
-    // --- sniff_domain dispatch tests ---
-
     #[test]
     fn sniff_domain_tls() {
         let packet = build_client_hello("tls.example.com");
@@ -502,8 +504,6 @@ mod tests {
     fn sniff_domain_empty() {
         assert_eq!(sniff_domain(&[]), None);
     }
-
-    // --- Additional HTTP Host header tests ---
 
     #[test]
     fn extract_http_host_put() {
@@ -605,8 +605,6 @@ mod tests {
         );
     }
 
-    // --- Additional sniff_domain dispatch tests ---
-
     #[test]
     fn sniff_domain_non_tls_non_http() {
         // Random binary data starting with something other than 0x16
@@ -629,8 +627,6 @@ mod tests {
         assert_eq!(sniff_domain(&[0x00]), None);
         assert_eq!(sniff_domain(&[0x16]), None); // TLS marker but truncated
     }
-
-    // --- SniffCache tests ---
 
     #[test]
     fn sniff_cache_new_dst_not_skipped() {

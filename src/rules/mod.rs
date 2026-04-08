@@ -334,7 +334,7 @@ impl RuleEngine {
             if self
                 .rule_stats
                 .get(i)
-                .map_or(false, |s| s.disabled.load(Ordering::Relaxed))
+                .is_some_and(|s| s.disabled.load(Ordering::Relaxed))
             {
                 continue;
             }
@@ -701,11 +701,6 @@ impl RuleEngine {
         &self.rule_stats
     }
 
-    /// Check if the GeoIP database is loaded.
-    pub fn has_geoip(&self) -> bool {
-        self.geoip_matcher.is_loaded()
-    }
-
     /// Get a reference to the GeoIP matcher (for DNS fallback filtering, etc.)
     pub fn geoip_matcher(&self) -> &geoip::GeoIpMatcher {
         &self.geoip_matcher
@@ -738,10 +733,6 @@ impl RuleEngine {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// Rule parsing
-// ---------------------------------------------------------------------------
 
 /// Parse a rule from the main config (needTarget=true).
 /// Format: "TYPE,PAYLOAD,TARGET[,PARAMS...]" or "MATCH,TARGET"
@@ -883,10 +874,6 @@ fn target_to_action(target: &str) -> Action {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Port range matching (mihomo compat: common/utils/ranges.go)
-// ---------------------------------------------------------------------------
-
 /// Parse mihomo-style port specification: "80", "80/443", "1000-2000", "80-90/443/8080-9090"
 /// Also supports comma as separator (mihomo normalizes "," to "/").
 fn parse_port_spec(spec: &str) -> Vec<(u16, u16)> {
@@ -919,10 +906,6 @@ fn port_matches(port: u16, spec: &str) -> bool {
     ranges.iter().any(|&(start, end)| port >= start && port <= end)
 }
 
-// ---------------------------------------------------------------------------
-// Domain regex (using the regex crate, matching mihomo behavior)
-// ---------------------------------------------------------------------------
-
 /// Match a domain against a regex pattern using the `regex` crate.
 /// mihomo uses Go's regexp package which is RE2-based, similar to Rust's regex crate.
 fn match_domain_regex(pattern: &str, domain: &str) -> bool {
@@ -933,10 +916,6 @@ fn match_domain_regex(pattern: &str, domain: &str) -> bool {
         false
     }
 }
-
-// ---------------------------------------------------------------------------
-// Logical rule matching (AND, OR, NOT)
-// ---------------------------------------------------------------------------
 
 /// Parse the inner conditions from a logical rule payload.
 /// Input like `((DOMAIN-SUFFIX,google.com),(NETWORK,udp))` returns
@@ -1107,10 +1086,6 @@ fn match_logical_not(payload: &str, metadata: &RuleMetadata, engine: &RuleEngine
     !eval_condition(&conditions[0], metadata, engine)
 }
 
-// ---------------------------------------------------------------------------
-// Helper: inline CIDR check for logical rules
-// ---------------------------------------------------------------------------
-
 fn check_ip_in_cidr(ip: &IpAddr, cidr: &str) -> bool {
     let parts: Vec<&str> = cidr.split('/').collect();
     if parts.len() != 2 {
@@ -1157,10 +1132,6 @@ fn check_ip_in_cidr(ip: &IpAddr, cidr: &str) -> bool {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Wildcard matching (*, ?)
-// ---------------------------------------------------------------------------
-
 fn wildcard_match(pattern: &str, text: &str) -> bool {
     let pattern = pattern.as_bytes();
     let text = text.as_bytes();
@@ -1192,10 +1163,6 @@ fn wildcard_match(pattern: &str, text: &str) -> bool {
     pi == plen
 }
 
-// ---------------------------------------------------------------------------
-// IP suffix matching
-// ---------------------------------------------------------------------------
-
 fn check_ip_suffix(ip: &IpAddr, suffix: &str) -> bool {
     // IP-SUFFIX format: "1.2.3.0/24" means the last 24 bits match
     // Or just a plain IP suffix string
@@ -1206,10 +1173,6 @@ fn check_ip_suffix(ip: &IpAddr, suffix: &str) -> bool {
     // If it has /prefix, treat as CIDR
     check_ip_in_cidr(ip, suffix)
 }
-
-// ---------------------------------------------------------------------------
-// Default home dir (same logic as main.rs)
-// ---------------------------------------------------------------------------
 
 fn default_home_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("CLASH_HOME_DIR") {

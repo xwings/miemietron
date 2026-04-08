@@ -48,7 +48,7 @@ async fn batch_resolve(domain: &str, servers: &[String]) -> Result<(IpAddr, u32)
     }
     drop(tx);
 
-    let mut last_err = anyhow::anyhow!("all DNS servers failed for {}", domain);
+    let mut last_err = anyhow::anyhow!("all DNS servers failed for {domain}");
     while let Some(result) = rx.recv().await {
         match result {
             Ok(ip_ttl) => return Ok(ip_ttl),
@@ -73,8 +73,7 @@ async fn batch_resolve_reject_fakeip(
         let (ip, _ttl) = query_server(domain, &servers[0]).await?;
         if is_in_fakeip_range(&ip, fake_ip_range) {
             return Err(anyhow::anyhow!(
-                "DNS {} returned FakeIP {} for proxy server {}, rejecting",
-                source_label, ip, domain
+                "DNS {source_label} returned FakeIP {ip} for proxy server {domain}, rejecting"
             ));
         }
         return Ok(ip);
@@ -93,8 +92,7 @@ async fn batch_resolve_reject_fakeip(
                     if is_in_fakeip_range(&ip, &fake_ip_range) {
                         let _ = tx
                             .send(Err(anyhow::anyhow!(
-                                "DNS {} {} returned FakeIP {} for proxy server {}, rejecting",
-                                source_label, server, ip, domain
+                                "DNS {source_label} {server} returned FakeIP {ip} for proxy server {domain}, rejecting"
                             )))
                             .await;
                     } else {
@@ -109,7 +107,7 @@ async fn batch_resolve_reject_fakeip(
     }
     drop(tx);
 
-    let mut last_err = anyhow::anyhow!("all DNS servers failed for {}", domain);
+    let mut last_err = anyhow::anyhow!("all DNS servers failed for {domain}");
     while let Some(result) = rx.recv().await {
         match result {
             Ok(ip) => return Ok(ip),
@@ -449,7 +447,7 @@ async fn query_server(domain: &str, server: &str) -> Result<(IpAddr, u32)> {
         resolve_system(domain).await
     } else if server.starts_with("quic://") || server.starts_with("h3://") {
         // DoQ/H3 not yet supported
-        Err(anyhow::anyhow!("DNS scheme not supported: {}", server))
+        Err(anyhow::anyhow!("DNS scheme not supported: {server}"))
     } else if server.starts_with("system://") || server == "system" {
         resolve_system(domain).await
     } else {
@@ -465,17 +463,13 @@ async fn query_server(domain: &str, server: &str) -> Result<(IpAddr, u32)> {
 /// System DNS resolver fallback via tokio's lookup_host.
 /// Returns a default TTL of 60s since the system resolver doesn't expose TTL.
 async fn resolve_system(domain: &str) -> Result<(IpAddr, u32)> {
-    let host = format!("{}:0", domain);
+    let host = format!("{domain}:0");
     let addrs: Vec<SocketAddr> = tokio::net::lookup_host(&host).await?.collect();
     addrs
         .first()
         .map(|a| (a.ip(), 60)) // System resolver doesn't expose TTL; use 60s default
-        .ok_or_else(|| anyhow::anyhow!("system resolver returned no results for {}", domain))
+        .ok_or_else(|| anyhow::anyhow!("system resolver returned no results for {domain}"))
 }
-
-// ---------------------------------------------------------------------------
-// Plain UDP DNS
-// ---------------------------------------------------------------------------
 
 /// Resolve via plain UDP DNS. Returns (IP, TTL).
 async fn resolve_udp(domain: &str, server: &str) -> Result<(IpAddr, u32)> {
@@ -505,10 +499,6 @@ async fn resolve_udp(domain: &str, server: &str) -> Result<(IpAddr, u32)> {
     parse_dns_response(response)
 }
 
-// ---------------------------------------------------------------------------
-// DNS-over-HTTPS
-// ---------------------------------------------------------------------------
-
 /// Resolve via DNS-over-HTTPS (RFC 8484). Returns (IP, TTL).
 async fn resolve_doh(domain: &str, url: &str) -> Result<(IpAddr, u32)> {
     let query = build_dns_query(domain, 1);
@@ -531,10 +521,6 @@ async fn resolve_doh(domain: &str, url: &str) -> Result<(IpAddr, u32)> {
 }
 
 use base64::Engine;
-
-// ---------------------------------------------------------------------------
-// DNS-over-TLS (DoT)
-// ---------------------------------------------------------------------------
 
 /// Global connection pool for DoT servers.
 /// Maps server address to a pooled TLS connection.
@@ -664,10 +650,6 @@ async fn dot_query_on_stream(
 
     parse_dns_response(&resp_buf)
 }
-
-// ---------------------------------------------------------------------------
-// DNS wire format helpers
-// ---------------------------------------------------------------------------
 
 /// Build a DNS query packet for the given domain and record type.
 fn build_dns_query(domain: &str, qtype: u16) -> Vec<u8> {
@@ -836,8 +818,6 @@ mod tests {
     use super::*;
     use std::net::Ipv6Addr;
 
-    // ---- is_private_ip tests ----
-
     #[test]
     fn is_private_ip_10_range() {
         assert!(is_private_ip(&IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))));
@@ -885,8 +865,6 @@ mod tests {
         assert!(!is_private_ip(&IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1))));
     }
 
-    // ---- parse_cidr_simple tests ----
-
     #[test]
     fn parse_cidr_valid() {
         let (base, prefix) = parse_cidr_simple("198.18.0.0/15").unwrap();
@@ -910,8 +888,6 @@ mod tests {
     fn parse_cidr_invalid_bad_ip() {
         assert!(parse_cidr_simple("not.an.ip/24").is_err());
     }
-
-    // ---- build_dns_query tests ----
 
     #[test]
     fn build_dns_query_structure() {
@@ -952,8 +928,6 @@ mod tests {
         assert_eq!(query[27], 0x00);
         assert_eq!(query[28], 0x01);
     }
-
-    // ---- should_use_fallback tests ----
 
     #[test]
     fn should_use_fallback_local_domain() {
@@ -997,8 +971,6 @@ mod tests {
         assert!(!should_use_fallback(&ip, "example.com", &config));
     }
 
-    // ---- is_in_fakeip_range tests ----
-
     #[test]
     fn fakeip_range_match() {
         let range = "198.18.0.0/15";
@@ -1012,8 +984,6 @@ mod tests {
     fn fakeip_range_empty() {
         assert!(!is_in_fakeip_range(&IpAddr::V4(Ipv4Addr::new(198, 18, 0, 1)), ""));
     }
-
-    // ---- parse_dns_response tests ----
 
     #[test]
     fn parse_dns_response_too_short() {

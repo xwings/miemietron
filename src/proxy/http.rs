@@ -71,15 +71,7 @@ impl HttpOutbound {
             sni: config.sni.clone(),
             skip_cert_verify: config.skip_cert_verify.unwrap_or(false),
             headers,
-            connect_opts: ConnectOpts {
-                routing_mark: config.routing_mark,
-                interface: config.interface_name.clone(),
-                tcp_concurrent: config.tcp_concurrent.unwrap_or(false),
-                keep_alive_idle: std::time::Duration::from_secs(config.keep_alive_idle.unwrap_or(0)),
-                keep_alive_interval: std::time::Duration::from_secs(config.keep_alive_interval.unwrap_or(0)),
-                disable_keep_alive: config.disable_keep_alive.unwrap_or(false),
-                ..Default::default()
-            },
+            connect_opts: ConnectOpts::from_proxy_config(config),
         })
     }
 }
@@ -133,27 +125,26 @@ impl HttpOutbound {
         S: super::ProxyStream + 'static,
     {
         let host_port = match target {
-            Address::Domain(host, port) => format!("{}:{}", host, port),
+            Address::Domain(host, port) => format!("{host}:{port}"),
             Address::Ip(addr) => addr.to_string(),
         };
 
         // Build CONNECT request
         let mut req = format!(
-            "CONNECT {} HTTP/1.1\r\nHost: {}\r\n",
-            host_port, host_port
+            "CONNECT {host_port} HTTP/1.1\r\nHost: {host_port}\r\n"
         );
 
         // Add proxy authentication
         if let Some(ref username) = self.username {
             let pass = self.password.as_deref().unwrap_or("");
             let creds = base64::engine::general_purpose::STANDARD
-                .encode(format!("{}:{}", username, pass));
-            req.push_str(&format!("Proxy-Authorization: Basic {}\r\n", creds));
+                .encode(format!("{username}:{pass}"));
+            req.push_str(&format!("Proxy-Authorization: Basic {creds}\r\n"));
         }
 
         // Add custom headers
         for (key, value) in &self.headers {
-            req.push_str(&format!("{}: {}\r\n", key, value));
+            req.push_str(&format!("{key}: {value}\r\n"));
         }
 
         req.push_str("\r\n");

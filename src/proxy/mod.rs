@@ -91,6 +91,7 @@ pub struct ProxyManager {
     provider_configs: HashMap<String, ProxyProviderConfig>,
     subscription_info: HashMap<String, SubscriptionInfo>,
     /// Maps proxy name -> dialer proxy name (for proxy chaining)
+    #[allow(dead_code)]
     dialer_proxy_map: HashMap<String, String>,
     /// Centralized per-proxy state store shared with all groups.
     state_store: Arc<crate::proxy_group::proxy_state::ProxyStateStore>,
@@ -281,6 +282,8 @@ impl ProxyManager {
 
             // Compatible proxies: directly listed in the group config (no filter applied)
             let mut compatible_proxies = gc.proxies.clone();
+            let mut compatible_set: std::collections::HashSet<String> =
+                compatible_proxies.iter().cloned().collect();
 
             // mihomo compat: include-all implies include-all-providers + include-all-proxies
             let include_all_providers =
@@ -293,11 +296,12 @@ impl ProxyManager {
             if include_all_proxies {
                 if !filter_regs.is_empty() {
                     for pc in proxy_configs {
-                        if compatible_proxies.contains(&pc.name) {
+                        if compatible_set.contains(&pc.name) {
                             continue;
                         }
                         for filter_reg in &filter_regs {
                             if filter_reg.is_match(&pc.name) {
+                                compatible_set.insert(pc.name.clone());
                                 compatible_proxies.push(pc.name.clone());
                                 break;
                             }
@@ -305,7 +309,7 @@ impl ProxyManager {
                     }
                 } else {
                     for pc in proxy_configs {
-                        if !compatible_proxies.contains(&pc.name) {
+                        if compatible_set.insert(pc.name.clone()) {
                             compatible_proxies.push(pc.name.clone());
                         }
                     }
@@ -314,11 +318,17 @@ impl ProxyManager {
 
             // Provider proxies: from `use` and include-all-providers (filter applied)
             let mut provider_proxies: Vec<String> = Vec::new();
+            let mut provider_set: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
 
             // Expand `use` provider references
             for prov_name in &gc.use_providers {
                 if let Some(prov_proxies) = provider_proxy_names.get(prov_name) {
-                    provider_proxies.extend(prov_proxies.iter().cloned());
+                    for name in prov_proxies {
+                        if provider_set.insert(name.clone()) {
+                            provider_proxies.push(name.clone());
+                        }
+                    }
                 } else {
                     tracing::warn!(
                         "Proxy group '{}' references unknown provider '{}'",
@@ -332,7 +342,7 @@ impl ProxyManager {
             if include_all_providers {
                 for prov_proxies in provider_proxy_names.values() {
                     for name in prov_proxies {
-                        if !provider_proxies.contains(name) {
+                        if provider_set.insert(name.clone()) {
                             provider_proxies.push(name.clone());
                         }
                     }
@@ -856,19 +866,9 @@ impl ProxyManager {
         Ok(())
     }
 
-    /// Get the dialer proxy name for a given proxy, if any.
-    pub fn get_dialer_proxy(&self, proxy_name: &str) -> Option<&str> {
-        self.dialer_proxy_map.get(proxy_name).map(|s| s.as_str())
-    }
-
     /// Get subscription info for a provider.
     pub fn get_subscription_info(&self, provider_name: &str) -> Option<&SubscriptionInfo> {
         self.subscription_info.get(provider_name)
-    }
-
-    /// Get all subscription info (for API).
-    pub fn all_subscription_info(&self) -> &HashMap<String, SubscriptionInfo> {
-        &self.subscription_info
     }
 
     /// Get the shared proxy state store (for API and health checks).

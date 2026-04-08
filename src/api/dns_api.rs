@@ -59,7 +59,7 @@ pub async fn get_dns_query(
     let fqdn = if name.ends_with('.') {
         name.clone()
     } else {
-        format!("{}.", name)
+        format!("{name}.")
     };
 
     let dns_resolver = state.app.dns_resolver();

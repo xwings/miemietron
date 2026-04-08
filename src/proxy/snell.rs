@@ -16,9 +16,11 @@ use crate::dns::DnsResolver;
 use crate::transport::tcp::{self, ConnectOpts};
 
 // Snell protocol constants
+#[allow(dead_code)]
 const SNELL_VERSION: u8 = 3;
 const CMD_CONNECT: u8 = 0x01;
 
+#[allow(dead_code)]
 pub struct SnellOutbound {
     name: String,
     server: String,
@@ -69,19 +71,12 @@ impl SnellOutbound {
             obfs,
             obfs_host,
             version,
-            connect_opts: ConnectOpts {
-                routing_mark: config.routing_mark,
-                interface: config.interface_name.clone(),
-                tcp_concurrent: config.tcp_concurrent.unwrap_or(false),
-                keep_alive_idle: std::time::Duration::from_secs(config.keep_alive_idle.unwrap_or(0)),
-                keep_alive_interval: std::time::Duration::from_secs(config.keep_alive_interval.unwrap_or(0)),
-                disable_keep_alive: config.disable_keep_alive.unwrap_or(false),
-                ..Default::default()
-            },
+            connect_opts: ConnectOpts::from_proxy_config(config),
         })
     }
 
     /// Derive the session key from the PSK using HKDF-like derivation.
+    #[allow(dead_code)]
     fn derive_key(&self) -> [u8; 32] {
         let hash = sha2::Sha256::digest(&self.psk);
         let mut key = [0u8; 32];

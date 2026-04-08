@@ -1,6 +1,5 @@
 use dashmap::DashMap;
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 const DEFAULT_MAX_SIZE: usize = 4096;
@@ -18,8 +17,6 @@ struct CacheEntry {
 pub struct DnsCache {
     entries: DashMap<String, CacheEntry>,
     max_size: usize,
-    hits: AtomicU64,
-    misses: AtomicU64,
 }
 
 impl DnsCache {
@@ -32,8 +29,6 @@ impl DnsCache {
         Self {
             entries: DashMap::with_capacity(max_size),
             max_size,
-            hits: AtomicU64::new(0),
-            misses: AtomicU64::new(0),
         }
     }
 
@@ -42,14 +37,12 @@ impl DnsCache {
         let key = domain.to_string();
         if let Some(entry) = self.entries.get(&key) {
             if Instant::now() < entry.expires_at {
-                self.hits.fetch_add(1, Ordering::Relaxed);
                 return Some(entry.ip);
             }
             // Entry expired — drop the ref before removing
             drop(entry);
             self.entries.remove(&key);
         }
-        self.misses.fetch_add(1, Ordering::Relaxed);
         None
     }
 
@@ -83,18 +76,6 @@ impl DnsCache {
     /// Flush all entries.
     pub fn clear(&self) {
         self.entries.clear();
-    }
-
-    /// Current number of entries (including possibly expired ones).
-    pub fn len(&self) -> usize {
-        self.entries.len()
-    }
-
-    pub fn stats(&self) -> (u64, u64) {
-        (
-            self.hits.load(Ordering::Relaxed),
-            self.misses.load(Ordering::Relaxed),
-        )
     }
 
     /// Remove expired entries.
@@ -131,19 +112,6 @@ mod tests {
         cache.insert("b.com".to_string(), ip, 300);
         cache.clear();
         assert_eq!(cache.get("a.com"), None);
-    }
-
-    #[test]
-    fn stats_tracking() {
-        let cache = DnsCache::new(100);
-        let ip = IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4));
-        cache.insert("a.com".to_string(), ip, 300);
-        cache.get("a.com"); // hit
-        cache.get("b.com"); // miss
-        cache.get("a.com"); // hit
-        let (hits, misses) = cache.stats();
-        assert_eq!(hits, 2);
-        assert_eq!(misses, 1);
     }
 
     #[test]

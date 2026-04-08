@@ -113,16 +113,7 @@ impl ShadowsocksOutbound {
             .map(PluginOpts::from_map)
             .unwrap_or_default();
 
-        let connect_opts = ConnectOpts {
-            interface: config.interface_name.clone(),
-            routing_mark: config.routing_mark,
-            tfo: config.tfo.unwrap_or(false),
-            mptcp: config.mptcp.unwrap_or(false),
-            tcp_concurrent: config.tcp_concurrent.unwrap_or(false),
-            keep_alive_idle: std::time::Duration::from_secs(config.keep_alive_idle.unwrap_or(0)),
-            keep_alive_interval: std::time::Duration::from_secs(config.keep_alive_interval.unwrap_or(0)),
-            disable_keep_alive: config.disable_keep_alive.unwrap_or(false),
-        };
+        let connect_opts = ConnectOpts::from_proxy_config(config);
 
         info!(
             "Shadowsocks proxy '{}': {}:{} cipher={} udp={}",
@@ -222,7 +213,7 @@ impl OutboundHandler for ShadowsocksOutbound {
                     self.identity_keys.clone(),
                 );
                 // mihomo compat: flush handshake to wire immediately (like DialConn)
-                ss.flush_handshake().await.map_err(|e| anyhow::anyhow!("ss handshake flush: {}", e))?;
+                ss.flush_handshake().await.map_err(|e| anyhow::anyhow!("ss handshake flush: {e}"))?;
                 Ok(Box::new(ss))
             }
 
@@ -245,7 +236,7 @@ impl OutboundHandler for ShadowsocksOutbound {
                     addr_header,
                     self.identity_keys.clone(),
                 );
-                ss.flush_handshake().await.map_err(|e| anyhow::anyhow!("ss handshake flush: {}", e))?;
+                ss.flush_handshake().await.map_err(|e| anyhow::anyhow!("ss handshake flush: {e}"))?;
                 Ok(Box::new(ss))
             }
 
@@ -265,7 +256,7 @@ impl OutboundHandler for ShadowsocksOutbound {
                     addr_header,
                     self.identity_keys.clone(),
                 );
-                ss.flush_handshake().await.map_err(|e| anyhow::anyhow!("ss handshake flush: {}", e))?;
+                ss.flush_handshake().await.map_err(|e| anyhow::anyhow!("ss handshake flush: {e}"))?;
                 Ok(Box::new(ss))
             }
 
@@ -285,7 +276,7 @@ impl OutboundHandler for ShadowsocksOutbound {
                     addr_header,
                     self.identity_keys.clone(),
                 );
-                ss.flush_handshake().await.map_err(|e| anyhow::anyhow!("ss handshake flush: {}", e))?;
+                ss.flush_handshake().await.map_err(|e| anyhow::anyhow!("ss handshake flush: {e}"))?;
                 Ok(Box::new(ss))
             }
 
@@ -302,7 +293,7 @@ impl OutboundHandler for ShadowsocksOutbound {
                     addr_header,
                     self.identity_keys.clone(),
                 );
-                ss.flush_handshake().await.map_err(|e| anyhow::anyhow!("ss handshake flush: {}", e))?;
+                ss.flush_handshake().await.map_err(|e| anyhow::anyhow!("ss handshake flush: {e}"))?;
                 Ok(Box::new(ss))
             }
         }

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -40,9 +40,9 @@ pub struct LoadBalanceGroup {
     strategy: LoadBalanceStrategy,
     /// Round-robin counter (only used by RoundRobin strategy).
     rr_counter: AtomicUsize,
-    /// Sticky-session cache: destination -> proxy name.
-    /// Bounded to 1024 entries; when full, the oldest entry is evicted.
-    sticky_cache: RwLock<Vec<(String, String)>>,
+    /// Sticky-session cache: destination -> proxy name (LRU, bounded).
+    sticky_map: RwLock<HashMap<String, String>>,
+    sticky_order: RwLock<VecDeque<String>>,
     /// Destination hint set by the caller before calling `get_proxy`.
     destination_hint: RwLock<String>,
 }
@@ -106,13 +106,15 @@ impl LoadBalanceGroup {
             proxy_names: proxies,
             strategy,
             rr_counter: AtomicUsize::new(0),
-            sticky_cache: RwLock::new(Vec::new()),
+            sticky_map: RwLock::new(HashMap::new()),
+            sticky_order: RwLock::new(VecDeque::new()),
             destination_hint: RwLock::new(String::new()),
         }
     }
 
     /// Set the destination hint used by consistent-hashing and sticky-session
     /// strategies. Must be called before `get_proxy`.
+    #[allow(dead_code)]
     pub fn set_destination_hint(&self, dst: &str) {
         *self.destination_hint.write() = dst.to_string();
     }
@@ -137,24 +139,27 @@ impl LoadBalanceGroup {
     }
 
     fn pick_sticky(&self, dst: &str) -> Option<String> {
-        let cache = self.sticky_cache.read();
-        for (d, proxy) in cache.iter().rev() {
-            if d == dst {
-                return Some(proxy.clone());
-            }
-        }
-        None
+        self.sticky_map.read().get(dst).cloned()
     }
 
     fn insert_sticky(&self, dst: &str, proxy: &str) {
-        let mut cache = self.sticky_cache.write();
-        // Remove existing entry for this destination.
-        cache.retain(|(d, _)| d != dst);
-        // Evict oldest if at capacity.
-        if cache.len() >= STICKY_CACHE_MAX {
-            cache.remove(0);
+        let mut map = self.sticky_map.write();
+        let mut order = self.sticky_order.write();
+        if map.contains_key(dst) {
+            // Update existing entry, move to back of LRU order
+            map.insert(dst.to_string(), proxy.to_string());
+            order.retain(|d| d != dst);
+            order.push_back(dst.to_string());
+        } else {
+            // Evict oldest if at capacity
+            if map.len() >= STICKY_CACHE_MAX {
+                if let Some(oldest) = order.pop_front() {
+                    map.remove(&oldest);
+                }
+            }
+            map.insert(dst.to_string(), proxy.to_string());
+            order.push_back(dst.to_string());
         }
-        cache.push((dst.to_string(), proxy.to_string()));
     }
 }
 

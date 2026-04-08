@@ -264,8 +264,7 @@ impl DnsResolver {
             if created.elapsed() < ttl {
                 if ip.is_unspecified() {
                     return Err(anyhow::anyhow!(
-                        "DNS resolution for proxy server '{}' failed (cached negative result)",
-                        domain
+                        "DNS resolution for proxy server '{domain}' failed (cached negative result)"
                     ));
                 }
                 debug!("DNS proxy-server cache hit: {} -> {}", domain, ip);
@@ -297,8 +296,7 @@ impl DnsResolver {
             if created.elapsed() < ttl {
                 if ip.is_unspecified() {
                     return Err(anyhow::anyhow!(
-                        "DNS resolution for proxy server '{}' failed (cached negative result)",
-                        domain
+                        "DNS resolution for proxy server '{domain}' failed (cached negative result)"
                     ));
                 }
                 debug!("DNS proxy-server cache hit (after dedup): {} -> {}", domain, ip);

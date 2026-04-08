@@ -10,10 +10,6 @@ use tracing::debug;
 
 use super::fingerprint::{self, TlsFingerprint};
 
-// ---------------------------------------------------------------------------
-// Options struct (used by proxy adapters)
-// ---------------------------------------------------------------------------
-
 /// Configuration for a TLS connection.
 #[derive(Debug, Clone)]
 pub struct TlsOptions {
@@ -37,10 +33,6 @@ where
     )?;
     connector.connect(stream).await
 }
-
-// ---------------------------------------------------------------------------
-// TlsConnector - reusable, shareable TLS connector
-// ---------------------------------------------------------------------------
 
 /// TLS transport layer wrapping `tokio_rustls::TlsConnector`.
 ///
@@ -128,10 +120,6 @@ impl TlsConnector {
         Ok(tls_stream)
     }
 }
-
-// ---------------------------------------------------------------------------
-// Dangerous: accept-anything certificate verifier
-// ---------------------------------------------------------------------------
 
 /// A `ServerCertVerifier` that blindly accepts any certificate chain.
 ///

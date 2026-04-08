@@ -179,6 +179,7 @@ pub async fn get_proxy(
 pub struct DelayQuery {
     url: Option<String>,
     timeout: Option<u64>,
+    #[allow(dead_code)]
     expected: Option<String>,
 }
 
@@ -230,8 +231,7 @@ pub async fn get_proxy_delay(
 
         // Send HTTP HEAD
         let req = format!(
-            "HEAD {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
-            path, host
+            "HEAD {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"
         );
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         stream.write_all(req.as_bytes()).await?;
@@ -353,8 +353,6 @@ pub async fn delete_proxy(State(state): State<ApiState>, Path(name): Path<String
     }
 }
 
-// --- Groups ---
-
 pub async fn get_groups(State(state): State<ApiState>) -> Json<Value> {
     let groups: HashMap<String, Value> = state
         .app
@@ -458,8 +456,7 @@ pub async fn get_group_delay(
             let result = tokio::time::timeout(timeout, async {
                 let mut stream = handler.connect_stream(&target, &dns).await?;
                 let req = format!(
-                    "HEAD {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
-                    path, host
+                    "HEAD {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"
                 );
                 use tokio::io::{AsyncReadExt, AsyncWriteExt};
                 stream.write_all(req.as_bytes()).await?;
@@ -515,8 +512,6 @@ pub async fn get_group_delay(
 
     (StatusCode::OK, Json(Value::Object(result)))
 }
-
-// --- Providers ---
 
 pub async fn get_providers(State(state): State<ApiState>) -> Json<Value> {
     let providers: HashMap<String, Value> = state

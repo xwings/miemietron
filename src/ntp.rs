@@ -39,13 +39,13 @@ const NTP_EPOCH_OFFSET: u64 = 2_208_988_800; // Seconds between 1900 and 1970
 
 /// Query an NTP server and return the clock offset in milliseconds.
 pub async fn query_ntp(server: &str, port: u16) -> Result<i64> {
-    let addr_str = format!("{}:{}", server, port);
+    let addr_str = format!("{server}:{port}");
 
     // Resolve the NTP server
     let addr: SocketAddr = tokio::net::lookup_host(&addr_str)
         .await?
         .next()
-        .ok_or_else(|| anyhow::anyhow!("failed to resolve NTP server: {}", server))?;
+        .ok_or_else(|| anyhow::anyhow!("failed to resolve NTP server: {server}"))?;
 
     let socket = UdpSocket::bind("0.0.0.0:0").await?;
 
@@ -71,7 +71,7 @@ pub async fn query_ntp(server: &str, port: u16) -> Result<i64> {
         .unwrap_or_default();
 
     if n < 48 {
-        return Err(anyhow::anyhow!("NTP response too short: {} bytes", n));
+        return Err(anyhow::anyhow!("NTP response too short: {n} bytes"));
     }
 
     // Extract transmit timestamp (bytes 40-47)
