@@ -8,12 +8,6 @@ Same CLI. Same config. Same API. Just swap the binary.
 
 mihomo is written in Go. On ARM routers with 256 MB RAM, Go's garbage collector and goroutine overhead matter. Miemietron eliminates this:
 
-| | mihomo (Go) | miemietron (Rust) |
-|---|---|---|
-| Binary size | ~25 MB | **~5.5 MB** |
-| Idle memory | ~40 MB | **~7 MB** |
-| GC pauses | 10-50 ms | **None** |
-
 ## Features
 
 ### Protocols
