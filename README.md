@@ -6,7 +6,7 @@ Same CLI. Same config. Same API. Just swap the binary.
 
 ## Performance
 
-Tested with 3 full 4K Youtube video running concurrently.
+Tested with 3 devices. Running few Youtube live stream and few 4K video.
 
 ![Usage](img/usage.png)
 
