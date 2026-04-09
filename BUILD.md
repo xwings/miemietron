@@ -91,7 +91,7 @@ Pushing a `v*` tag triggers GitHub Actions CI which automatically:
 git add -A
 git commit -m "v0.2.0: description"
 git tag v0.2.0
-git push origin main --tags
+git push origin dev --tags
 ```
 
 ## Troubleshooting
