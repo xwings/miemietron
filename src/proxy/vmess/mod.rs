@@ -205,7 +205,6 @@ impl OutboundHandler for VmessOutbound {
         target: &Address,
         dns: &DnsResolver,
     ) -> Result<Box<dyn ProxyStream>> {
-        // Step 1: TCP connect to the VMess server.
         let tcp_stream = self.dial_server(dns).await?;
 
         match self.network.as_str() {

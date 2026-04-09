@@ -16,6 +16,8 @@ use crate::config::DnsConfig;
 use cache::DnsCache;
 use fakeip::FakeIpPool;
 
+type GeositeCheckerFn = Arc<dyn Fn(&str, &str) -> bool + Send + Sync>;
+
 pub struct DnsResolver {
     config: DnsConfig,
     cache: DnsCache,
@@ -25,7 +27,7 @@ pub struct DnsResolver {
     fakeip_geosite_codes: Vec<String>,
     /// Callback to check if a domain matches a geosite code.
     /// Set after construction via `set_geosite_checker()`.
-    geosite_checker: Option<Arc<dyn Fn(&str, &str) -> bool + Send + Sync>>,
+    geosite_checker: Option<GeositeCheckerFn>,
     /// Reverse IP→domain mapping for redir-host mode and traffic logging.
     /// Records every DNS resolution result (both FakeIP and real IPs).
     /// Matches mihomo's dns/enhancer.go mapping LRU.
@@ -556,11 +558,10 @@ fn build_dns_response(id: u16, domain: &str, ip: IpAddr, qtype: u16, ttl: u32) -
     const TYPE_AAAA: u16 = 28;
 
     // Check if we have a type mismatch (AAAA query but IPv4 answer, or A query but IPv6 answer)
-    let type_mismatch = match (&ip, qtype) {
-        (IpAddr::V4(_), TYPE_AAAA) => true,
-        (IpAddr::V6(_), TYPE_A) => true,
-        _ => false,
-    };
+    let type_mismatch = matches!(
+        (&ip, qtype),
+        (IpAddr::V4(_), TYPE_AAAA) | (IpAddr::V6(_), TYPE_A)
+    );
 
     let mut response = Vec::with_capacity(128);
 

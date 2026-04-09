@@ -108,9 +108,6 @@ impl GeoSiteMatcher {
     }
 }
 
-// ===========================================================================
-// Minimal protobuf wire-format parser
-// ===========================================================================
 //
 // Protobuf wire format basics:
 //   - Each field is encoded as: tag (varint) + value

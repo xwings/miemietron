@@ -83,6 +83,16 @@ pub struct SubscriptionInfo {
     pub expire: u64,
 }
 
+/// Global options that apply to all proxies (routing mark, keepalive, etc.).
+/// Bundles related parameters to avoid too-many-arguments warnings.
+pub struct ProxyGlobalOpts {
+    pub routing_mark: Option<u32>,
+    pub tcp_concurrent: bool,
+    pub keep_alive_idle: u64,
+    pub keep_alive_interval: u64,
+    pub disable_keep_alive: bool,
+}
+
 /// Manages all configured proxies and provides lookup.
 pub struct ProxyManager {
     proxies: HashMap<String, Arc<dyn OutboundHandler>>,
@@ -90,9 +100,6 @@ pub struct ProxyManager {
     live_groups: HashMap<String, Arc<dyn ProxyGroup>>,
     provider_configs: HashMap<String, ProxyProviderConfig>,
     subscription_info: HashMap<String, SubscriptionInfo>,
-    /// Maps proxy name -> dialer proxy name (for proxy chaining)
-    #[allow(dead_code)]
-    dialer_proxy_map: HashMap<String, String>,
     /// Centralized per-proxy state store shared with all groups.
     state_store: Arc<crate::proxy_group::proxy_state::ProxyStateStore>,
 }
@@ -102,23 +109,15 @@ impl ProxyManager {
         proxy_configs: &[ProxyConfig],
         group_configs: &[ProxyGroupConfig],
         providers: &HashMap<String, ProxyProviderConfig>,
-        global_routing_mark: Option<u32>,
-        global_tcp_concurrent: bool,
-        keep_alive_idle: u64,
-        keep_alive_interval: u64,
-        disable_keep_alive: bool,
+        global_opts: &ProxyGlobalOpts,
     ) -> Result<Self> {
         let state_store = Arc::new(crate::proxy_group::proxy_state::ProxyStateStore::new());
         Self::with_state_store(
             proxy_configs,
             group_configs,
             providers,
-            global_routing_mark,
-            global_tcp_concurrent,
+            global_opts,
             state_store,
-            keep_alive_idle,
-            keep_alive_interval,
-            disable_keep_alive,
         )
         .await
     }
@@ -127,21 +126,21 @@ impl ProxyManager {
         proxy_configs: &[ProxyConfig],
         group_configs: &[ProxyGroupConfig],
         providers: &HashMap<String, ProxyProviderConfig>,
-        global_routing_mark: Option<u32>,
-        global_tcp_concurrent: bool,
+        global_opts: &ProxyGlobalOpts,
         state_store: Arc<crate::proxy_group::proxy_state::ProxyStateStore>,
-        keep_alive_idle: u64,
-        keep_alive_interval: u64,
-        disable_keep_alive: bool,
     ) -> Result<Self> {
         let mut proxies: HashMap<String, Arc<dyn OutboundHandler>> = HashMap::new();
+
+        let global_routing_mark = global_opts.routing_mark;
+        let global_tcp_concurrent = global_opts.tcp_concurrent;
+        let keep_alive_idle = global_opts.keep_alive_idle;
+        let keep_alive_interval = global_opts.keep_alive_interval;
+        let disable_keep_alive = global_opts.disable_keep_alive;
 
         // mihomo compat: DefaultRoutingMark starts at 0 in mihomo (dialer/options.go:14).
         // When no routing-mark is configured, mihomo does NOT set SO_MARK on sockets.
         // It relies on GID 65534 (set by OpenClash via procd) for firewall bypass.
         // Only set SO_MARK when the config explicitly specifies routing-mark.
-        let global_routing_mark = global_routing_mark;
-
         // Built-in proxies — DIRECT gets the global routing mark for SO_MARK
         proxies.insert(
             "DIRECT".to_string(),
@@ -154,7 +153,6 @@ impl ProxyManager {
         );
 
         // Parse configured proxies, applying global settings as defaults
-        let mut dialer_proxy_map: HashMap<String, String> = HashMap::new();
         for config in proxy_configs {
             let mut cfg = config.clone();
             if cfg.routing_mark.is_none() {
@@ -172,10 +170,6 @@ impl ProxyManager {
             }
             if cfg.disable_keep_alive.is_none() {
                 cfg.disable_keep_alive = Some(disable_keep_alive);
-            }
-            // Track dialer-proxy relationships
-            if let Some(ref dialer) = cfg.dialer_proxy {
-                dialer_proxy_map.insert(cfg.name.clone(), dialer.clone());
             }
             if let Some(handler) = Self::load_proxy_config(&cfg) {
                 proxies.insert(cfg.name.clone(), handler);
@@ -405,27 +399,27 @@ impl ProxyManager {
                 "url-test" => Arc::new(UrlTestGroup::new(
                     gc.name.clone(),
                     all_proxies,
-                    gc.url
-                        .clone()
-                        .unwrap_or_else(|| "http://www.gstatic.com/generate_204".to_string()),
-                    gc.interval.unwrap_or(300),
                     gc.tolerance.unwrap_or(150),
+                    crate::proxy_group::HealthCheckOpts {
+                        url: gc.url.clone().unwrap_or_else(|| "http://www.gstatic.com/generate_204".to_string()),
+                        interval_secs: gc.interval.unwrap_or(300),
+                        max_failed_times: gc.max_failed_times,
+                        test_timeout: gc.timeout,
+                        lazy: gc.lazy.unwrap_or(false),
+                    },
                     state_store.clone(),
-                    gc.max_failed_times,
-                    gc.timeout,
-                    gc.lazy.unwrap_or(false),
                 )),
                 "fallback" => Arc::new(FallbackGroup::new(
                     gc.name.clone(),
                     all_proxies,
-                    gc.url
-                        .clone()
-                        .unwrap_or_else(|| "http://www.gstatic.com/generate_204".to_string()),
-                    gc.interval.unwrap_or(300),
+                    crate::proxy_group::HealthCheckOpts {
+                        url: gc.url.clone().unwrap_or_else(|| "http://www.gstatic.com/generate_204".to_string()),
+                        interval_secs: gc.interval.unwrap_or(300),
+                        max_failed_times: gc.max_failed_times,
+                        test_timeout: gc.timeout,
+                        lazy: gc.lazy.unwrap_or(false),
+                    },
                     state_store.clone(),
-                    gc.max_failed_times,
-                    gc.timeout,
-                    gc.lazy.unwrap_or(false),
                 )),
                 "load-balance" => Arc::new(LoadBalanceGroup::new(
                     gc.name.clone(),
@@ -463,7 +457,6 @@ impl ProxyManager {
             live_groups,
             provider_configs: providers.clone(),
             subscription_info,
-            dialer_proxy_map,
             state_store,
         })
     }

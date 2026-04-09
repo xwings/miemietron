@@ -257,8 +257,6 @@ struct ParsedPacket {
     dst_ip: IpAddr,
     protocol: u8,
     payload: Vec<u8>, // TCP/UDP header + data
-    #[allow(dead_code)]
-    raw: Vec<u8>,     // Full raw IP packet (for building replies)
 }
 
 fn parse_ipv4_packet(data: &[u8]) -> Option<ParsedPacket> {
@@ -279,7 +277,6 @@ fn parse_ipv4_packet(data: &[u8]) -> Option<ParsedPacket> {
         dst_ip,
         protocol,
         payload: data[ihl..].to_vec(),
-        raw: data.to_vec(),
     })
 }
 
@@ -302,7 +299,6 @@ fn parse_ipv6_packet(data: &[u8]) -> Option<ParsedPacket> {
         dst_ip,
         protocol: next_header,
         payload: data[40..].to_vec(),
-        raw: data.to_vec(),
     })
 }
 
@@ -371,14 +367,14 @@ async fn handle_tcp_packet(
         });
 
         // Send SYN-ACK back through TUN
-        let syn_ack = build_tcp_response(
-            &packet.dst_ip, dst_port,
-            &packet.src_ip, src_port,
-            our_seq,
-            seq_num.wrapping_add(1),
-            0x12, // SYN+ACK
-            &[],
-        );
+        let syn_ack = build_tcp_response(&TcpSegment {
+            src_ip: &packet.dst_ip, src_port: dst_port,
+            dst_ip: &packet.src_ip, dst_port: src_port,
+            seq: our_seq,
+            ack: seq_num.wrapping_add(1),
+            flags: 0x12, // SYN+ACK
+            payload: &[],
+        });
         use tokio::io::AsyncWriteExt;
         let _ = tun.write_all(&syn_ack).await;
 
@@ -415,14 +411,14 @@ async fn handle_tcp_packet(
                 conn.their_seq = conn.their_seq.wrapping_add(tcp_payload.len() as u32);
 
                 // Send ACK
-                let ack_pkt = build_tcp_response(
-                    &packet.dst_ip, dst_port,
-                    &packet.src_ip, src_port,
-                    conn.our_seq,
-                    conn.their_seq,
-                    0x10, // ACK
-                    &[],
-                );
+                let ack_pkt = build_tcp_response(&TcpSegment {
+                    src_ip: &packet.dst_ip, src_port: dst_port,
+                    dst_ip: &packet.src_ip, dst_port: src_port,
+                    seq: conn.our_seq,
+                    ack: conn.their_seq,
+                    flags: 0x10, // ACK
+                    payload: &[],
+                });
                 use tokio::io::AsyncWriteExt;
                 let _ = tun.write_all(&ack_pkt).await;
             }
@@ -432,14 +428,14 @@ async fn handle_tcp_packet(
     if fin {
         if let Some(conn) = connections.remove(&key) {
             // Send FIN-ACK
-            let fin_ack = build_tcp_response(
-                &packet.dst_ip, dst_port,
-                &packet.src_ip, src_port,
-                conn.our_seq,
-                seq_num.wrapping_add(1),
-                0x11, // FIN+ACK
-                &[],
-            );
+            let fin_ack = build_tcp_response(&TcpSegment {
+                src_ip: &packet.dst_ip, src_port: dst_port,
+                dst_ip: &packet.src_ip, dst_port: src_port,
+                seq: conn.our_seq,
+                ack: seq_num.wrapping_add(1),
+                flags: 0x11, // FIN+ACK
+                payload: &[],
+            });
             use tokio::io::AsyncWriteExt;
             let _ = tun.write_all(&fin_ack).await;
             debug!("Gvisor: TCP FIN {} -> {}", src, dst);
@@ -451,14 +447,28 @@ async fn handle_tcp_packet(
     }
 }
 
-/// Build a minimal IPv4 + TCP response packet
-fn build_tcp_response(
-    src_ip: &IpAddr, src_port: u16,
-    dst_ip: &IpAddr, dst_port: u16,
-    seq: u32, ack: u32,
+/// TCP segment parameters for building response packets.
+struct TcpSegment<'a> {
+    src_ip: &'a IpAddr,
+    src_port: u16,
+    dst_ip: &'a IpAddr,
+    dst_port: u16,
+    seq: u32,
+    ack: u32,
     flags: u8,
-    payload: &[u8],
-) -> Vec<u8> {
+    payload: &'a [u8],
+}
+
+/// Build a minimal IPv4 + TCP response packet
+fn build_tcp_response(seg: &TcpSegment<'_>) -> Vec<u8> {
+    let src_ip = seg.src_ip;
+    let src_port = seg.src_port;
+    let dst_ip = seg.dst_ip;
+    let dst_port = seg.dst_port;
+    let seq = seg.seq;
+    let ack = seg.ack;
+    let flags = seg.flags;
+    let payload = seg.payload;
     let tcp_len = 20 + payload.len();
     let total_len = 20 + tcp_len; // IPv4 header + TCP
 
@@ -529,16 +539,13 @@ fn tcp_checksum(src_ip: &IpAddr, dst_ip: &IpAddr, tcp_segment: &[u8]) -> u16 {
     let mut sum: u32 = 0;
 
     // Pseudo-header
-    match (src_ip, dst_ip) {
-        (IpAddr::V4(src), IpAddr::V4(dst)) => {
-            let s = src.octets();
-            let d = dst.octets();
-            sum += ((s[0] as u32) << 8) | (s[1] as u32);
-            sum += ((s[2] as u32) << 8) | (s[3] as u32);
-            sum += ((d[0] as u32) << 8) | (d[1] as u32);
-            sum += ((d[2] as u32) << 8) | (d[3] as u32);
-        }
-        _ => {} // IPv6 pseudo-header would go here
+    if let (IpAddr::V4(src), IpAddr::V4(dst)) = (src_ip, dst_ip) {
+        let s = src.octets();
+        let d = dst.octets();
+        sum += ((s[0] as u32) << 8) | (s[1] as u32);
+        sum += ((s[2] as u32) << 8) | (s[3] as u32);
+        sum += ((d[0] as u32) << 8) | (d[1] as u32);
+        sum += ((d[2] as u32) << 8) | (d[3] as u32);
     }
     sum += 6; // Protocol: TCP
     sum += tcp_segment.len() as u32;

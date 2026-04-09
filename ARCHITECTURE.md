@@ -4,7 +4,7 @@ Rust drop-in replacement for [mihomo](https://github.com/MetaCubeX/mihomo) (Meta
 Compatible with [OpenClash](https://github.com/vernesong/OpenClash) on OpenWrt routers.
 Same CLI, same config, same REST API — just swap the binary.
 
-**~31k lines of Rust, 412 tests, single static binary.**
+**~30k lines of Rust, 399 tests, single static binary.**
 
 ## The One Rule
 
@@ -32,8 +32,8 @@ src/
 │   │                          #   singleflight dedup, 120s positive / 10s negative TTL cache
 │   ├── upstream.rs            #   Upstream resolvers — UDP, DoT, DoH, system, nameserver-policy,
 │   │                          #   proxy-server-nameserver, fallback with GeoIP anti-poison
-│   ├── cache.rs               #   DNS response cache
-│   └── fakeip.rs              #   FakeIP pool — ring buffer, persistence across restarts
+│   ├── cache.rs               #   DNS response cache (zero-alloc &str lookups)
+│   └── fakeip.rs              #   FakeIP pool — ring buffer, compiled filter, persistence
 │
 ├── conn/                      # Connection manager (mihomo tunnel/tunnel.go)
 │   └── mod.rs                 #   CountingStream, PeekableStream, ConnectionManager,
@@ -83,14 +83,13 @@ src/
 │   ├── fallback.rs            #   Fallback — first alive proxy
 │   ├── load_balance.rs        #   Load-balance — consistent-hashing (jump_hash with eTLD+1),
 │   │                          #   round-robin, sticky-sessions
-│   ├── relay.rs               #   Relay — proxy chains
 │   ├── health.rs              #   Health check scheduler
 │   └── proxy_state.rs         #   Proxy state tracking (alive, latency history)
 │
 ├── rules/                     # Rule engine — sequential config-order evaluation (first match)
-│   ├── mod.rs                 #   Rule matching, RuleStats (AtomicU64 hit counters), actions
+│   ├── mod.rs                 #   Rule matching, PreParsedCidr, cached regexes/ports,
+│   │                          #   RuleStats (AtomicU64 hit counters), actions
 │   ├── domain.rs              #   Domain matcher (exact, suffix, keyword, regex)
-│   ├── ipcidr.rs              #   IP-CIDR / IP-CIDR6 matcher
 │   ├── geoip.rs               #   MaxMindDB GeoIP lookup
 │   ├── geosite.rs             #   GeoSite.dat protobuf parser
 │   ├── process.rs             #   PROCESS-NAME / PROCESS-PATH matcher
@@ -136,10 +135,8 @@ src/
 └── common/                    # Shared utilities
     ├── mod.rs                 #   Module exports
     ├── addr.rs                #   Address type (domain/IP + port)
-    ├── buf.rs                 #   Buffer pool
-    ├── delay_history.rs       #   Latency history ring buffer
+    ├── delay_history.rs       #   Latency history ring buffer (VecDeque)
     ├── error.rs               #   Error types
-    ├── net.rs                 #   Network utilities
     └── singledo.rs            #   Singleflight + timer-cached execution
 ```
 
@@ -302,10 +299,13 @@ Static musl builds — single binary, zero shared libs. Linux/OpenWrt only.
 | Target | Triple | Use Case |
 |--------|--------|----------|
 | x86_64 | `x86_64-unknown-linux-musl` | Soft routers, VMs |
-| ARM64  | `aarch64-unknown-linux-musl` | Modern routers, RPi 3/4/5 |
-| ARM32  | `armv7-unknown-linux-musleabihf` | Older routers, RPi 2 |
+| ARM64  | `aarch64-unknown-linux-musl` | MediaTek Filogic routers, RPi 3/4/5 |
 
-Release profile: `opt-level = "z"`, LTO, single codegen unit, stripped, `panic = "abort"`.
+Release profile: `opt-level = "z"`, LTO, single codegen unit, stripped, `panic = "abort"`, `overflow-checks = false`.
+
+Per-target CPU flags in `.cargo/config.toml`:
+- aarch64: `target-cpu=cortex-a53` (NEON, A53 scheduling)
+- x86_64: `target-cpu=x86-64-v2` (SSE4.2, POPCNT)
 
 ## Key Dependencies
 

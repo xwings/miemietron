@@ -179,8 +179,123 @@ pub async fn get_proxy(
 pub struct DelayQuery {
     url: Option<String>,
     timeout: Option<u64>,
-    #[allow(dead_code)]
     expected: Option<String>,
+}
+
+/// Parse mihomo-style expected status ranges (e.g. "200" or "200-299" or "200-299/400-499").
+/// Parse mihomo-style expected status ranges.
+/// mihomo compat: ranges.go supports both `/` and `,` as separators.
+fn parse_expected_status(s: &str) -> Option<Vec<(u16, u16)>> {
+    if s.is_empty() || s == "*" {
+        return None;
+    }
+    let mut ranges = Vec::new();
+    // mihomo compat: `strings.ReplaceAll(expected, ",", "/")` (ranges.go:25)
+    let normalized = s.replace(',', "/");
+    for part in normalized.split('/') {
+        let part = part.trim();
+        if let Some((a, b)) = part.split_once('-') {
+            if let (Ok(lo), Ok(hi)) = (a.trim().parse::<u16>(), b.trim().parse::<u16>()) {
+                ranges.push((lo, hi));
+            }
+        } else if let Ok(v) = part.parse::<u16>() {
+            ranges.push((v, v));
+        }
+    }
+    if ranges.is_empty() { None } else { Some(ranges) }
+}
+
+fn status_matches(code: u16, ranges: &[(u16, u16)]) -> bool {
+    ranges.iter().any(|&(lo, hi)| code >= lo && code <= hi)
+}
+
+/// Perform a delay test through a proxy, matching mihomo's adapter.go URLTest().
+///
+/// mihomo uses Go's http.Client with DialContext overridden to route through the
+/// proxy connection. It sends HTTP HEAD, reads the full HTTP response (handling
+/// TLS for HTTPS URLs), and checks the status code against `expected`.
+async fn do_delay_test(
+    handler: &std::sync::Arc<dyn crate::proxy::OutboundHandler>,
+    dns: &std::sync::Arc<crate::dns::DnsResolver>,
+    url_str: &str,
+    expected_status: Option<&[(u16, u16)]>,
+) -> Result<(u16, u16), anyhow::Error> {
+    let parsed: url::Url = url_str.parse()?;
+    let host = parsed.host_str().unwrap_or("www.gstatic.com").to_string();
+    let port = parsed.port().unwrap_or(if parsed.scheme() == "https" { 443 } else { 80 });
+    let path = if parsed.query().is_some() {
+        format!("{}?{}", parsed.path(), parsed.query().unwrap())
+    } else {
+        parsed.path().to_string()
+    };
+    let is_https = parsed.scheme() == "https";
+
+    let target = crate::common::addr::Address::domain(&host, port);
+    let start = Instant::now();
+
+    // mihomo compat: connect through proxy, then use full HTTP client (handles TLS)
+    let stream = handler.connect_stream(&target, dns).await?;
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // For HTTPS: wrap with TLS to the destination (the proxy tunnel is already established)
+    let status_code = if is_https {
+        let provider = rustls::crypto::ring::default_provider();
+        let tls_connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(
+            rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(provider))
+                .with_safe_default_protocol_versions()
+                .expect("tls config")
+                .dangerous()
+                .with_custom_certificate_verifier(std::sync::Arc::new(
+                    crate::transport::tls::NoVerifier::new(),
+                ))
+                .with_no_client_auth(),
+        ));
+        let server_name = rustls::pki_types::ServerName::try_from(host.clone())
+            .unwrap_or_else(|_| rustls::pki_types::ServerName::try_from("localhost".to_string()).unwrap());
+        let mut tls_stream = tls_connector.connect(server_name, stream).await?;
+
+        let req = format!("HEAD {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+        tls_stream.write_all(req.as_bytes()).await?;
+
+        let mut buf = [0u8; 512];
+        let n = tls_stream.read(&mut buf).await?;
+        parse_http_status(&buf[..n])
+    } else {
+        let mut stream = stream;
+        let req = format!("HEAD {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+        stream.write_all(req.as_bytes()).await?;
+
+        let mut buf = [0u8; 512];
+        let n = stream.read(&mut buf).await?;
+        parse_http_status(&buf[..n])
+    };
+
+    let delay = start.elapsed().as_millis() as u16;
+
+    let status_code = status_code.ok_or_else(|| anyhow::anyhow!("invalid HTTP response"))?;
+
+    // mihomo compat: check expected status (satisfied flag)
+    if let Some(ranges) = expected_status {
+        if !status_matches(status_code, ranges) {
+            return Err(anyhow::anyhow!("expected status {}, got {}",
+                ranges.iter().map(|(a,b)| if a == b { format!("{a}") } else { format!("{a}-{b}") }).collect::<Vec<_>>().join("/"),
+                status_code));
+        }
+    }
+
+    Ok((delay, status_code))
+}
+
+/// Parse HTTP status code from response bytes.
+fn parse_http_status(buf: &[u8]) -> Option<u16> {
+    let s = std::str::from_utf8(buf).ok()?;
+    // "HTTP/1.1 204 No Content"
+    if !s.starts_with("HTTP/") {
+        return None;
+    }
+    let status_part = s.get(9..12)?;
+    status_part.trim().parse().ok()
 }
 
 pub async fn get_proxy_delay(
@@ -193,12 +308,10 @@ pub async fn get_proxy_delay(
         .as_deref()
         .unwrap_or("http://www.gstatic.com/generate_204");
     let timeout_ms = query.timeout.unwrap_or(5000);
+    let expected_status = query.expected.as_deref().and_then(parse_expected_status);
 
-    // Resolve the proxy handler
     let pm = state.app.proxy_manager();
-    let handler = pm
-        .get(&name)
-        .or_else(|| pm.resolve(&name));
+    let handler = pm.get(&name).or_else(|| pm.resolve(&name));
     let handler = match handler {
         Some(h) => h,
         None => return (StatusCode::NOT_FOUND, Json(json!({"message": "proxy not found"}))),
@@ -207,59 +320,19 @@ pub async fn get_proxy_delay(
     let dns = state.app.dns_resolver();
     let timeout = std::time::Duration::from_millis(timeout_ms);
 
-    // Parse URL to extract host and path
-    let parsed: url::Url = match url_str.parse() {
-        Ok(u) => u,
-        Err(_) => return (StatusCode::BAD_REQUEST, Json(json!({"message": "invalid url"}))),
-    };
-    let host = parsed.host_str().unwrap_or("www.gstatic.com").to_string();
-    let port = parsed.port().unwrap_or(if parsed.scheme() == "https" { 443 } else { 80 });
-    let path = if parsed.query().is_some() {
-        format!("{}?{}", parsed.path(), parsed.query().unwrap())
-    } else {
-        parsed.path().to_string()
-    };
-
-    let target = crate::common::addr::Address::domain(&host, port);
-
-    let start = Instant::now();
-
-    // Connect through the proxy and send an HTTP HEAD request
-    // mihomo compat: uses http.Client with DialContext overridden to use proxy connection
-    let result = tokio::time::timeout(timeout, async {
-        let mut stream = handler.connect_stream(&target, &dns).await?;
-
-        // Send HTTP HEAD
-        let req = format!(
-            "HEAD {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"
-        );
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        stream.write_all(req.as_bytes()).await?;
-
-        // Read response status line
-        let mut buf = [0u8; 256];
-        let n = stream.read(&mut buf).await?;
-        let response = String::from_utf8_lossy(&buf[..n]);
-
-        if response.starts_with("HTTP/") {
-            Ok::<_, anyhow::Error>(())
-        } else {
-            Err(anyhow::anyhow!("invalid HTTP response"))
-        }
-    })
+    let result = tokio::time::timeout(
+        timeout,
+        do_delay_test(&handler, &dns, url_str, expected_status.as_deref()),
+    )
     .await;
 
-    let delay = start.elapsed().as_millis() as u64;
     let store = state.app.proxy_state_store();
     match result {
-        Ok(Ok(())) => {
-            // Record successful delay to the state store
-            store.record_result(&name, url_str, Some(delay as u16));
+        Ok(Ok((delay, _status))) => {
+            store.record_result(&name, url_str, Some(delay));
             (StatusCode::OK, Json(json!({ "delay": delay })))
         }
-        // mihomo compat: returns 503 on error, 504 on timeout
         Ok(Err(e)) => {
-            // Record failure
             store.record_result(&name, url_str, None);
             (
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -267,7 +340,6 @@ pub async fn get_proxy_delay(
             )
         }
         Err(_) => {
-            // Record timeout as failure
             store.record_result(&name, url_str, None);
             (
                 StatusCode::GATEWAY_TIMEOUT,
@@ -421,61 +493,30 @@ pub async fn get_group_delay(
         .unwrap_or("http://www.gstatic.com/generate_204");
     let timeout_ms = query.timeout.unwrap_or(5000);
     let timeout = std::time::Duration::from_millis(timeout_ms);
-
-    // Parse URL once
-    let parsed: url::Url = match url_str.parse() {
-        Ok(u) => u,
-        Err(_) => return (StatusCode::BAD_REQUEST, Json(json!({"message": "invalid url"}))),
-    };
-    let host = parsed.host_str().unwrap_or("www.gstatic.com").to_string();
-    let port = parsed.port().unwrap_or(if parsed.scheme() == "https" { 443 } else { 80 });
-    let path = if parsed.query().is_some() {
-        format!("{}?{}", parsed.path(), parsed.query().unwrap())
-    } else {
-        parsed.path().to_string()
-    };
+    let expected_status = query.expected.as_deref().and_then(parse_expected_status);
 
     let dns = state.app.dns_resolver();
 
-    // mihomo compat: test all proxies concurrently through the actual proxy connections
+    // mihomo compat: test all proxies concurrently (groupbase.go URLTest)
     let mut handles = Vec::new();
     for proxy_name in proxy_names {
-        let handler = pm.get(&proxy_name);
-        if handler.is_none() {
-            continue;
-        }
-        let handler = handler.unwrap();
+        let handler = match pm.get(&proxy_name) {
+            Some(h) => h,
+            None => continue,
+        };
         let dns = dns.clone();
         let pname = proxy_name.clone();
-        let host = host.clone();
-        let path = path.clone();
+        let url = url_str.to_string();
+        let expected = expected_status.clone();
         handles.push(tokio::spawn(async move {
-            let target = crate::common::addr::Address::domain(&host, port);
-            let start = Instant::now();
-
-            let result = tokio::time::timeout(timeout, async {
-                let mut stream = handler.connect_stream(&target, &dns).await?;
-                let req = format!(
-                    "HEAD {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"
-                );
-                use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                stream.write_all(req.as_bytes()).await?;
-                let mut buf = [0u8; 256];
-                let n = stream.read(&mut buf).await?;
-                let response = String::from_utf8_lossy(&buf[..n]);
-                if response.starts_with("HTTP/") {
-                    Ok::<_, anyhow::Error>(())
-                } else {
-                    Err(anyhow::anyhow!("invalid HTTP response"))
-                }
-            })
+            let result = tokio::time::timeout(
+                timeout,
+                do_delay_test(&handler, &dns, &url, expected.as_deref()),
+            )
             .await;
 
             match result {
-                Ok(Ok(())) => {
-                    let delay = start.elapsed().as_millis() as u64;
-                    (pname, Some(delay))
-                }
+                Ok(Ok((delay, _))) => (pname, Some(delay)),
                 _ => (pname, None),
             }
         }));
@@ -483,27 +524,24 @@ pub async fn get_group_delay(
 
     let store = state.app.proxy_state_store();
     let mut result = serde_json::Map::new();
-    let mut any_success = false;
     for h in handles {
         if let Ok((pname, delay_opt)) = h.await {
             match delay_opt {
                 Some(delay) => {
-                    any_success = true;
-                    // Record successful delay to the state store
-                    store.record_result(&pname, url_str, Some(delay as u16));
+                    store.record_result(&pname, url_str, Some(delay));
+                    // mihomo compat: only successful proxies appear in the map
                     result.insert(pname, json!(delay));
                 }
                 None => {
-                    // Record failure
                     store.record_result(&pname, url_str, None);
-                    result.insert(pname, json!(0));
+                    // mihomo compat: failed proxies are NOT included in the response
                 }
             }
         }
     }
 
-    // mihomo compat: returns 504 if all proxies timeout
-    if !any_success && !result.is_empty() {
+    // mihomo compat: returns 504 if all proxies timeout (groupbase.go:252-256)
+    if result.is_empty() {
         return (
             StatusCode::GATEWAY_TIMEOUT,
             Json(json!({"message": "get delay: all proxies timeout"})),

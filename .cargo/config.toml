@@ -1,0 +1,8 @@
+# Target-specific optimizations for supported platforms.
+# Only ARMv8 64-bit (MediaTek Filogic / Cortex-A53) and x86_64.
+
+[target.aarch64-unknown-linux-musl]
+rustflags = ["-C", "target-cpu=cortex-a53"]
+
+[target.x86_64-unknown-linux-musl]
+rustflags = ["-C", "target-cpu=x86-64-v2"]

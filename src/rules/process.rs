@@ -23,13 +23,8 @@ pub fn lookup_process(src_ip: &IpAddr, src_port: u16) -> Option<(String, String)
 
 #[cfg(target_os = "linux")]
 fn lookup_process_linux(src_ip: &IpAddr, src_port: u16) -> Option<(String, String)> {
-    // Step 1: Find inode from /proc/net/tcp or tcp6
     let inode = find_socket_inode(src_ip, src_port)?;
-
-    // Step 2: Find PID that owns this inode
     let pid = find_pid_by_inode(inode)?;
-
-    // Step 3: Read the exe path
     let exe_path = read_process_exe(pid)?;
     let process_name = Path::new(&exe_path)
         .file_name()

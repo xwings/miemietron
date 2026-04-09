@@ -119,10 +119,9 @@ impl OutboundHandler for VlessOutbound {
         target: &Address,
         dns: &DnsResolver,
     ) -> Result<Box<dyn ProxyStream>> {
-        // Step 1: TCP connect to the VLESS server.
         let tcp_stream = self.dial_server(dns).await?;
 
-        // Step 2: Check if Reality transport is configured.
+        // Check if Reality transport is configured.
         if let Some(reality_config) = self.build_reality_config()? {
             // Reality transport — perform the Reality handshake which
             // includes TLS with camouflage SNI + x25519 auth, then

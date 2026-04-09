@@ -110,16 +110,16 @@ pub fn evp_bytes_to_key(password: &[u8], key_len: usize) -> Vec<u8> {
     const MD5_LEN: usize = 16;
     let count = key_len.div_ceil(MD5_LEN);
     let mut result = Vec::with_capacity(count * MD5_LEN);
-    let mut prev = Vec::new();
+    let mut prev = [0u8; MD5_LEN]; // stack array instead of Vec
 
     for i in 0..count {
         let mut hasher = md5::Md5::new();
         if i > 0 {
-            hasher.update(&prev);
+            hasher.update(prev);
         }
         hasher.update(password);
-
-        prev = hasher.finalize().to_vec();
+        let hash = hasher.finalize();
+        prev.copy_from_slice(&hash);
         result.extend_from_slice(&prev);
     }
 
@@ -131,20 +131,24 @@ pub fn evp_bytes_to_key(password: &[u8], key_len: usize) -> Vec<u8> {
 fn hkdf_sha1(ikm: &[u8], salt: &[u8], info: &[u8], out_len: usize) -> Vec<u8> {
     let s = ring::hmac::Key::new(ring::hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY, salt);
     let prk = ring::hmac::sign(&s, ikm);
+    // Compute HMAC key once outside the loop (prk is constant).
+    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY, prk.as_ref());
 
     let mut okm = Vec::with_capacity(out_len);
-    let mut t = Vec::new();
+    // Reuse buffers across iterations instead of allocating fresh Vecs each loop.
+    let mut prev_tag = Vec::with_capacity(20); // SHA1 output is 20 bytes
+    let mut data = Vec::with_capacity(20 + info.len() + 1);
     let mut counter: u8 = 1;
 
     while okm.len() < out_len {
-        let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY, prk.as_ref());
-        let mut data = Vec::new();
-        data.extend_from_slice(&t);
+        data.clear();
+        data.extend_from_slice(&prev_tag);
         data.extend_from_slice(info);
         data.push(counter);
         let tag = ring::hmac::sign(&key, &data);
-        t = tag.as_ref().to_vec();
-        okm.extend_from_slice(&t);
+        prev_tag.clear();
+        prev_tag.extend_from_slice(tag.as_ref());
+        okm.extend_from_slice(tag.as_ref());
         counter += 1;
     }
 
@@ -159,7 +163,15 @@ fn hkdf_sha1(ikm: &[u8], salt: &[u8], info: &[u8], out_len: usize) -> Vec<u8> {
 ///   addr_type 3 = domain (1 byte length + domain bytes)
 ///   addr_type 4 = IPv6 (16 bytes)
 pub fn encode_address(addr: &Address) -> Vec<u8> {
-    let mut buf = Vec::new();
+    // Pre-allocate based on address type: IPv4=7, IPv6=19, Domain=4+len
+    let cap = match addr {
+        Address::Ip(sa) => match sa.ip() {
+            std::net::IpAddr::V4(_) => 7,
+            std::net::IpAddr::V6(_) => 19,
+        },
+        Address::Domain(d, _) => 4 + d.len(),
+    };
+    let mut buf = Vec::with_capacity(cap);
     match addr {
         Address::Ip(sockaddr) => match sockaddr.ip() {
             std::net::IpAddr::V4(ipv4) => {
@@ -584,7 +596,6 @@ fn build_ss2022_request_buffer(
         server_key.is_some(),
     );
 
-    // --- Build wire buffer ---
     let mut buf = Vec::with_capacity(
         salt.len() + 16 + (header.len() + TAG_LEN) + (data_payload.len() + TAG_LEN),
     );

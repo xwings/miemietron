@@ -34,14 +34,14 @@ impl DnsCache {
 
     /// Return IP if entry exists and is not expired; remove expired entries on access.
     pub fn get(&self, domain: &str) -> Option<IpAddr> {
-        let key = domain.to_string();
-        if let Some(entry) = self.entries.get(&key) {
+        // DashMap supports Borrow<str> lookups — no String allocation needed.
+        if let Some(entry) = self.entries.get(domain) {
             if Instant::now() < entry.expires_at {
                 return Some(entry.ip);
             }
             // Entry expired — drop the ref before removing
             drop(entry);
-            self.entries.remove(&key);
+            self.entries.remove(domain);
         }
         None
     }

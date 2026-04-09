@@ -3,6 +3,7 @@
 //! Port of mihomo's delay history from `adapter/adapter.go` and
 //! the queue from `common/queue/queue.go`.
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use chrono::{DateTime, Utc};
@@ -26,13 +27,13 @@ pub struct DelayHistory {
 /// mihomo uses Put + manual Len/Pop to enforce the bound; we replicate that
 /// exact pattern here.
 pub struct DelayQueue {
-    inner: RwLock<Vec<DelayHistory>>,
+    inner: RwLock<VecDeque<DelayHistory>>,
 }
 
 impl DelayQueue {
     pub fn new() -> Self {
         Self {
-            inner: RwLock::new(Vec::with_capacity(MAX_HISTORY)),
+            inner: RwLock::new(VecDeque::with_capacity(MAX_HISTORY)),
         }
     }
 
@@ -43,9 +44,9 @@ impl DelayQueue {
     /// We replicate that exact behavior.
     pub fn put(&self, entry: DelayHistory) {
         let mut items = self.inner.write();
-        items.push(entry);
+        items.push_back(entry);
         if items.len() > MAX_HISTORY {
-            items.remove(0);
+            items.pop_front(); // O(1) instead of Vec::remove(0) O(n)
         }
     }
 
@@ -54,25 +55,21 @@ impl DelayQueue {
     #[allow(dead_code)]
     pub fn pop(&self) -> Option<DelayHistory> {
         let mut items = self.inner.write();
-        if items.is_empty() {
-            None
-        } else {
-            Some(items.remove(0))
-        }
+        items.pop_front()
     }
 
     /// Return the most recent entry (last in queue).
     /// Matches mihomo's `Queue.Last()`.
     pub fn last(&self) -> Option<DelayHistory> {
         let items = self.inner.read();
-        items.last().cloned()
+        items.back().cloned()
     }
 
     /// Return a copy of all entries.
     /// Matches mihomo's `Queue.Copy()`.
     pub fn copy(&self) -> Vec<DelayHistory> {
         let items = self.inner.read();
-        items.clone()
+        items.iter().cloned().collect()
     }
 
     /// Return the number of entries.

@@ -191,10 +191,9 @@ impl OutboundHandler for TrojanOutbound {
         target: &Address,
         dns: &DnsResolver,
     ) -> Result<Box<dyn ProxyStream>> {
-        // Step 1: TCP connect to the Trojan server.
         let tcp_stream = self.dial_server(dns).await?;
 
-        // Step 2: Check if Reality transport is configured.
+        // Check if Reality transport is configured.
         if let Some(reality_config) = self.build_reality_config()? {
             debug!("Trojan [{}]: using Reality transport", self.name);
 

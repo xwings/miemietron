@@ -52,35 +52,8 @@ impl LogBroadcast {
         let _ = self.sender.send(entry);
     }
 
-    #[allow(dead_code)]
-    pub fn info(&self, msg: &str) {
-        self.send("info", msg);
-    }
-
-    #[allow(dead_code)]
-    pub fn warning(&self, msg: &str) {
-        self.send("warning", msg);
-    }
-
-    #[allow(dead_code)]
-    pub fn error(&self, msg: &str) {
-        self.send("error", msg);
-    }
-
-    #[allow(dead_code)]
-    pub fn debug(&self, msg: &str) {
-        self.send("debug", msg);
-    }
-
     pub fn subscribe(&self) -> broadcast::Receiver<LogEntry> {
         self.sender.subscribe()
-    }
-
-    /// Get the last N log entries.
-    #[allow(dead_code)]
-    pub fn recent_entries(&self, max: usize) -> Vec<LogEntry> {
-        let recent = self.recent.read();
-        recent.iter().rev().take(max).rev().cloned().collect()
     }
 }
 

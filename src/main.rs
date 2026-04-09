@@ -231,12 +231,14 @@ impl AppState {
             &new_config.proxies,
             &new_config.proxy_groups,
             &new_config.proxy_providers,
-            new_config.routing_mark,
-            new_config.tcp_concurrent,
+            &proxy::ProxyGlobalOpts {
+                routing_mark: new_config.routing_mark,
+                tcp_concurrent: new_config.tcp_concurrent,
+                keep_alive_idle: new_config.keep_alive_idle,
+                keep_alive_interval: new_config.keep_alive_interval,
+                disable_keep_alive: new_config.disable_keep_alive,
+            },
             self.proxy_state_store.clone(),
-            new_config.keep_alive_idle,
-            new_config.keep_alive_interval,
-            new_config.disable_keep_alive,
         )
         .await?;
 
@@ -503,12 +505,14 @@ impl Engine {
                 &self.config.proxies,
                 &self.config.proxy_groups,
                 &self.config.proxy_providers,
-                self.config.routing_mark,
-                self.config.tcp_concurrent,
+                &proxy::ProxyGlobalOpts {
+                    routing_mark: self.config.routing_mark,
+                    tcp_concurrent: self.config.tcp_concurrent,
+                    keep_alive_idle: self.config.keep_alive_idle,
+                    keep_alive_interval: self.config.keep_alive_interval,
+                    disable_keep_alive: self.config.disable_keep_alive,
+                },
                 proxy_state_store.clone(),
-                self.config.keep_alive_idle,
-                self.config.keep_alive_interval,
-                self.config.disable_keep_alive,
             )
             .await?,
         );

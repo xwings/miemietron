@@ -1,9 +1,19 @@
 use anyhow::Result;
 use dashmap::DashMap;
+use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::Path;
 use std::sync::atomic::{AtomicU32, Ordering};
 use tracing::debug;
+
+/// Pre-compiled filter for fast domain bypass checks.
+/// Separates exact matches (O(1) HashSet lookup) from suffix patterns.
+struct CompiledFilter {
+    /// Exact domain matches (from bare patterns and `*.domain` patterns).
+    exact: HashSet<String>,
+    /// Suffix patterns to check with ends_with (from `*.` and `+` patterns).
+    suffixes: Vec<String>,
+}
 
 /// FakeIP pool: assigns fake IPs from a CIDR range to domains.
 pub struct FakeIpPool {
@@ -20,8 +30,8 @@ pub struct FakeIpPool {
     ip_to_domain: DashMap<IpAddr, String>,
     domain_to_ip: DashMap<String, IpAddr>,
 
-    // Filter
-    filter: Vec<String>,
+    // Filter (pre-compiled for fast matching)
+    compiled_filter: CompiledFilter,
     filter_mode: FilterMode,
 }
 
@@ -54,6 +64,23 @@ impl FakeIpPool {
             FilterMode::Blacklist
         };
 
+        // Pre-compile filter patterns into exact matches and suffix lists
+        // for O(1) exact lookups instead of O(n) iteration per query.
+        let mut exact = HashSet::with_capacity(filter.len());
+        let mut suffixes = Vec::new();
+        for f in filter {
+            if let Some(stripped) = f.strip_prefix("*.") {
+                // *.example.com → suffix ".example.com" + exact "example.com"
+                suffixes.push(format!(".{stripped}"));
+                exact.insert(stripped.to_string());
+            } else if let Some(suffix) = f.strip_prefix('+') {
+                suffixes.push(suffix.to_string());
+            } else {
+                exact.insert(f.clone());
+            }
+        }
+        let compiled_filter = CompiledFilter { exact, suffixes };
+
         Ok(Self {
             base: first, // First allocatable IP (base+4)
             size,
@@ -62,7 +89,7 @@ impl FakeIpPool {
             offset: AtomicU32::new(0),
             ip_to_domain: DashMap::new(),
             domain_to_ip: DashMap::new(),
-            filter: filter.to_vec(),
+            compiled_filter,
             filter_mode: mode,
         })
     }
@@ -122,16 +149,9 @@ impl FakeIpPool {
 
     /// Check if a domain should bypass fake IP (i.e., is filtered).
     pub fn should_bypass(&self, domain: &str) -> bool {
-        let matches_filter = self.filter.iter().any(|f| {
-            if f.starts_with("*.") {
-                let suffix = &f[1..]; // ".example.com"
-                domain.ends_with(suffix) || domain == &f[2..]
-            } else if let Some(suffix) = f.strip_prefix('+') {
-                domain.ends_with(suffix)
-            } else {
-                domain == f
-            }
-        });
+        // O(1) exact match check first, then O(n) suffix scan.
+        let matches_filter = self.compiled_filter.exact.contains(domain)
+            || self.compiled_filter.suffixes.iter().any(|s| domain.ends_with(s.as_str()));
 
         match self.filter_mode {
             FilterMode::Blacklist => matches_filter,

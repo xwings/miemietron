@@ -15,6 +15,15 @@ use std::sync::Arc;
 
 use crate::proxy::OutboundHandler;
 
+/// Health check options shared by URLTest and Fallback groups.
+pub struct HealthCheckOpts {
+    pub url: String,
+    pub interval_secs: u64,
+    pub max_failed_times: Option<u32>,
+    pub test_timeout: Option<u64>,
+    pub lazy: bool,
+}
+
 /// Trait implemented by all proxy group types.
 pub trait ProxyGroup: Send + Sync {
     /// The display name of this group.

@@ -300,7 +300,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncRead for SsrStream<T> {
     ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
 
-        // Step 1: Read the server's IV if we haven't yet.
+        // Read the server's IV if we haven't yet.
         if !this.iv_received {
             let iv_len = this.cipher_type.iv_len();
             while this.iv_buf.len() < iv_len {
@@ -332,7 +332,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncRead for SsrStream<T> {
             this.iv_received = true;
         }
 
-        // Step 2: Read encrypted data from inner, decrypt in-place.
+        // Read encrypted data from inner, decrypt in-place.
         let before = buf.filled().len();
         match Pin::new(&mut this.inner).poll_read(cx, buf) {
             Poll::Ready(Ok(())) => {

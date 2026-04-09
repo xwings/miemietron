@@ -231,28 +231,38 @@ pub struct ConnectionInfo {
     pub rule_payload: String,
 }
 
+/// Serialize IpAddr as string without intermediate String allocation.
+fn ser_ip<S: serde::Serializer>(ip: &std::net::IpAddr, s: S) -> Result<S::Ok, S::Error> {
+    s.collect_str(ip)
+}
+
+/// Serialize u16 as string without intermediate String allocation.
+fn ser_port_str<S: serde::Serializer>(port: &u16, s: S) -> Result<S::Ok, S::Error> {
+    s.collect_str(port)
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ConnectionMetadata {
-    pub network: String,
+    pub network: &'static str,
     #[serde(rename = "type")]
-    pub conn_type: String,
-    #[serde(rename = "sourceIP")]
-    pub source_ip: String,
-    #[serde(rename = "destinationIP")]
-    pub destination_ip: String,
-    #[serde(rename = "sourcePort")]
-    pub source_port: String,
-    #[serde(rename = "destinationPort")]
-    pub destination_port: String,
+    pub conn_type: &'static str,
+    #[serde(rename = "sourceIP", serialize_with = "ser_ip")]
+    pub source_ip: std::net::IpAddr,
+    #[serde(rename = "destinationIP", serialize_with = "ser_ip")]
+    pub destination_ip: std::net::IpAddr,
+    #[serde(rename = "sourcePort", serialize_with = "ser_port_str")]
+    pub source_port: u16,
+    #[serde(rename = "destinationPort", serialize_with = "ser_port_str")]
+    pub destination_port: u16,
     pub host: String,
     #[serde(rename = "dnsMode")]
-    pub dns_mode: String,
+    pub dns_mode: &'static str,
     #[serde(rename = "processPath")]
     pub process_path: String,
     #[serde(rename = "specialProxy")]
-    pub special_proxy: String,
+    pub special_proxy: &'static str,
     #[serde(rename = "specialRules")]
-    pub special_rules: String,
+    pub special_rules: &'static str,
     #[serde(rename = "remoteDestination")]
     pub remote_destination: String,
     pub dscp: u8,
@@ -287,7 +297,7 @@ impl ConnectionManager {
         src: SocketAddr,
         dst: SocketAddr,
         stream: impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
-        conn_type: &str,
+        conn_type: &'static str,
         host_override: Option<String>,
     ) -> Result<()> {
         self.handle_tcp_inner(src, dst, stream, conn_type, host_override)
@@ -301,7 +311,7 @@ impl ConnectionManager {
         src: SocketAddr,
         dst: SocketAddr,
         stream: impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
-        conn_type: &str,
+        conn_type: &'static str,
     ) -> Result<()> {
         self.handle_tcp_inner(src, dst, stream, conn_type, None)
             .await
@@ -312,7 +322,7 @@ impl ConnectionManager {
         src: SocketAddr,
         dst: SocketAddr,
         mut stream: impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
-        conn_type: &str,
+        conn_type: &'static str,
         host_override: Option<String>,
     ) -> Result<()> {
         // mihomo compat: fixMetadata — unmap IPv4-mapped IPv6 addresses.
@@ -363,16 +373,15 @@ impl ConnectionManager {
         // have repeatedly failed, unless forced. Matches mihomo's skipList check
         // in TCPSniff: `if count, ok := sd.skipList.Get(dst); ok && count > 5`.
         let sniff_cache = &self.app.sniff_cache;
-        let dst_key = format!("{}:{}", dst.ip(), dst.port());
         let skip_sniff = if !force_sniffer {
-            sniff_cache.should_skip(&dst_key)
+            sniff_cache.should_skip(dst)
         } else {
             false
         };
 
-        let mut peek_buf = vec![0u8; SNIFF_PEEK_SIZE];
+        let mut peek_arr = [0u8; SNIFF_PEEK_SIZE]; // stack, not heap
         let peeked_len = if sniff_override.is_some() && !skip_sniff {
-            match tokio::io::AsyncReadExt::read(&mut stream, &mut peek_buf).await {
+            match tokio::io::AsyncReadExt::read(&mut stream, &mut peek_arr).await {
                 Ok(n) => n,
                 Err(e) => {
                     debug!("Sniff peek read failed: {}", e);
@@ -381,11 +390,12 @@ impl ConnectionManager {
             }
         } else {
             if skip_sniff && sniff_override.is_some() {
-                debug!("[Sniffer] Skip sniffing[{}] due to multiple failures", dst_key);
+                debug!("[Sniffer] Skip sniffing[{}] due to multiple failures", dst);
             }
             0
         };
-        peek_buf.truncate(peeked_len);
+        // Only heap-allocate the actual peeked bytes (not the full 1KB buffer)
+        let peek_buf = peek_arr[..peeked_len].to_vec();
 
         let mut sniff_host = String::new();
         let mut sniff_succeeded = false;
@@ -419,11 +429,9 @@ impl ConnectionManager {
         // On failure: increment failure counter (`sd.cacheSniffFailed(metadata)`).
         if sniff_override.is_some() && !skip_sniff {
             if sniff_succeeded {
-                sniff_cache.record_success(&dst_key);
+                sniff_cache.record_success(dst);
             } else if peeked_len > 0 && !force_sniffer {
-                // Only record failure if we actually tried sniffing (peeked data)
-                // and sniffing failed, matching mihomo's `if err != nil` path.
-                sniff_cache.record_failure(&dst_key);
+                sniff_cache.record_failure(dst);
             }
         }
 
@@ -489,11 +497,11 @@ impl ConnectionManager {
             src_ip: Some(src.ip()),
             dst_port: dst.port(),
             src_port: src.port(),
-            network: "tcp".to_string(),
+            network: "tcp",
             process_name: proc_name.clone(),
             process_path: proc_path.clone(),
             in_port,
-            in_type: Some(conn_type.to_string()),
+            in_type: Some(conn_type),
             ..Default::default()
         };
 
@@ -695,29 +703,25 @@ impl ConnectionManager {
             }
         };
 
-        let conn_id = uuid::Uuid::new_v4().to_string();
+        let conn_id: Arc<str> = uuid::Uuid::new_v4().to_string().into();
         let up_counter = Arc::new(AtomicU64::new(0));
         let down_counter = Arc::new(AtomicU64::new(0));
 
         // Register connection in the DashMap
         let conn_info = ConnectionInfo {
-            id: conn_id.clone(),
+            id: conn_id.to_string(),
             metadata: ConnectionMetadata {
-                network: "tcp".to_string(),
-                conn_type: conn_type.to_string(),
-                source_ip: src.ip().to_string(),
-                destination_ip: dst.ip().to_string(),
-                source_port: src.port().to_string(),
-                destination_port: dst.port().to_string(),
+                network: "tcp",
+                conn_type,
+                source_ip: src.ip(),
+                destination_ip: dst.ip(),
+                source_port: src.port(),
+                destination_port: dst.port(),
                 host: domain.clone().unwrap_or_default(),
-                dns_mode: if domain.is_some() {
-                    "fake-ip".to_string()
-                } else {
-                    String::new()
-                },
+                dns_mode: if domain.is_some() { "fake-ip" } else { "" },
                 process_path: proc_path.unwrap_or_default(),
-                special_proxy: String::new(),
-                special_rules: String::new(),
+                special_proxy: "",
+                special_rules: "",
                 remote_destination: target.to_string(),
                 dscp: 0,
                 sniff_host,
@@ -729,10 +733,11 @@ impl ConnectionManager {
             rule: rule_str,
             rule_payload,
         };
-        self.connections.insert(conn_id.clone(), conn_info);
+        let conn_id_str = conn_id.to_string();
+        self.connections.insert(conn_id_str.clone(), conn_info);
         // Store live counters so the API can read real-time byte counts
         self.counters
-            .insert(conn_id.clone(), (up_counter.clone(), down_counter.clone()));
+            .insert(conn_id_str.clone(), (up_counter.clone(), down_counter.clone()));
         stats.add_connection();
 
         // Wrap only the remote side with CountingStream to avoid double-counting
@@ -751,7 +756,7 @@ impl ConnectionManager {
             relay_bidirectional(local_plain, remote_counted).await;
         });
         self.relay_handles
-            .insert(conn_id.clone(), relay_handle.abort_handle());
+            .insert(conn_id_str.clone(), relay_handle.abort_handle());
 
         // Wait for the relay to complete (normally or via abort from close_connection)
         let _ = relay_handle.await;
@@ -762,9 +767,9 @@ impl ConnectionManager {
         stats.add_upload(up);
         stats.add_download(down);
         stats.remove_connection();
-        self.relay_handles.remove(&conn_id);
-        self.counters.remove(&conn_id);
-        self.connections.remove(&conn_id);
+        self.relay_handles.remove(&*conn_id);
+        self.counters.remove(&*conn_id);
+        self.connections.remove(&*conn_id);
 
         Ok(())
     }
@@ -792,11 +797,11 @@ impl ConnectionManager {
             src_ip: Some(src.ip()),
             dst_port: dst.port(),
             src_port: src.port(),
-            network: "udp".to_string(),
+            network: "udp",
             process_name: None,
             process_path: None,
             in_port: Some(config.tproxy_port),
-            in_type: Some("tproxy".to_string()),
+            in_type: Some("tproxy"),
             ..Default::default()
         };
 
@@ -1041,17 +1046,17 @@ mod tests {
         let info = ConnectionInfo {
             id: "test-id".to_string(),
             metadata: ConnectionMetadata {
-                network: "tcp".to_string(),
-                conn_type: "tun".to_string(),
-                source_ip: "192.168.1.1".to_string(),
-                destination_ip: "1.2.3.4".to_string(),
-                source_port: "12345".to_string(),
-                destination_port: "443".to_string(),
+                network: "tcp",
+                conn_type: "tun",
+                source_ip: "192.168.1.1".parse().unwrap(),
+                destination_ip: "1.2.3.4".parse().unwrap(),
+                source_port: 12345,
+                destination_port: 443,
                 host: "example.com".to_string(),
-                dns_mode: "fake-ip".to_string(),
+                dns_mode: "fake-ip",
                 process_path: "".to_string(),
-                special_proxy: "".to_string(),
-                special_rules: "".to_string(),
+                special_proxy: "",
+                special_rules: "",
                 remote_destination: "example.com:443".to_string(),
                 dscp: 0,
                 sniff_host: "example.com".to_string(),

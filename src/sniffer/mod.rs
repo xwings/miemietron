@@ -22,8 +22,8 @@ const SNIFF_SKIP_THRESHOLD: u8 = 5;
 
 pub struct SniffCache {
     /// Destinations that failed sniffing — skip for SNIFF_SKIP_TTL seconds.
-    /// Key is "ip:port" string, value is (failure_count, first_recorded_time).
-    skip_list: DashMap<String, (AtomicU8, Instant)>,
+    /// Uses SocketAddr key to avoid format!() allocation per connection.
+    skip_list: DashMap<std::net::SocketAddr, (AtomicU8, Instant)>,
 }
 
 impl Default for SniffCache {
@@ -41,13 +41,12 @@ impl SniffCache {
 
     /// Check if a destination should skip sniffing.
     /// mihomo compat: returns true only if count > 5 AND entry is within TTL.
-    pub fn should_skip(&self, dst: &str) -> bool {
-        if let Some(entry) = self.skip_list.get(dst) {
+    pub fn should_skip(&self, dst: std::net::SocketAddr) -> bool {
+        if let Some(entry) = self.skip_list.get(&dst) {
             let (count, recorded) = entry.value();
             if recorded.elapsed() >= SNIFF_SKIP_TTL {
-                // TTL expired — remove stale entry
                 drop(entry);
-                self.skip_list.remove(dst);
+                self.skip_list.remove(&dst);
                 return false;
             }
             return count.load(Ordering::Relaxed) > SNIFF_SKIP_THRESHOLD;
@@ -57,13 +56,12 @@ impl SniffCache {
 
     /// Record a failed sniff attempt.
     /// mihomo compat: increments counter up to 6, matching `cacheSniffFailed`.
-    pub fn record_failure(&self, dst: &str) {
-        if let Some(entry) = self.skip_list.get(dst) {
+    pub fn record_failure(&self, dst: std::net::SocketAddr) {
+        if let Some(entry) = self.skip_list.get(&dst) {
             let (count, recorded) = entry.value();
             if recorded.elapsed() >= SNIFF_SKIP_TTL {
-                // TTL expired — reset
                 drop(entry);
-                self.skip_list.insert(dst.to_string(), (AtomicU8::new(1), Instant::now()));
+                self.skip_list.insert(dst, (AtomicU8::new(1), Instant::now()));
             } else {
                 let old = count.load(Ordering::Relaxed);
                 if old <= SNIFF_SKIP_THRESHOLD {
@@ -72,14 +70,14 @@ impl SniffCache {
             }
         } else {
             self.skip_list
-                .insert(dst.to_string(), (AtomicU8::new(1), Instant::now()));
+                .insert(dst, (AtomicU8::new(1), Instant::now()));
         }
     }
 
     /// Remove a destination from the skip list (called on successful sniff).
     /// mihomo compat: `sd.skipList.Delete(dst)` after successful sniffing.
-    pub fn record_success(&self, dst: &str) {
-        self.skip_list.remove(dst);
+    pub fn record_success(&self, dst: std::net::SocketAddr) {
+        self.skip_list.remove(&dst);
     }
 }
 
@@ -321,7 +319,10 @@ pub fn extract_tls_sni(data: &[u8]) -> Option<String> {
                 sni_pos += 3;
 
                 if name_type == 0 && sni_pos + name_len <= ch.len() {
-                    return String::from_utf8(ch[sni_pos..sni_pos + name_len].to_vec()).ok();
+                    // Use from_utf8 on slice to avoid .to_vec() allocation
+                    return std::str::from_utf8(&ch[sni_pos..sni_pos + name_len])
+                        .ok()
+                        .map(|s| s.to_string());
                 }
 
                 sni_pos += name_len;
@@ -337,6 +338,11 @@ pub fn extract_tls_sni(data: &[u8]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::SocketAddr;
+
+    fn addr1() -> SocketAddr { "1.2.3.4:443".parse().unwrap() }
+    fn addr2() -> SocketAddr { "5.6.7.8:443".parse().unwrap() }
+    fn addr3() -> SocketAddr { "1.2.3.4:80".parse().unwrap() }
 
     /// Build a minimal TLS 1.2 ClientHello with a single SNI extension.
     ///
@@ -631,14 +637,14 @@ mod tests {
     #[test]
     fn sniff_cache_new_dst_not_skipped() {
         let cache = SniffCache::new();
-        assert!(!cache.should_skip("1.2.3.4:443"));
+        assert!(!cache.should_skip(addr1()));
     }
 
     #[test]
     fn sniff_cache_single_failure_not_skipped() {
         let cache = SniffCache::new();
-        cache.record_failure("1.2.3.4:443");
-        assert!(!cache.should_skip("1.2.3.4:443"));
+        cache.record_failure(addr1());
+        assert!(!cache.should_skip(addr1()));
     }
 
     #[test]
@@ -646,9 +652,9 @@ mod tests {
         // mihomo skips only when count > 5, so 5 failures should NOT skip
         let cache = SniffCache::new();
         for _ in 0..5 {
-            cache.record_failure("1.2.3.4:443");
+            cache.record_failure(addr1());
         }
-        assert!(!cache.should_skip("1.2.3.4:443"));
+        assert!(!cache.should_skip(addr1()));
     }
 
     #[test]
@@ -656,32 +662,32 @@ mod tests {
         // mihomo: counter goes 1,2,3,4,5,6 and check is count > 5
         let cache = SniffCache::new();
         for _ in 0..6 {
-            cache.record_failure("1.2.3.4:443");
+            cache.record_failure(addr1());
         }
-        assert!(cache.should_skip("1.2.3.4:443"));
+        assert!(cache.should_skip(addr1()));
     }
 
     #[test]
     fn sniff_cache_success_clears_entry() {
         let cache = SniffCache::new();
         for _ in 0..6 {
-            cache.record_failure("1.2.3.4:443");
+            cache.record_failure(addr1());
         }
-        assert!(cache.should_skip("1.2.3.4:443"));
+        assert!(cache.should_skip(addr1()));
 
-        cache.record_success("1.2.3.4:443");
-        assert!(!cache.should_skip("1.2.3.4:443"));
+        cache.record_success(addr1());
+        assert!(!cache.should_skip(addr1()));
     }
 
     #[test]
     fn sniff_cache_different_destinations_independent() {
         let cache = SniffCache::new();
         for _ in 0..6 {
-            cache.record_failure("1.2.3.4:443");
+            cache.record_failure(addr1());
         }
-        assert!(cache.should_skip("1.2.3.4:443"));
-        assert!(!cache.should_skip("5.6.7.8:443"));
-        assert!(!cache.should_skip("1.2.3.4:80"));
+        assert!(cache.should_skip(addr1()));
+        assert!(!cache.should_skip(addr2()));
+        assert!(!cache.should_skip(addr3()));
     }
 
     #[test]
@@ -689,10 +695,10 @@ mod tests {
         // mihomo: `if oldValue <= 5 { oldValue++ }` — caps at 6
         let cache = SniffCache::new();
         for _ in 0..20 {
-            cache.record_failure("1.2.3.4:443");
+            cache.record_failure(addr1());
         }
         // Should still be skipped (counter capped, not overflowed)
-        assert!(cache.should_skip("1.2.3.4:443"));
+        assert!(cache.should_skip(addr1()));
     }
 
     #[test]
@@ -702,9 +708,9 @@ mod tests {
         // that a newly inserted entry is not expired.
         let cache = SniffCache::new();
         for _ in 0..6 {
-            cache.record_failure("1.2.3.4:443");
+            cache.record_failure(addr1());
         }
         // Entry was just created, should still be valid
-        assert!(cache.should_skip("1.2.3.4:443"));
+        assert!(cache.should_skip(addr1()));
     }
 }

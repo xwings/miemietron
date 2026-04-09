@@ -38,11 +38,11 @@ pub struct RuleMetadata {
     pub src_ip: Option<IpAddr>,
     pub dst_port: u16,
     pub src_port: u16,
-    pub network: String, // "tcp" or "udp"
+    pub network: &'static str, // "tcp" or "udp" — avoids heap allocation
     pub process_name: Option<String>,
     pub process_path: Option<String>,
     pub in_port: Option<u16>,
-    pub in_type: Option<String>,
+    pub in_type: Option<&'static str>, // "http-proxy", "socks5", etc.
     pub in_user: Option<String>,
     pub in_name: Option<String>,
     pub uid: Option<u32>,
@@ -58,12 +58,58 @@ pub struct ParsedRule {
     pub params: Vec<String>,
 }
 
+/// Pre-parsed CIDR for O(1) bitwise matching (avoids string parsing per match).
+enum PreParsedCidr {
+    V4 { masked_net: u32, mask: u32 },
+    V6 { masked_net: u128, mask: u128 },
+}
+
+impl PreParsedCidr {
+    /// Parse a CIDR string into pre-computed mask + masked network.
+    fn parse(cidr: &str) -> Option<Self> {
+        let (addr_str, prefix_str) = cidr.split_once('/')?;
+        let prefix_len: u8 = prefix_str.parse().ok()?;
+        if let Ok(v4) = addr_str.parse::<std::net::Ipv4Addr>() {
+            let mask = if prefix_len == 0 { 0 } else if prefix_len >= 32 { !0u32 } else { !((1u32 << (32 - prefix_len)) - 1) };
+            Some(PreParsedCidr::V4 { masked_net: u32::from(v4) & mask, mask })
+        } else if let Ok(v6) = addr_str.parse::<std::net::Ipv6Addr>() {
+            let mask = if prefix_len == 0 { 0 } else if prefix_len >= 128 { !0u128 } else { !((1u128 << (128 - prefix_len)) - 1) };
+            Some(PreParsedCidr::V6 { masked_net: u128::from(v6) & mask, mask })
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    fn matches(&self, ip: &IpAddr) -> bool {
+        match (self, ip) {
+            (PreParsedCidr::V4 { masked_net, mask }, IpAddr::V4(v4)) => {
+                (u32::from(*v4) & mask) == *masked_net
+            }
+            (PreParsedCidr::V6 { masked_net, mask }, IpAddr::V6(v6)) => {
+                (u128::from(*v6) & mask) == *masked_net
+            }
+            _ => false,
+        }
+    }
+}
+
 pub struct RuleEngine {
     rules: Vec<ParsedRule>,
     rule_stats: Vec<RuleStats>,
     geoip_matcher: geoip::GeoIpMatcher,
     geosite_matcher: geosite::GeoSiteMatcher,
     sub_rules: HashMap<String, Vec<ParsedRule>>,
+    /// Pre-compiled regexes for DOMAIN-REGEX rules (avoids Regex::new per match).
+    compiled_regexes: HashMap<String, Regex>,
+    /// Pre-parsed CIDRs for IP-CIDR/IP-CIDR6/SRC-IP-CIDR rules (avoids string parsing per match).
+    parsed_cidrs: HashMap<usize, PreParsedCidr>,
+    /// Pre-parsed port ranges for DST-PORT/SRC-PORT/IN-PORT rules.
+    parsed_ports: HashMap<usize, Vec<(u16, u16)>>,
+    /// Pre-parsed u32 values for IP-ASN/SRC-IP-ASN/UID rules.
+    parsed_u32s: HashMap<usize, u32>,
+    /// Pre-parsed u8 values for DSCP rules.
+    parsed_u8s: HashMap<usize, u8>,
 }
 
 impl RuleEngine {
@@ -157,8 +203,8 @@ impl RuleEngine {
                         let cleaned = payload
                             .trim_start_matches("'")
                             .trim_end_matches("'");
-                        if cleaned.starts_with("+.") {
-                            let suffix = cleaned[2..].to_lowercase();
+                        if let Some(stripped) = cleaned.strip_prefix("+.") {
+                            let suffix = stripped.to_lowercase();
                             if !suffix.is_empty() {
                                 provider_rules
                                     .entry(name.clone())
@@ -170,8 +216,8 @@ impl RuleEngine {
                                         params: vec![],
                                     });
                             }
-                        } else if cleaned.starts_with('.') {
-                            let suffix = cleaned[1..].to_lowercase();
+                        } else if let Some(stripped) = cleaned.strip_prefix('.') {
+                            let suffix = stripped.to_lowercase();
                             if !suffix.is_empty() {
                                 // Dot-prefix means subdomains only — DOMAIN-SUFFIX
                                 // matches "sub.example.com" but NOT "example.com" itself.
@@ -295,12 +341,68 @@ impl RuleEngine {
             })
             .collect();
 
+        // Pre-compile regex patterns for DOMAIN-REGEX rules to avoid
+        // Regex::new() on every connection match (compilation is expensive).
+        let mut compiled_regexes = HashMap::new();
+        for rule in &rules {
+            if rule.rule_type == "DOMAIN-REGEX" && !compiled_regexes.contains_key(&rule.payload) {
+                // mihomo compat: domain_regex.go uses regexp2.IgnoreCase flag.
+                // Rust regex equivalent: (?i) prefix for case-insensitive matching.
+                let pattern = if rule.payload.starts_with("(?i)") {
+                    rule.payload.clone()
+                } else {
+                    format!("(?i){}", &rule.payload)
+                };
+                if let Ok(re) = Regex::new(&pattern) {
+                    compiled_regexes.insert(rule.payload.clone(), re);
+                }
+            }
+        }
+
+        // Pre-parse CIDR and port rules for O(1) matching instead of
+        // per-connection string parsing. With 20k rules this is massive.
+        let mut parsed_cidrs = HashMap::new();
+        let mut parsed_ports = HashMap::new();
+        let mut parsed_u32s = HashMap::new(); // IP-ASN, SRC-IP-ASN, UID
+        let mut parsed_u8s = HashMap::new();  // DSCP
+        for (i, rule) in rules.iter().enumerate() {
+            match rule.rule_type.as_str() {
+                "IP-CIDR" | "IP-CIDR6" | "SRC-IP-CIDR" => {
+                    if let Some(cidr) = PreParsedCidr::parse(&rule.payload) {
+                        parsed_cidrs.insert(i, cidr);
+                    }
+                }
+                "DST-PORT" | "SRC-PORT" | "IN-PORT" => {
+                    let ranges = parse_port_spec(&rule.payload);
+                    if !ranges.is_empty() {
+                        parsed_ports.insert(i, ranges);
+                    }
+                }
+                "IP-ASN" | "SRC-IP-ASN" | "UID" => {
+                    if let Ok(v) = rule.payload.parse::<u32>() {
+                        parsed_u32s.insert(i, v);
+                    }
+                }
+                "DSCP" => {
+                    if let Ok(v) = rule.payload.parse::<u8>() {
+                        parsed_u8s.insert(i, v);
+                    }
+                }
+                _ => {}
+            }
+        }
+
         Ok(Self {
             rules,
             rule_stats,
             geoip_matcher,
             geosite_matcher,
             sub_rules: HashMap::new(),
+            compiled_regexes,
+            parsed_cidrs,
+            parsed_ports,
+            parsed_u32s,
+            parsed_u8s,
         })
     }
 
@@ -322,13 +424,11 @@ impl RuleEngine {
     /// This is used by the connection manager to populate the `rule` and
     /// `rulePayload` fields in the connections API.
     pub fn match_rules_detailed(&self, metadata: &RuleMetadata) -> (Action, String, String) {
-        // Evaluate rules in CONFIG ORDER — first match wins.
-        // This matches mihomo behavior where rule priority is determined by
-        // position in the YAML file, not by rule type.
-        //
-        // We still use indexed data structures (domain trie, CIDR table, etc.)
-        // for O(1) lookup within each rule, but the evaluation order follows
-        // the original config sequence.
+        // Pre-lowercase domain once for all domain-based rules.
+        // Previously each domain rule arm called to_lowercase() individually,
+        // resulting in 5+ allocations per connection through the rule chain.
+        let domain_lower = metadata.domain.as_ref().map(|d| d.to_lowercase());
+
         for (i, rule) in self.rules.iter().enumerate() {
             // mihomo compat: skip disabled rules (toggled via PATCH /rules/disable)
             if self
@@ -339,7 +439,7 @@ impl RuleEngine {
                 continue;
             }
 
-            if let Some(action) = self.match_single_rule(rule, metadata) {
+            if let Some(action) = self.match_single_rule(i, rule, metadata, domain_lower.as_deref()) {
                 if let Some(stats) = self.rule_stats.get(i) {
                     stats.hit_count.fetch_add(1, Ordering::Relaxed);
                 }
@@ -356,7 +456,7 @@ impl RuleEngine {
         self.match_rules_detailed(metadata).0
     }
 
-    fn match_single_rule(&self, rule: &ParsedRule, metadata: &RuleMetadata) -> Option<Action> {
+    fn match_single_rule(&self, rule_idx: usize, rule: &ParsedRule, metadata: &RuleMetadata, domain_lower: Option<&str>) -> Option<Action> {
         match rule.rule_type.as_str() {
             "MATCH" => Some(target_to_action(&rule.target)),
 
@@ -369,15 +469,21 @@ impl RuleEngine {
             }
 
             "SRC-PORT" => {
-                if port_matches(metadata.src_port, &rule.payload) {
+                let matched = if let Some(ranges) = self.parsed_ports.get(&rule_idx) {
+                    port_matches_pre(metadata.src_port, ranges)
+                } else {
+                    port_matches(metadata.src_port, &rule.payload)
+                };
+                if matched {
                     return Some(target_to_action(&rule.target));
                 }
                 None
             }
 
             "PROCESS-NAME" => {
+                // mihomo compat: process.go uses strings.EqualFold (case-insensitive)
                 if let Some(ref name) = metadata.process_name {
-                    if name == &rule.payload {
+                    if name.eq_ignore_ascii_case(&rule.payload) {
                         return Some(target_to_action(&rule.target));
                     }
                 }
@@ -385,8 +491,9 @@ impl RuleEngine {
             }
 
             "PROCESS-PATH" => {
+                // mihomo compat: process.go uses strings.EqualFold (case-insensitive)
                 if let Some(ref path) = metadata.process_path {
-                    if path == &rule.payload {
+                    if path.eq_ignore_ascii_case(&rule.payload) {
                         return Some(target_to_action(&rule.target));
                     }
                 }
@@ -418,8 +525,8 @@ impl RuleEngine {
             }
 
             "GEOSITE" => {
-                if let Some(ref domain) = metadata.domain {
-                    if self.geosite_matcher.lookup(domain, &rule.payload) {
+                if let Some(d) = domain_lower {
+                    if self.geosite_matcher.lookup(d, &rule.payload) {
                         return Some(target_to_action(&rule.target));
                     }
                 }
@@ -428,7 +535,12 @@ impl RuleEngine {
 
             "SRC-IP-CIDR" => {
                 if let Some(ref ip) = metadata.src_ip {
-                    if check_ip_in_cidr(ip, &rule.payload) {
+                    let matched = if let Some(cidr) = self.parsed_cidrs.get(&rule_idx) {
+                        cidr.matches(ip)
+                    } else {
+                        check_ip_in_cidr(ip, &rule.payload)
+                    };
+                    if matched {
                         return Some(target_to_action(&rule.target));
                     }
                 }
@@ -436,11 +548,15 @@ impl RuleEngine {
             }
 
             "DOMAIN-REGEX" => {
-                // Basic pattern matching without full regex dependency.
-                // Supports simple patterns: "^" (starts_with), "$" (ends_with),
-                // ".*" (any substring). For full regex, add the `regex` crate.
-                if let Some(ref domain) = metadata.domain {
-                    if match_domain_regex(&rule.payload, domain) {
+                if let Some(d) = domain_lower {
+                    // Use pre-compiled regex from cache (avoids Regex::new per match)
+                    let matched = if let Some(re) = self.compiled_regexes.get(&rule.payload) {
+                        re.is_match(d)
+                    } else {
+                        // Fallback for dynamically added patterns
+                        match_domain_regex(&rule.payload, d)
+                    };
+                    if matched {
                         return Some(target_to_action(&rule.target));
                     }
                 }
@@ -451,7 +567,7 @@ impl RuleEngine {
                 // Syntax: AND,((RULE1),(RULE2),...),target
                 // The payload contains the nested conditions like
                 // "((DOMAIN-SUFFIX,google.com),(NETWORK,udp))"
-                if match_logical_and(&rule.payload, metadata, self) {
+                if match_logical_and(&rule.payload, metadata, self, domain_lower) {
                     Some(target_to_action(&rule.target))
                 } else {
                     None
@@ -459,7 +575,7 @@ impl RuleEngine {
             }
 
             "OR" => {
-                if match_logical_or(&rule.payload, metadata, self) {
+                if match_logical_or(&rule.payload, metadata, self, domain_lower) {
                     Some(target_to_action(&rule.target))
                 } else {
                     None
@@ -468,7 +584,7 @@ impl RuleEngine {
 
             "NOT" => {
                 // NOT,((RULE)),target -- true if the inner rule does NOT match
-                if match_logical_not(&rule.payload, metadata, self) {
+                if match_logical_not(&rule.payload, metadata, self, domain_lower) {
                     Some(target_to_action(&rule.target))
                 } else {
                     None
@@ -476,8 +592,7 @@ impl RuleEngine {
             }
 
             "DOMAIN" => {
-                if let Some(ref domain) = metadata.domain {
-                    let d = domain.to_lowercase();
+                if let Some(d) = domain_lower {
                     if d == rule.payload {
                         return Some(target_to_action(&rule.target));
                     }
@@ -486,10 +601,9 @@ impl RuleEngine {
             }
 
             "DOMAIN-SUFFIX" => {
-                if let Some(ref domain) = metadata.domain {
-                    let d = domain.to_lowercase();
+                if let Some(d) = domain_lower {
                     let s = &rule.payload; // already lowercase from parse time
-                    if d == *s
+                    if d == s.as_str()
                         || (d.len() > s.len()
                             && d.ends_with(s.as_str())
                             && d.as_bytes()[d.len() - s.len() - 1] == b'.')
@@ -503,8 +617,7 @@ impl RuleEngine {
             // mihomo compat: ".example.com" in domain-behavior providers
             // matches subdomains only (not the domain itself)
             "DOMAIN-SUFFIX-STRICT" => {
-                if let Some(ref domain) = metadata.domain {
-                    let d = domain.to_lowercase();
+                if let Some(d) = domain_lower {
                     let s = &rule.payload; // already lowercase from parse time
                     if d.len() > s.len()
                         && d.ends_with(s.as_str())
@@ -517,8 +630,8 @@ impl RuleEngine {
             }
 
             "DOMAIN-KEYWORD" => {
-                if let Some(ref domain) = metadata.domain {
-                    if domain.to_lowercase().contains(&rule.payload[..]) {
+                if let Some(d) = domain_lower {
+                    if d.contains(&rule.payload[..]) {
                         return Some(target_to_action(&rule.target));
                     }
                 }
@@ -526,8 +639,8 @@ impl RuleEngine {
             }
 
             "DOMAIN-WILDCARD" => {
-                if let Some(ref domain) = metadata.domain {
-                    if wildcard_match(&rule.payload, &domain.to_lowercase()) {
+                if let Some(d) = domain_lower {
+                    if wildcard_match(&rule.payload, d) {
                         return Some(target_to_action(&rule.target));
                     }
                 }
@@ -537,10 +650,10 @@ impl RuleEngine {
             "IP-ASN" => {
                 if let Some(ref ip) = metadata.dst_ip {
                     if let Some(asn) = self.geoip_matcher.lookup_asn(ip) {
-                        if let Ok(rule_asn) = rule.payload.parse::<u32>() {
-                            if asn == rule_asn {
-                                return Some(target_to_action(&rule.target));
-                            }
+                        let rule_asn = self.parsed_u32s.get(&rule_idx).copied()
+                            .or_else(|| rule.payload.parse().ok());
+                        if rule_asn == Some(asn) {
+                            return Some(target_to_action(&rule.target));
                         }
                     }
                 }
@@ -550,10 +663,10 @@ impl RuleEngine {
             "SRC-IP-ASN" => {
                 if let Some(ref ip) = metadata.src_ip {
                     if let Some(asn) = self.geoip_matcher.lookup_asn(ip) {
-                        if let Ok(rule_asn) = rule.payload.parse::<u32>() {
-                            if asn == rule_asn {
-                                return Some(target_to_action(&rule.target));
-                            }
+                        let rule_asn = self.parsed_u32s.get(&rule_idx).copied()
+                            .or_else(|| rule.payload.parse().ok());
+                        if rule_asn == Some(asn) {
+                            return Some(target_to_action(&rule.target));
                         }
                     }
                 }
@@ -579,8 +692,9 @@ impl RuleEngine {
             }
 
             "PROCESS-NAME-WILDCARD" => {
+                // mihomo compat: process.go lowercases both pattern and target
                 if let Some(ref name) = metadata.process_name {
-                    if wildcard_match(&rule.payload, name) {
+                    if wildcard_match(&rule.payload.to_lowercase(), &name.to_lowercase()) {
                         return Some(target_to_action(&rule.target));
                     }
                 }
@@ -588,8 +702,9 @@ impl RuleEngine {
             }
 
             "PROCESS-PATH-WILDCARD" => {
+                // mihomo compat: process.go lowercases both pattern and target
                 if let Some(ref path) = metadata.process_path {
-                    if wildcard_match(&rule.payload, path) {
+                    if wildcard_match(&rule.payload.to_lowercase(), &path.to_lowercase()) {
                         return Some(target_to_action(&rule.target));
                     }
                 }
@@ -598,7 +713,13 @@ impl RuleEngine {
 
             "IP-CIDR" | "IP-CIDR6" => {
                 if let Some(ref ip) = metadata.dst_ip {
-                    if check_ip_in_cidr(ip, &rule.payload) {
+                    // Use pre-parsed CIDR for O(1) bitwise match
+                    let matched = if let Some(cidr) = self.parsed_cidrs.get(&rule_idx) {
+                        cidr.matches(ip)
+                    } else {
+                        check_ip_in_cidr(ip, &rule.payload)
+                    };
+                    if matched {
                         return Some(target_to_action(&rule.target));
                     }
                 }
@@ -606,7 +727,12 @@ impl RuleEngine {
             }
 
             "DST-PORT" => {
-                if port_matches(metadata.dst_port, &rule.payload) {
+                let matched = if let Some(ranges) = self.parsed_ports.get(&rule_idx) {
+                    port_matches_pre(metadata.dst_port, ranges)
+                } else {
+                    port_matches(metadata.dst_port, &rule.payload)
+                };
+                if matched {
                     return Some(target_to_action(&rule.target));
                 }
                 None
@@ -614,7 +740,12 @@ impl RuleEngine {
 
             "IN-PORT" => {
                 if let Some(in_port) = metadata.in_port {
-                    if port_matches(in_port, &rule.payload) {
+                    let matched = if let Some(ranges) = self.parsed_ports.get(&rule_idx) {
+                        port_matches_pre(in_port, ranges)
+                    } else {
+                        port_matches(in_port, &rule.payload)
+                    };
+                    if matched {
                         return Some(target_to_action(&rule.target));
                     }
                 }
@@ -622,7 +753,7 @@ impl RuleEngine {
             }
 
             "IN-TYPE" => {
-                if let Some(ref in_type) = metadata.in_type {
+                if let Some(in_type) = metadata.in_type {
                     if in_type.eq_ignore_ascii_case(&rule.payload) {
                         return Some(target_to_action(&rule.target));
                     }
@@ -650,10 +781,10 @@ impl RuleEngine {
 
             "UID" => {
                 if let Some(uid) = metadata.uid {
-                    if let Ok(rule_uid) = rule.payload.parse::<u32>() {
-                        if uid == rule_uid {
-                            return Some(target_to_action(&rule.target));
-                        }
+                    let rule_uid = self.parsed_u32s.get(&rule_idx).copied()
+                        .or_else(|| rule.payload.parse().ok());
+                    if rule_uid == Some(uid) {
+                        return Some(target_to_action(&rule.target));
                     }
                 }
                 None
@@ -661,10 +792,10 @@ impl RuleEngine {
 
             "DSCP" => {
                 if let Some(dscp) = metadata.dscp {
-                    if let Ok(rule_dscp) = rule.payload.parse::<u8>() {
-                        if dscp == rule_dscp {
-                            return Some(target_to_action(&rule.target));
-                        }
+                    let rule_dscp = self.parsed_u8s.get(&rule_idx).copied()
+                        .or_else(|| rule.payload.parse().ok());
+                    if rule_dscp == Some(dscp) {
+                        return Some(target_to_action(&rule.target));
                     }
                 }
                 None
@@ -676,7 +807,7 @@ impl RuleEngine {
                 // return its action. Otherwise fall through.
                 if let Some(sub_rules) = self.sub_rules.get(&rule.payload) {
                     for sub_rule in sub_rules {
-                        if let Some(action) = self.match_single_rule(sub_rule, metadata) {
+                        if let Some(action) = self.match_single_rule(usize::MAX, sub_rule, metadata, domain_lower) {
                             return Some(action);
                         }
                     }
@@ -779,9 +910,9 @@ fn parse_rule_payload(rule_str: &str, need_target: bool) -> Result<ParsedRule> {
 
     let mut payload = items[1].to_string();
 
-    // Pre-lowercase domain payloads
+    // Pre-lowercase domain payloads (NOT regex — regex uses case-insensitive flag)
     match rule_type.as_str() {
-        "DOMAIN" | "DOMAIN-SUFFIX" | "DOMAIN-KEYWORD" | "DOMAIN-REGEX" => {
+        "DOMAIN" | "DOMAIN-SUFFIX" | "DOMAIN-KEYWORD" => {
             payload = payload.to_lowercase();
         }
         _ => {}
@@ -865,6 +996,7 @@ fn parse_logical_rule(rule_str: &str) -> Result<ParsedRule> {
     })
 }
 
+#[inline]
 fn target_to_action(target: &str) -> Action {
     match target {
         "DIRECT" => Action::Direct,
@@ -906,12 +1038,23 @@ fn port_matches(port: u16, spec: &str) -> bool {
     ranges.iter().any(|&(start, end)| port >= start && port <= end)
 }
 
+/// Fast port matching against pre-parsed ranges (avoids re-parsing per match).
+#[inline]
+fn port_matches_pre(port: u16, ranges: &[(u16, u16)]) -> bool {
+    ranges.iter().any(|&(start, end)| port >= start && port <= end)
+}
+
 /// Match a domain against a regex pattern using the `regex` crate.
-/// mihomo uses Go's regexp package which is RE2-based, similar to Rust's regex crate.
+/// mihomo compat: uses case-insensitive matching (regexp2.IgnoreCase).
 fn match_domain_regex(pattern: &str, domain: &str) -> bool {
-    let domain_lower = domain.to_lowercase();
-    if let Ok(re) = Regex::new(pattern) {
-        re.is_match(&domain_lower)
+    // Add (?i) for case-insensitive matching if not already present
+    let pat = if pattern.starts_with("(?i)") {
+        pattern.to_string()
+    } else {
+        format!("(?i){pattern}")
+    };
+    if let Ok(re) = Regex::new(&pat) {
+        re.is_match(domain)
     } else {
         false
     }
@@ -959,7 +1102,7 @@ fn parse_logical_conditions(payload: &str) -> Vec<String> {
 }
 
 /// Evaluate a single condition string (e.g. "DOMAIN-SUFFIX,google.com") against metadata.
-fn eval_condition(condition: &str, metadata: &RuleMetadata, engine: &RuleEngine) -> bool {
+fn eval_condition(condition: &str, metadata: &RuleMetadata, engine: &RuleEngine, domain_lower: Option<&str>) -> bool {
     let parts: Vec<&str> = condition.splitn(2, ',').collect();
     if parts.len() < 2 {
         return false;
@@ -969,40 +1112,43 @@ fn eval_condition(condition: &str, metadata: &RuleMetadata, engine: &RuleEngine)
 
     match rule_type {
         "DOMAIN" => {
-            if let Some(ref domain) = metadata.domain {
-                domain.to_lowercase() == payload.to_lowercase()
+            if let Some(d) = domain_lower {
+                d == payload.to_lowercase()
             } else {
                 false
             }
         }
         "DOMAIN-SUFFIX" => {
-            if let Some(ref domain) = metadata.domain {
-                let d = domain.to_lowercase();
+            if let Some(d) = domain_lower {
                 let p = payload.to_lowercase();
-                d.ends_with(&format!(".{p}")) || d == p
+                (d.len() > p.len() && d.ends_with(p.as_str()) && d.as_bytes()[d.len() - p.len() - 1] == b'.') || d == p.as_str()
             } else {
                 false
             }
         }
         "DOMAIN-SUFFIX-STRICT" => {
-            if let Some(ref domain) = metadata.domain {
-                let d = domain.to_lowercase();
+            if let Some(d) = domain_lower {
                 let p = payload.to_lowercase();
-                d.ends_with(&format!(".{p}"))
+                d.len() > p.len() && d.ends_with(p.as_str()) && d.as_bytes()[d.len() - p.len() - 1] == b'.'
             } else {
                 false
             }
         }
         "DOMAIN-KEYWORD" => {
-            if let Some(ref domain) = metadata.domain {
-                domain.to_lowercase().contains(&payload.to_lowercase())
+            if let Some(d) = domain_lower {
+                d.contains(&payload.to_lowercase()[..])
             } else {
                 false
             }
         }
         "DOMAIN-REGEX" => {
-            if let Some(ref domain) = metadata.domain {
-                match_domain_regex(payload, domain)
+            if let Some(d) = domain_lower {
+                // Use pre-compiled regex from engine cache when available
+                if let Some(re) = engine.compiled_regexes.get(payload) {
+                    re.is_match(d)
+                } else {
+                    match_domain_regex(payload, d)
+                }
             } else {
                 false
             }
@@ -1057,48 +1203,50 @@ fn eval_condition(condition: &str, metadata: &RuleMetadata, engine: &RuleEngine)
     }
 }
 
-fn match_logical_and(payload: &str, metadata: &RuleMetadata, engine: &RuleEngine) -> bool {
+fn match_logical_and(payload: &str, metadata: &RuleMetadata, engine: &RuleEngine, domain_lower: Option<&str>) -> bool {
     let conditions = parse_logical_conditions(payload);
     if conditions.is_empty() {
         return false;
     }
     conditions
         .iter()
-        .all(|c| eval_condition(c, metadata, engine))
+        .all(|c| eval_condition(c, metadata, engine, domain_lower))
 }
 
-fn match_logical_or(payload: &str, metadata: &RuleMetadata, engine: &RuleEngine) -> bool {
+fn match_logical_or(payload: &str, metadata: &RuleMetadata, engine: &RuleEngine, domain_lower: Option<&str>) -> bool {
     let conditions = parse_logical_conditions(payload);
     if conditions.is_empty() {
         return false;
     }
     conditions
         .iter()
-        .any(|c| eval_condition(c, metadata, engine))
+        .any(|c| eval_condition(c, metadata, engine, domain_lower))
 }
 
-fn match_logical_not(payload: &str, metadata: &RuleMetadata, engine: &RuleEngine) -> bool {
+fn match_logical_not(payload: &str, metadata: &RuleMetadata, engine: &RuleEngine, domain_lower: Option<&str>) -> bool {
     let conditions = parse_logical_conditions(payload);
     if conditions.is_empty() {
         return false;
     }
     // NOT applies to the first (and typically only) condition
-    !eval_condition(&conditions[0], metadata, engine)
+    !eval_condition(&conditions[0], metadata, engine, domain_lower)
 }
 
+/// Fallback CIDR check for eval_condition and unparseable rules.
+/// Uses split_once to avoid Vec allocation from split().collect().
 fn check_ip_in_cidr(ip: &IpAddr, cidr: &str) -> bool {
-    let parts: Vec<&str> = cidr.split('/').collect();
-    if parts.len() != 2 {
-        return false;
-    }
-    let prefix_len: u8 = match parts[1].parse() {
+    let (addr_str, prefix_str) = match cidr.split_once('/') {
+        Some(parts) => parts,
+        None => return false,
+    };
+    let prefix_len: u8 = match prefix_str.parse() {
         Ok(p) => p,
         Err(_) => return false,
     };
 
     match ip {
         IpAddr::V4(v4) => {
-            if let Ok(network) = parts[0].parse::<std::net::Ipv4Addr>() {
+            if let Ok(network) = addr_str.parse::<std::net::Ipv4Addr>() {
                 let ip_u32 = u32::from(*v4);
                 let net_u32 = u32::from(network);
                 if prefix_len == 0 {
@@ -1114,7 +1262,7 @@ fn check_ip_in_cidr(ip: &IpAddr, cidr: &str) -> bool {
             }
         }
         IpAddr::V6(v6) => {
-            if let Ok(network) = parts[0].parse::<std::net::Ipv6Addr>() {
+            if let Ok(network) = addr_str.parse::<std::net::Ipv6Addr>() {
                 let ip_u128 = u128::from(*v6);
                 let net_u128 = u128::from(network);
                 if prefix_len == 0 {
@@ -1166,12 +1314,11 @@ fn wildcard_match(pattern: &str, text: &str) -> bool {
 fn check_ip_suffix(ip: &IpAddr, suffix: &str) -> bool {
     // IP-SUFFIX format: "1.2.3.0/24" means the last 24 bits match
     // Or just a plain IP suffix string
-    let parts: Vec<&str> = suffix.split('/').collect();
-    if parts.len() != 2 {
-        return ip.to_string().ends_with(suffix);
+    if suffix.contains('/') {
+        return check_ip_in_cidr(ip, suffix);
     }
-    // If it has /prefix, treat as CIDR
-    check_ip_in_cidr(ip, suffix)
+    // Fallback: string suffix match (allocates, but IP-SUFFIX is rare)
+    ip.to_string().ends_with(suffix)
 }
 
 fn default_home_dir() -> PathBuf {

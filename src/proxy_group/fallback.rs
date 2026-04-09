@@ -10,7 +10,7 @@ use crate::proxy::OutboundHandler;
 
 use super::proxy_state::ProxyStateStore;
 use super::url_test::measure_unified_delay;
-use super::ProxyGroup;
+use super::{HealthCheckOpts, ProxyGroup};
 
 /// Fallback group: pick the first proxy that is alive.
 ///
@@ -44,27 +44,23 @@ impl FallbackGroup {
     pub fn new(
         name: String,
         proxies: Vec<String>,
-        url: String,
-        interval_secs: u64,
+        hc: HealthCheckOpts,
         state_store: Arc<ProxyStateStore>,
-        max_failed_times: Option<u32>,
-        test_timeout: Option<u64>,
-        lazy: bool,
     ) -> Self {
         Self {
             group_name: name,
             proxy_names: proxies,
-            test_url: url,
-            interval: Duration::from_secs(interval_secs),
+            test_url: hc.url,
+            interval: Duration::from_secs(hc.interval_secs),
             state_store,
             force_selected: parking_lot::RwLock::new(None),
             failed_times: AtomicU32::new(0),
             failed_time: parking_lot::Mutex::new(Instant::now()),
             failed_testing: AtomicBool::new(false),
-            max_failed_times: max_failed_times.unwrap_or(5),
-            test_timeout: test_timeout.unwrap_or(5000),
+            max_failed_times: hc.max_failed_times.unwrap_or(5),
+            test_timeout: hc.test_timeout.unwrap_or(5000),
             last_touch: Arc::new(AtomicU64::new(0)),
-            lazy,
+            lazy: hc.lazy,
         }
     }
 
@@ -303,17 +299,17 @@ mod tests {
         Arc::new(ProxyStateStore::new())
     }
 
+    fn make_hc(url: &str, interval: u64) -> HealthCheckOpts {
+        HealthCheckOpts { url: url.to_string(), interval_secs: interval, max_failed_times: None, test_timeout: None, lazy: false }
+    }
+
     #[test]
     fn defaults_are_correct() {
         let group = FallbackGroup::new(
             "fb".to_string(),
             vec!["a".to_string(), "b".to_string()],
-            "http://test.example/204".to_string(),
-            600,
+            make_hc("http://test.example/204", 600),
             make_store(),
-            None,
-            None,
-            false,
         );
         assert_eq!(group.name(), "fb");
         assert_eq!(group.group_type(), "Fallback");
@@ -327,12 +323,8 @@ mod tests {
         let group = FallbackGroup::new(
             "fb".to_string(),
             vec!["primary".to_string(), "backup".to_string()],
-            "http://test.example/204".to_string(),
-            300,
+            make_hc("http://test.example/204", 300),
             make_store(),
-            None,
-            None,
-            false,
         );
         // No health check has run, alive map is empty.
         assert_eq!(group.now(), "primary");
@@ -343,12 +335,8 @@ mod tests {
         let group = FallbackGroup::new(
             "fb".to_string(),
             vec!["a".to_string(), "b".to_string()],
-            "http://test.example/204".to_string(),
-            300,
+            make_hc("http://test.example/204", 300),
             make_store(),
-            None,
-            None,
-            false,
         );
         assert!(group.select("b"));
         assert_eq!(group.now(), "b");
@@ -362,12 +350,8 @@ mod tests {
         let group = FallbackGroup::new(
             "empty".to_string(),
             vec![],
-            "http://test.example/204".to_string(),
-            300,
+            make_hc("http://test.example/204", 300),
             make_store(),
-            None,
-            None,
-            false,
         );
         assert_eq!(group.now(), "");
     }
@@ -383,12 +367,8 @@ mod tests {
         let group = FallbackGroup::new(
             "fb".to_string(),
             vec!["primary".to_string(), "backup".to_string()],
-            url.to_string(),
-            300,
+            make_hc(url, 300),
             store,
-            None,
-            None,
-            false,
         );
         assert_eq!(group.now(), "backup");
     }

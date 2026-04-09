@@ -12,7 +12,7 @@ use crate::dns::DnsResolver;
 use crate::proxy::OutboundHandler;
 
 use super::proxy_state::ProxyStateStore;
-use super::ProxyGroup;
+use super::{HealthCheckOpts, ProxyGroup};
 
 /// Auto-select the proxy with the lowest measured latency.
 ///
@@ -53,19 +53,15 @@ impl UrlTestGroup {
     pub fn new(
         name: String,
         proxies: Vec<String>,
-        url: String,
-        interval_secs: u64,
         tolerance: u32,
+        hc: HealthCheckOpts,
         state_store: Arc<ProxyStateStore>,
-        max_failed_times: Option<u32>,
-        test_timeout: Option<u64>,
-        lazy: bool,
     ) -> Self {
         Self {
             group_name: name,
             proxy_names: proxies,
-            test_url: url,
-            interval: Duration::from_secs(interval_secs),
+            test_url: hc.url,
+            interval: Duration::from_secs(hc.interval_secs),
             tolerance,
             state_store,
             current_best: parking_lot::RwLock::new(None),
@@ -74,10 +70,10 @@ impl UrlTestGroup {
             failed_times: AtomicU32::new(0),
             failed_time: parking_lot::Mutex::new(Instant::now()),
             failed_testing: AtomicBool::new(false),
-            max_failed_times: max_failed_times.unwrap_or(5),
-            test_timeout: test_timeout.unwrap_or(5000),
+            max_failed_times: hc.max_failed_times.unwrap_or(5),
+            test_timeout: hc.test_timeout.unwrap_or(5000),
             last_touch: Arc::new(AtomicU64::new(0)),
-            lazy,
+            lazy: hc.lazy,
         }
     }
 
@@ -418,18 +414,18 @@ mod tests {
         Arc::new(ProxyStateStore::new())
     }
 
+    fn make_hc(url: &str) -> HealthCheckOpts {
+        HealthCheckOpts { url: url.to_string(), interval_secs: 300, max_failed_times: None, test_timeout: None, lazy: false }
+    }
+
     #[test]
     fn defaults_are_correct() {
         let group = UrlTestGroup::new(
             "auto".to_string(),
             vec!["a".to_string(), "b".to_string()],
-            "http://test.example/204".to_string(),
-            300,
             150,
+            HealthCheckOpts { url: "http://test.example/204".to_string(), interval_secs: 300, max_failed_times: None, test_timeout: None, lazy: false },
             make_store(),
-            None,
-            None,
-            false,
         );
         assert_eq!(group.name(), "auto");
         assert_eq!(group.group_type(), "URLTest");
@@ -443,13 +439,9 @@ mod tests {
         let group = UrlTestGroup::new(
             "auto".to_string(),
             vec!["fast".to_string(), "slow".to_string()],
-            "http://test.example/204".to_string(),
-            300,
             50,
+            make_hc("http://test.example/204"),
             make_store(),
-            None,
-            None,
-            false,
         );
         // No health check has run, delays map is empty.
         assert_eq!(group.now(), "fast");
@@ -460,13 +452,9 @@ mod tests {
         let group = UrlTestGroup::new(
             "auto".to_string(),
             vec!["a".to_string(), "b".to_string()],
-            "http://test.example/204".to_string(),
-            300,
             50,
+            make_hc("http://test.example/204"),
             make_store(),
-            None,
-            None,
-            false,
         );
         // Can force-pin a proxy that exists in the group
         assert!(group.select("b"));
@@ -483,13 +471,9 @@ mod tests {
         let group = UrlTestGroup::new(
             "empty".to_string(),
             vec![],
-            "http://test.example/204".to_string(),
-            300,
             50,
+            make_hc("http://test.example/204"),
             make_store(),
-            None,
-            None,
-            false,
         );
         assert_eq!(group.now(), "");
     }
@@ -509,13 +493,9 @@ mod tests {
                 "fast".to_string(),
                 "medium".to_string(),
             ],
-            url.to_string(),
-            300,
             50,
+            make_hc(url),
             store,
-            None,
-            None,
-            false,
         );
         assert_eq!(group.now(), "fast");
     }
@@ -530,13 +510,9 @@ mod tests {
         let group = UrlTestGroup::new(
             "auto".to_string(),
             vec!["a".to_string(), "b".to_string()],
-            url.to_string(),
-            300,
             50, // tolerance = 50ms
+            make_hc(url),
             store.clone(),
-            None,
-            None,
-            false,
         );
 
         // First call picks "a" (lowest)

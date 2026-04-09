@@ -27,8 +27,6 @@ const ZERO_NONCE: [u8; 12] = [0u8; 12];
 /// Shadowsocks UDP socket — wraps a `UdpSocket` and encrypts/decrypts with AEAD.
 pub struct SsUdpSocket {
     inner: UdpSocket,
-    #[allow(dead_code)]
-    server_addr: SocketAddr,
     cipher: AeadCipher,
     master_key: Vec<u8>,
     recv_buf: tokio::sync::Mutex<Vec<u8>>,
@@ -54,7 +52,6 @@ impl SsUdpSocket {
 
         Ok(Self {
             inner: socket,
-            server_addr,
             cipher,
             master_key,
             recv_buf: tokio::sync::Mutex::new(vec![0u8; 65535]),

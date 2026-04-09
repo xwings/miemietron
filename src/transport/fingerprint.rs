@@ -73,10 +73,6 @@ impl fmt::Display for TlsFingerprint {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Per-browser cipher suite and key-exchange group orderings
-// ---------------------------------------------------------------------------
-
 /// Chrome 120+ cipher suite order.
 ///
 /// Chrome sends TLS 1.3 suites first (AES-128-GCM preferred over AES-256-GCM,
@@ -187,10 +183,6 @@ fn random_kx_groups() -> Vec<&'static dyn SupportedKxGroup> {
     groups.shuffle(&mut rng);
     groups
 }
-
-// ---------------------------------------------------------------------------
-// Public API
-// ---------------------------------------------------------------------------
 
 /// Build a [`CryptoProvider`] with cipher suites and key-exchange groups
 /// ordered to match the given fingerprint.
