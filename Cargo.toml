@@ -85,9 +85,7 @@ thiserror = "2"
 # Async trait
 async-trait = "0.1"
 
-# Allocator — musl's default malloc fragments catastrophically under high-churn
-# workloads (SS AEAD encrypt/decrypt allocates ~32KB per call at ~3000 calls/sec).
-# jemalloc handles this the way Go's allocator does, returning memory to the OS.
+# Allocator — musl's malloc fragments under crypto workloads; jemalloc matches Go.
 tikv-jemallocator = "0.6"
 
 # Misc

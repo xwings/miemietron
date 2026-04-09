@@ -43,11 +43,8 @@ pub struct ApiState {
 }
 
 pub async fn start_server(addr: &str, secret: Option<String>, state: ApiState) -> Result<()> {
-    // mihomo compat: CORS configuration matching mihomo's chi cors.Options.
-    // AllowPrivateNetwork is critical — Chrome's Private Network Access blocks
-    // requests from browser tabs to private IPs (192.168.x.x, 10.x.x.x) unless
-    // the server responds with Access-Control-Allow-Private-Network: true.
-    // Without this, PUT /proxies/{name} from the dashboard is silently blocked.
+    // mihomo compat: CORS matching chi cors.Options. allow_private_network
+    // required for Chrome Private Network Access (dashboard → router IP).
     let cors = CorsLayer::new()
         .allow_origin(Any)
         .allow_methods(Any)

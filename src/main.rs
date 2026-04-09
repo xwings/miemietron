@@ -1,7 +1,4 @@
-// Use jemalloc globally — musl's default allocator fragments catastrophically
-// under high-churn workloads (SS AEAD encrypt/decrypt at ~3000 ops/sec).
-// Go's runtime has a comparable allocator; without jemalloc, Rust+musl leaks
-// memory until OOM-killed within minutes of 4K video streaming.
+// jemalloc — musl's allocator fragments under high-churn crypto workloads.
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 

@@ -14,6 +14,42 @@ use crate::rules::{process, Action, RuleMetadata};
 use crate::sniffer;
 use crate::AppState;
 
+/// Relay buffer pool matching mihomo's sing/bufio sync.Pool pattern.
+static RELAY_BUF_POOL: once_cell::sync::Lazy<RelayBufPool> =
+    once_cell::sync::Lazy::new(RelayBufPool::new);
+
+struct RelayBufPool {
+    pool: parking_lot::Mutex<Vec<Vec<u8>>>,
+}
+
+const RELAY_BUF_SIZE: usize = 16 * 1024;
+
+impl RelayBufPool {
+    fn new() -> Self {
+        Self {
+            pool: parking_lot::Mutex::new(Vec::new()),
+        }
+    }
+
+    fn get(&self) -> Vec<u8> {
+        self.pool
+            .lock()
+            .pop()
+            .unwrap_or_else(|| vec![0u8; RELAY_BUF_SIZE])
+    }
+
+    fn put(&self, mut buf: Vec<u8>) {
+        if buf.capacity() == RELAY_BUF_SIZE {
+            buf.clear();
+            let mut pool = self.pool.lock();
+            if pool.len() < 64 {
+                buf.resize(RELAY_BUF_SIZE, 0);
+                pool.push(buf);
+            }
+        }
+    }
+}
+
 pin_project! {
     pub struct CountingStream<T> {
         #[pin]
@@ -145,21 +181,8 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for PeekableStream<T> {
 /// Maximum number of bytes to peek for sniffing (TLS ClientHello / HTTP headers).
 const SNIFF_PEEK_SIZE: usize = 1024;
 
-/// Bidirectional relay matching mihomo's N.Relay (bufio.Copy in Go).
-///
-/// Uses two spawned tasks for true concurrency. Each direction reads into a
-/// buffer and writes all bytes. Flush is only called when the read didn't fill
-/// the buffer — meaning we've consumed all currently available data and should
-/// push it to the wire for responsiveness (interactive traffic, protocol
-/// handshakes). For bulk transfers (video, downloads), reads fill the buffer
-/// and we skip the flush, letting write_all push data through directly.
-///
-/// mihomo's Go implementation uses bufio.Copy which relies on Go's synchronous
-/// Write() — data goes out immediately without explicit flush. In Rust's async
-/// model, SsStream's poll_write may buffer encrypted ciphertext when the TCP
-/// socket would block. The conditional flush handles this: bulk data naturally
-/// drains the buffer via continuous write_all calls, while small interactive
-/// data gets an explicit flush to prevent deadlocks.
+/// Bidirectional relay matching mihomo's N.Relay (sing/bufio.Copy).
+/// Conditional flush: only when read < buf size (interactive data).
 async fn relay_bidirectional<A, B>(a: A, b: B)
 where
     A: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -171,7 +194,7 @@ where
     let (mut b_read, mut b_write) = tokio::io::split(b);
 
     let a_to_b = tokio::spawn(async move {
-        let mut buf = vec![0u8; 32 * 1024];
+        let mut buf = RELAY_BUF_POOL.get();
         loop {
             let n = match a_read.read(&mut buf).await {
                 Ok(0) => break,
@@ -181,19 +204,16 @@ where
             if b_write.write_all(&buf[..n]).await.is_err() {
                 break;
             }
-            // Only flush when read returned less than buffer size — we've
-            // drained available data and should push it out for responsiveness.
-            // For bulk transfers (video), reads fill the buffer and we skip
-            // flush, avoiding the overhead of ~1500 extra syscalls/sec at 50Mbps.
             if n < buf.len() && b_write.flush().await.is_err() {
                 break;
             }
         }
         let _ = b_write.shutdown().await;
+        RELAY_BUF_POOL.put(buf);
     });
 
     let b_to_a = tokio::spawn(async move {
-        let mut buf = vec![0u8; 32 * 1024];
+        let mut buf = RELAY_BUF_POOL.get();
         loop {
             let n = match b_read.read(&mut buf).await {
                 Ok(0) => break,
@@ -208,25 +228,18 @@ where
             }
         }
         let _ = a_write.shutdown().await;
+        RELAY_BUF_POOL.put(buf);
     });
 
     let _ = a_to_b.await;
     let _ = b_to_a.await;
 }
 
-/// Manages active connections and orchestrates the proxy pipeline.
-///
-/// Reads from the shared `AppState` on each new connection, so hot-reloaded
-/// configs, rules, proxies, and DNS are picked up immediately for new
-/// connections while existing connections continue with their snapshotted state.
+/// Connection manager — mihomo tunnel/tunnel.go equivalent.
 pub struct ConnectionManager {
     app: Arc<AppState>,
     connections: DashMap<String, ConnectionInfo>,
-    /// Live byte counters per connection ID, so the API can read real-time
-    /// upload/download values instead of the stale zeros stored at insert time.
     counters: DashMap<String, (Arc<AtomicU64>, Arc<AtomicU64>)>,
-    /// Abort handles for relay tasks, so close_connection() can actually
-    /// terminate the relay and close the underlying streams.
     relay_handles: DashMap<String, tokio::task::AbortHandle>,
 }
 
@@ -502,10 +515,21 @@ impl ConnectionManager {
             }
         };
 
-        // Build rule metadata
+        // mihomo compat: clear dst_ip when domain is known and IP is a FakeIP
+        // or unresolved placeholder (tunnel.go:288-290). preHandleMetadata sets
+        // DstIP = netip.Addr{} for FakeIP so IP-CIDR rules don't match the
+        // FakeIP range. Same for HTTP proxy 0.0.0.0 placeholder.
+        let rule_dst_ip = if domain.is_some()
+            && (dns.is_fake_ip(&dst.ip()) || dst.ip().is_unspecified())
+        {
+            None
+        } else {
+            Some(dst.ip())
+        };
+
         let rule_meta = RuleMetadata {
             domain: domain.clone(),
-            dst_ip: Some(dst.ip()),
+            dst_ip: rule_dst_ip,
             src_ip: Some(src.ip()),
             dst_port: dst.port(),
             src_port: src.port(),
@@ -747,13 +771,11 @@ impl ConnectionManager {
         };
         let conn_id_str = conn_id.to_string();
         self.connections.insert(conn_id_str.clone(), conn_info);
-        // Store live counters so the API can read real-time byte counts
         self.counters
             .insert(conn_id_str.clone(), (up_counter.clone(), down_counter.clone()));
         stats.add_connection();
 
-        // mihomo compat: single info log per connection after successful dial.
-        // Format matches mihomo tunnel.go line 617-629.
+        // mihomo compat: single info log per connection (tunnel.go:617-629)
         if let Some(ci) = self.connections.get(&conn_id_str) {
             let chains_str = format!("{:?}", ci.chains);
             if !ci.rule_payload.is_empty() {
@@ -769,18 +791,9 @@ impl ConnectionManager {
             }
         }
 
-        // Wrap only the remote side with CountingStream to avoid double-counting
         let local_plain = stream;
         let remote_counted = CountingStream::new(remote, up_counter.clone(), down_counter.clone());
 
-        // mihomo compat: bidirectional relay matching Go's goroutine-based N.Relay.
-        // Go's Write blocks until ALL bytes are committed. Rust's poll_write can
-        // buffer data internally (e.g., SsStream encrypts then partially writes).
-        // tokio::io::copy doesn't flush between writes, causing deadlocks.
-        // Solution: custom relay that flushes after each write cycle.
-        //
-        // Spawn the relay as a task so close_connection() can abort it.
-        // When aborted, the underlying streams are dropped (closing the connection).
         let relay_handle = tokio::spawn(async move {
             relay_bidirectional(local_plain, remote_counted).await;
         });
@@ -816,13 +829,18 @@ impl ConnectionManager {
             rt.mode.clone()
         };
 
-        // Resolve domain from FakeIP
         let domain = dns.reverse_lookup(&dst.ip());
 
-        // Build rule metadata
+        // mihomo compat: clear FakeIP from dst_ip (same as TCP path)
+        let rule_dst_ip = if dns.is_fake_ip(&dst.ip()) {
+            None
+        } else {
+            Some(dst.ip())
+        };
+
         let rule_meta = RuleMetadata {
             domain: domain.clone(),
-            dst_ip: Some(dst.ip()),
+            dst_ip: rule_dst_ip,
             src_ip: Some(src.ip()),
             dst_port: dst.port(),
             src_port: src.port(),

@@ -207,14 +207,20 @@ impl DnsResolver {
         None
     }
 
-    /// Record an IP→domain mapping with TTL-based expiry.
-    ///
-    /// mihomo compat: withMapping() middleware in dns/middleware.go records
-    /// each A/AAAA answer with its individual TTL (minimum 1 second).
+    /// mihomo compat: withMapping() in dns/middleware.go.
     fn record_ip_mapping(&self, ip: IpAddr, domain: &str, ttl: u32) {
-        let ttl = ttl.max(1); // mihomo compat: minimum TTL of 1 second
+        let ttl = ttl.max(1);
         let expires_at = Instant::now() + std::time::Duration::from_secs(ttl as u64);
+        if self.ip_to_host.len() > 4096 {
+            self.evict_expired_ip_mappings();
+        }
         self.ip_to_host.insert(ip, (domain.to_string(), expires_at));
+    }
+
+    /// Remove expired entries from ip_to_host to prevent unbounded growth.
+    fn evict_expired_ip_mappings(&self) {
+        let now = Instant::now();
+        self.ip_to_host.retain(|_, (_, expires_at)| now < *expires_at);
     }
 
     /// Manually insert an IP→domain mapping.

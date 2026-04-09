@@ -182,9 +182,7 @@ pub struct DelayQuery {
     expected: Option<String>,
 }
 
-/// Parse mihomo-style expected status ranges (e.g. "200" or "200-299" or "200-299/400-499").
-/// Parse mihomo-style expected status ranges.
-/// mihomo compat: ranges.go supports both `/` and `,` as separators.
+/// mihomo compat: parse expected status ranges (ranges.go).
 fn parse_expected_status(s: &str) -> Option<Vec<(u16, u16)>> {
     if s.is_empty() || s == "*" {
         return None;
@@ -355,10 +353,7 @@ pub struct SelectBody {
 }
 
 /// mihomo compat: accept JSON body regardless of Content-Type header.
-/// Metacubexd dashboard sends `body: JSON.stringify(...)` via ky library
-/// which does NOT set Content-Type: application/json. mihomo's Go
-/// render.DecodeJSON reads the body regardless. axum's Json<T> extractor
-/// rejects requests without the header (415), breaking the dashboard.
+/// Dashboard (ky library) sends body without Content-Type.
 pub async fn put_proxy(
     State(state): State<ApiState>,
     Path(group_name): Path<String>,

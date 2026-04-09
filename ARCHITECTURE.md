@@ -4,7 +4,7 @@ Rust drop-in replacement for [mihomo](https://github.com/MetaCubeX/mihomo) (Meta
 Compatible with [OpenClash](https://github.com/vernesong/OpenClash) on OpenWrt routers.
 Same CLI, same config, same REST API — just swap the binary.
 
-**~30k lines of Rust, 399 tests, single static binary.**
+**~30k lines of Rust, 404 tests, single static binary.**
 
 ## The One Rule
 
@@ -37,8 +37,9 @@ src/
 │
 ├── conn/                      # Connection manager (mihomo tunnel/tunnel.go)
 │   └── mod.rs                 #   CountingStream, PeekableStream, ConnectionManager,
-│                              #   bidirectional relay, retry (5s ctx timeout, exponential
-│                              #   backoff + jitter, 10 max attempts), preHandleMetadata
+│                              #   bidirectional relay with buffer pool (matches sing/bufio),
+│                              #   retry (5s ctx timeout, exponential backoff + jitter,
+│                              #   10 max attempts), preHandleMetadata
 │
 ├── inbound/                   # Inbound listeners
 │   ├── mod.rs                 #   Listener orchestration
@@ -202,6 +203,31 @@ All outbound connections set TCP keepalive matching mihomo's `keepalive.SetNetDi
 - `keep_alive_idle` and `keep_alive_interval` from config (default 30s)
 - Applied via `socket2` before `connect()`
 
+### Performance Architecture
+
+**Allocator**: jemalloc (via `tikv-jemallocator`). musl's default allocator fragments
+under high-churn crypto workloads. jemalloc matches Go's allocator behavior.
+
+**Relay buffer pool**: Matches mihomo's `sing/bufio` sync.Pool pattern.
+Relay buffers (16KB) are borrowed from a shared pool during active I/O and
+returned when idle. Prevents 500+ torrent connections from holding 32MB+ of
+permanently allocated buffers.
+
+**SsStream lazy allocation**: AEAD encrypt/decrypt buffers (`write_out_buf`,
+`write_payload_buf`, `read_reuse_buf`) start empty and grow on first use.
+Idle connections consume zero buffer memory. Active buffers are reused via
+`.clear()` to avoid per-packet heap allocation churn.
+
+**Conditional flush**: Relay only calls `flush()` when `read() < buf_size`,
+meaning available data is drained. Bulk transfers (video) skip flush; interactive
+data (web) gets flushed for responsiveness.
+
+**Logging**: One info log per connection after successful dial (matches mihomo
+tunnel.go:617). Per-connection intermediate logs are debug-level only.
+
+**DNS map eviction**: `ip_to_host` DashMap evicts expired entries when size
+exceeds 4096 to prevent unbounded growth under heavy torrent traffic.
+
 ## DNS Architecture
 
 ```
@@ -322,6 +348,7 @@ Per-target CPU flags in `.cargo/config.toml`:
 | `socket2` | Low-level socket options (SO_MARK, IP_TRANSPARENT, keepalive) |
 | `nix` | Linux syscalls (TUN ioctls, setgid) |
 | `rtnetlink` | Netlink route/rule management |
+| `tikv-jemallocator` | jemalloc allocator (musl compat, prevents fragmentation) |
 
 ## Development Workflow
 

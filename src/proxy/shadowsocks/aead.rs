@@ -305,21 +305,9 @@ impl NonceCounter {
     }
 }
 
-/// Internal states for the write (encrypt) half.
 enum WriteState {
-    /// Ready to accept data for encryption.
     Ready,
-    /// We have encrypted data that needs to be flushed to the inner writer.
     Flushing { buf: Vec<u8>, pos: usize },
-    /// SS2022: waiting for first user data to bundle with the address header.
-    /// The first poll_write builds the complete initial request including user data.
-    #[allow(dead_code)]
-    WaitingFirstData {
-        salt: Vec<u8>,
-        addr_header: Vec<u8>,
-        identity_server_key: Option<Vec<u8>>,
-        identity_user_key: Option<Vec<u8>>,
-    },
 }
 
 /// Internal states for the read (decrypt) half.
@@ -374,9 +362,7 @@ pin_project! {
         enc_cipher: Option<CipherCore>,
         enc_nonce: NonceCounter,
         write_state: WriteState,
-        // Reusable buffers for encryption to avoid per-write heap allocations.
-        // At 4K video throughput (~50Mbps), poll_write is called ~3000 times/sec.
-        // Without reuse, each call allocated ~32KB of Vecs (len_buf + payload_buf + out).
+        // Reusable buffers — avoids per-write heap allocations in the hot path.
         write_out_buf: Vec<u8>,
         write_payload_buf: Vec<u8>,
 
@@ -384,10 +370,7 @@ pin_project! {
         dec_cipher: Option<CipherCore>,
         dec_nonce: NonceCounter,
         read_state: ReadState,
-        // Reusable read buffer — avoids Vec::new() on every state transition.
-        // The read cycle (WaitingLength→WaitingPayload→Buffered→repeat)
-        // ran ~3000 times/sec for 4K video, each allocating/dropping ~16KB Vecs.
-        // musl's allocator never returns this fragmented memory to the OS.
+        // Reusable buffer — avoids per-read Vec::new() allocation churn.
         read_reuse_buf: Vec<u8>,
     }
 }
@@ -453,9 +436,7 @@ impl<T> SsStream<T> {
             (WriteState::Flushing { buf, pos: 0 }, nonce)
         };
 
-        // Pre-allocate write buffers for the largest possible chunk.
-        // Legacy MAX_PAYLOAD_SIZE=16383, SS2022 MAX_PAYLOAD_SIZE_2022=32734.
-        let max_chunk = if is_ss2022 { MAX_PAYLOAD_SIZE_2022 } else { MAX_PAYLOAD_SIZE };
+        // Lazy buffer allocation — grow on first use, reuse after.
         Self {
             inner,
             cipher_type: cipher,
@@ -465,12 +446,12 @@ impl<T> SsStream<T> {
             enc_cipher: Some(enc_cipher),
             enc_nonce,
             write_state,
-            write_out_buf: Vec::with_capacity(2 + TAG_LEN + max_chunk + TAG_LEN),
-            write_payload_buf: Vec::with_capacity(max_chunk + TAG_LEN),
+            write_out_buf: Vec::new(),
+            write_payload_buf: Vec::new(),
             dec_cipher: None,
             dec_nonce: NonceCounter::new(),
             read_state: ReadState::WaitingSalt { buf: Vec::new() },
-            read_reuse_buf: Vec::with_capacity(max_chunk + TAG_LEN),
+            read_reuse_buf: Vec::new(),
         }
     }
 
@@ -1491,79 +1472,6 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncWrite for SsStream<T> {
         data: &[u8],
     ) -> Poll<io::Result<usize>> {
         let mut me = self.project();
-
-        // SS2022: if this is the first write, build the initial request
-        // bundling user data with the address header.
-        if let WriteState::WaitingFirstData { .. } = me.write_state {
-            // Take ownership of the state data
-            let (salt, addr_header, id_sk, id_uk) = if let WriteState::WaitingFirstData {
-                salt,
-                addr_header,
-                identity_server_key,
-                identity_user_key,
-            } =
-                std::mem::replace(me.write_state, WriteState::Ready)
-            {
-                (salt, addr_header, identity_server_key, identity_user_key)
-            } else {
-                unreachable!()
-            };
-
-            let enc = me
-                .enc_cipher
-                .as_ref()
-                .ok_or_else(|| io::Error::other("encryption cipher not initialized"))?;
-
-            let initial_buf = build_ss2022_request_buffer(
-                &salt,
-                enc,
-                me.enc_nonce,
-                &addr_header,
-                *me.cipher_type,
-                id_sk.as_deref(),
-                id_uk.as_deref(),
-                data, // Bundle first user data!
-            );
-
-            let consumed = data.len(); // All user data consumed into the initial buffer
-            *me.write_state = WriteState::Flushing {
-                buf: initial_buf,
-                pos: 0,
-            };
-
-            // Fall through to the Flushing handler below, but report all
-            // user data as consumed
-            // First try to flush what we can
-            while let WriteState::Flushing {
-                ref buf,
-                ref mut pos,
-            } = me.write_state
-            {
-                if *pos < buf.len() {
-                    match me.inner.as_mut().poll_write(cx, &buf[*pos..]) {
-                        Poll::Ready(Ok(n)) => {
-                            if n == 0 {
-                                return Poll::Ready(Err(io::Error::new(
-                                    io::ErrorKind::WriteZero,
-                                    "write zero",
-                                )));
-                            }
-                            *pos += n;
-                            if *pos < buf.len() {
-                                continue;
-                            }
-                        }
-                        Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                        Poll::Pending => {
-                            // Data is buffered, will flush later. Report user data consumed.
-                            return Poll::Ready(Ok(consumed));
-                        }
-                    }
-                }
-                *me.write_state = WriteState::Ready;
-            }
-            return Poll::Ready(Ok(consumed));
-        }
 
         // Flush any pending data
         while let WriteState::Flushing {
