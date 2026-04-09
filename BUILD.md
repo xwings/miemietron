@@ -82,27 +82,10 @@ Pushing a `v*` tag triggers GitHub Actions CI which automatically:
 ```bash
 # 1. Bump version in Cargo.toml
 # 2. Commit and tag
-git add -A
-git commit -m "v0.2.0: description"
+git checkout released
+git merge dev
 git tag v0.2.0
-git push origin dev --tags
+git push origin released --tags
 ```
 
-## Troubleshooting
 
-### "cannot execute: required file not found" on OpenWrt
-
-The binary is dynamically linked. You must build with the musl target:
-
-```bash
-RUSTFLAGS="-C target-feature=+crt-static" \
-  cargo build --release --target x86_64-unknown-linux-musl
-```
-
-### "Extension REDIRECT revision 0 not supported"
-
-OpenWrt 25.02 uses nftables. Miemietron automatically tries nft first, then falls back to iptables-legacy, then iptables.
-
-### SS2022 "invalid base64 key"
-
-Check your provider's password encoding. Miemietron accepts standard base64, URL-safe base64, with or without padding.
