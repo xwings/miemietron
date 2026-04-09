@@ -12,6 +12,10 @@ Same CLI. Same config. Same API. Just swap the binary.
 
 mihomo is written in Go. On routers with limited RAM, Go's garbage collector and goroutine overhead matter. Miemietron uses jemalloc, pooled relay buffers, and lazy-allocated crypto streams to stay under 100 MB VSZ even with 500+ concurrent torrent connections + 4K video streaming.
 
+## Tested On
+
+Only tested on vanilla OpenWrt with OpenClash. The firmware used for testing is [xwingswrt](https://github.com/xwings/xwingswrt). Other variants of OpenWrt (iStoreOS, ImmortalWrt, etc.) have not been tested and may have compatibility issues.
+
 ## Features
 
 ### Protocols
