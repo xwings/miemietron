@@ -6,7 +6,7 @@ Same CLI. Same config. Same API. Just swap the binary.
 
 ## Why
 
-mihomo is written in Go. On ARM routers with 256 MB RAM, Go's garbage collector and goroutine overhead matter. Miemietron eliminates this:
+mihomo is written in Go. On routers with limited RAM, Go's garbage collector and goroutine overhead matter. Miemietron uses jemalloc, pooled relay buffers, and lazy-allocated crypto streams to stay under 100 MB VSZ even with 500+ concurrent torrent connections + 4K video streaming.
 
 ## Features
 
@@ -83,12 +83,12 @@ cargo build --release
 # Static musl (for deployment)
 cargo build --release --target x86_64-unknown-linux-musl
 
-# Cross-compile for routers
-cross build --release --target aarch64-unknown-linux-musl      # ARM64
-cross build --release --target armv7-unknown-linux-musleabihf   # ARM32
+# Cross-compile for ARM64 routers
+cross build --release --target aarch64-unknown-linux-musl
 ```
 
 All builds are statically linked — single binary, zero dependencies.
+See [BUILD.md](BUILD.md) for detailed build and deploy instructions.
 
 ## Usage
 
@@ -108,12 +108,10 @@ miemietron -v
 | Target | Triple | Use Case |
 |--------|--------|----------|
 | x86_64 | `x86_64-unknown-linux-musl` | Soft routers, VMs |
-| ARM64 | `aarch64-unknown-linux-musl` | Modern routers, RPi 3/4/5 |
-| ARM32 | `armv7-unknown-linux-musleabihf` | Older routers, RPi 2 |
-
+| ARM64  | `aarch64-unknown-linux-musl` | MediaTek Filogic routers, RPi 3/4/5 |
 ## Architecture
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) for the full design document.
+See [CLAUDE.md](CLAUDE.md) for the full design document.
 
 ```
 ┌────────────────────────────────────────────────────────┐

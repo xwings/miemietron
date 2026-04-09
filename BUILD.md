@@ -42,12 +42,6 @@ ls -lh target/x86_64-unknown-linux-musl/release/miemietron
 cross build --release --target aarch64-unknown-linux-musl
 ```
 
-## Static Binary for ARM32 (armv7 routers, RPi 2)
-
-```bash
-cross build --release --target armv7-unknown-linux-musleabihf
-```
-
 ## Install cross (for ARM builds)
 
 ```bash
@@ -71,7 +65,7 @@ ssh root@router 'chmod 4755 /etc/openclash/core/clash_meta'
 
 # Verify
 ssh root@router '/etc/openclash/core/clash_meta -v'
-# Mihomo Meta v0.1.6 linux/x86_64 (miemietron)
+# Mihomo Meta v0.1.13 linux/x86_64 (miemietron)
 
 # Restart OpenClash
 ssh root@router '/etc/init.d/openclash restart'
@@ -81,7 +75,7 @@ ssh root@router '/etc/init.d/openclash restart'
 
 Pushing a `v*` tag triggers GitHub Actions CI which automatically:
 
-1. Cross-compiles static musl binaries for all 3 targets
+1. Cross-compiles static musl binaries for x86_64 and aarch64
 2. Generates SHA256 checksums
 3. Creates a GitHub Release with binaries attached
 

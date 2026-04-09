@@ -158,19 +158,15 @@ src/
          └────────────────────┼──────────────────────┘
                               ▼
                     ┌──────────────────┐
-                    │    Sniffer       │  TLS SNI / HTTP Host
-                    │  (if enabled)    │  extraction
-                    └────────┬─────────┘
-                             ▼
-                    ┌──────────────────┐
-                    │   DNS Resolver   │  FakeIP → real IP lookup
-                    │   (if needed)    │  nameserver-policy routing
+                    │  preHandleMetadata│ FakeIP→domain lookup,
+                    │  + Sniffer        │ clear FakeIP from dst_ip,
+                    │  (if enabled)     │ TLS SNI / HTTP Host sniffing
                     └────────┬─────────┘
                              ▼
                     ┌──────────────────┐
                     │   Rule Engine    │  Sequential match (first wins)
-                    │  DOMAIN/IP/GEO/  │  → Action: proxy group name
-                    │  PROCESS/MATCH   │
+                    │  DOMAIN/IP/GEO/  │  dst_ip=None for FakeIP so
+                    │  PROCESS/MATCH   │  domain rules match first
                     └────────┬─────────┘
                              ▼
                     ┌──────────────────┐
@@ -390,7 +386,7 @@ Map mihomo's Go to our Rust before touching code:
 ### Step 4: Test
 
 - `cargo check` — zero warnings
-- `cargo test` — all pass (currently 412 tests)
+- `cargo test` — all pass (currently 404 tests)
 - Integration test on real config if the change touches connection handling,
   DNS, rules, TUN, or sniffer (see below)
 
