@@ -238,14 +238,15 @@ where
 /// Connection manager — mihomo tunnel/tunnel.go equivalent.
 pub struct ConnectionManager {
     app: Arc<AppState>,
-    connections: DashMap<String, ConnectionInfo>,
-    counters: DashMap<String, (Arc<AtomicU64>, Arc<AtomicU64>)>,
-    relay_handles: DashMap<String, tokio::task::AbortHandle>,
+    connections: DashMap<Arc<str>, ConnectionInfo>,
+    counters: DashMap<Arc<str>, (Arc<AtomicU64>, Arc<AtomicU64>)>,
+    relay_handles: DashMap<Arc<str>, tokio::task::AbortHandle>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ConnectionInfo {
-    pub id: String,
+    #[serde(serialize_with = "ser_arc_str")]
+    pub id: Arc<str>,
     pub metadata: ConnectionMetadata,
     pub upload: u64,
     pub download: u64,
@@ -254,6 +255,11 @@ pub struct ConnectionInfo {
     pub rule: String,
     #[serde(rename = "rulePayload")]
     pub rule_payload: String,
+}
+
+/// Serialize Arc<str> as a plain string.
+fn ser_arc_str<S: serde::Serializer>(val: &Arc<str>, s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_str(val)
 }
 
 /// Serialize IpAddr as string without intermediate String allocation.
@@ -745,7 +751,7 @@ impl ConnectionManager {
 
         // Register connection in the DashMap
         let conn_info = ConnectionInfo {
-            id: conn_id.to_string(),
+            id: conn_id.clone(),
             metadata: ConnectionMetadata {
                 network: "tcp",
                 conn_type,
@@ -769,14 +775,13 @@ impl ConnectionManager {
             rule: rule_str,
             rule_payload,
         };
-        let conn_id_str = conn_id.to_string();
-        self.connections.insert(conn_id_str.clone(), conn_info);
+        self.connections.insert(conn_id.clone(), conn_info);
         self.counters
-            .insert(conn_id_str.clone(), (up_counter.clone(), down_counter.clone()));
+            .insert(conn_id.clone(), (up_counter.clone(), down_counter.clone()));
         stats.add_connection();
 
         // mihomo compat: single info log per connection (tunnel.go:617-629)
-        if let Some(ci) = self.connections.get(&conn_id_str) {
+        if let Some(ci) = self.connections.get(&conn_id) {
             let chains_str = format!("{:?}", ci.chains);
             if !ci.rule_payload.is_empty() {
                 info!(
@@ -798,7 +803,7 @@ impl ConnectionManager {
             relay_bidirectional(local_plain, remote_counted).await;
         });
         self.relay_handles
-            .insert(conn_id_str.clone(), relay_handle.abort_handle());
+            .insert(conn_id.clone(), relay_handle.abort_handle());
 
         // Wait for the relay to complete (normally or via abort from close_connection)
         let _ = relay_handle.await;
@@ -809,9 +814,9 @@ impl ConnectionManager {
         stats.add_upload(up);
         stats.add_download(down);
         stats.remove_connection();
-        self.relay_handles.remove(&*conn_id);
-        self.counters.remove(&*conn_id);
-        self.connections.remove(&*conn_id);
+        self.relay_handles.remove(&conn_id);
+        self.counters.remove(&conn_id);
+        self.connections.remove(&conn_id);
 
         Ok(())
     }
@@ -1091,7 +1096,7 @@ mod tests {
     #[test]
     fn connection_info_serializes_correctly() {
         let info = ConnectionInfo {
-            id: "test-id".to_string(),
+            id: Arc::from("test-id"),
             metadata: ConnectionMetadata {
                 network: "tcp",
                 conn_type: "tun",

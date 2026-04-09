@@ -85,12 +85,10 @@ impl AeadCipher {
         if self.is_ss2022() {
             // SS2022: BLAKE3 key derivation
             // subkey = BLAKE3::derive_key("shadowsocks 2022 session subkey", key || salt)
-            let mut context_material = Vec::with_capacity(key.len() + salt.len());
-            context_material.extend_from_slice(key);
-            context_material.extend_from_slice(salt);
             let mut out = vec![0u8; self.key_len()];
             let mut hasher = blake3::Hasher::new_derive_key("shadowsocks 2022 session subkey");
-            hasher.update(&context_material);
+            hasher.update(key);
+            hasher.update(salt);
             hasher.finalize_xof().fill(&mut out);
             out
         } else {
@@ -156,22 +154,13 @@ fn hkdf_sha1(ikm: &[u8], salt: &[u8], info: &[u8], out_len: usize) -> Vec<u8> {
     okm
 }
 
-/// Encode an Address into shadowsocks address header bytes.
+/// Write an Address as shadowsocks address header bytes into an existing buffer.
 ///
 /// Format: [addr_type(1)][addr_data][port(2 big-endian)]
 ///   addr_type 1 = IPv4 (4 bytes)
 ///   addr_type 3 = domain (1 byte length + domain bytes)
 ///   addr_type 4 = IPv6 (16 bytes)
-pub fn encode_address(addr: &Address) -> Vec<u8> {
-    // Pre-allocate based on address type: IPv4=7, IPv6=19, Domain=4+len
-    let cap = match addr {
-        Address::Ip(sa) => match sa.ip() {
-            std::net::IpAddr::V4(_) => 7,
-            std::net::IpAddr::V6(_) => 19,
-        },
-        Address::Domain(d, _) => 4 + d.len(),
-    };
-    let mut buf = Vec::with_capacity(cap);
+pub fn encode_address_into(addr: &Address, buf: &mut Vec<u8>) {
     match addr {
         Address::Ip(sockaddr) => match sockaddr.ip() {
             std::net::IpAddr::V4(ipv4) => {
@@ -193,18 +182,50 @@ pub fn encode_address(addr: &Address) -> Vec<u8> {
             buf.extend_from_slice(&port.to_be_bytes());
         }
     }
+}
+
+/// Encode an Address into shadowsocks address header bytes.
+pub fn encode_address(addr: &Address) -> Vec<u8> {
+    let cap = match addr {
+        Address::Ip(sa) => match sa.ip() {
+            std::net::IpAddr::V4(_) => 7,
+            std::net::IpAddr::V6(_) => 19,
+        },
+        Address::Domain(d, _) => 4 + d.len(),
+    };
+    let mut buf = Vec::with_capacity(cap);
+    encode_address_into(addr, &mut buf);
     buf
 }
 
+/// Pre-initialized cipher — avoids re-running key expansion on every encrypt/decrypt.
+#[allow(clippy::large_enum_variant)]
+enum CachedCipher {
+    Aes128Gcm(Aes128Gcm),
+    Aes256Gcm(Aes256Gcm),
+    ChaCha20(ChaCha20Poly1305),
+}
+
 /// Encrypt/decrypt dispatcher that works with any of the supported AEAD ciphers.
+/// Cipher object is created once (key expansion) and reused for all operations.
 struct CipherCore {
-    cipher: AeadCipher,
-    key: Vec<u8>,
+    cached: CachedCipher,
 }
 
 impl CipherCore {
     fn new(cipher: AeadCipher, key: Vec<u8>) -> Self {
-        Self { cipher, key }
+        let cached = match cipher {
+            AeadCipher::Aes128Gcm | AeadCipher::Blake3Aes128Gcm => {
+                CachedCipher::Aes128Gcm(Aes128Gcm::new(GenericArray::from_slice(&key)))
+            }
+            AeadCipher::Aes256Gcm | AeadCipher::Blake3Aes256Gcm => {
+                CachedCipher::Aes256Gcm(Aes256Gcm::new(GenericArray::from_slice(&key)))
+            }
+            AeadCipher::ChaCha20Poly1305 | AeadCipher::Blake3ChaCha20Poly1305 => {
+                CachedCipher::ChaCha20(ChaCha20Poly1305::new(GenericArray::from_slice(&key)))
+            }
+        };
+        Self { cached }
     }
 
     /// Encrypt `data` in-place using the given nonce, appending the AEAD tag.
@@ -214,25 +235,16 @@ impl CipherCore {
         data: &mut Vec<u8>,
     ) -> Result<(), io::Error> {
         let nonce_ga = GenericArray::from_slice(nonce);
-        match self.cipher {
-            AeadCipher::Aes128Gcm | AeadCipher::Blake3Aes128Gcm => {
-                let cipher = Aes128Gcm::new(GenericArray::from_slice(&self.key));
-                cipher
-                    .encrypt_in_place(nonce_ga, b"", data)
-                    .map_err(|e| io::Error::other(format!("aes-128-gcm encrypt: {e}")))
-            }
-            AeadCipher::Aes256Gcm | AeadCipher::Blake3Aes256Gcm => {
-                let cipher = Aes256Gcm::new(GenericArray::from_slice(&self.key));
-                cipher
-                    .encrypt_in_place(nonce_ga, b"", data)
-                    .map_err(|e| io::Error::other(format!("aes-256-gcm encrypt: {e}")))
-            }
-            AeadCipher::ChaCha20Poly1305 | AeadCipher::Blake3ChaCha20Poly1305 => {
-                let cipher = ChaCha20Poly1305::new(GenericArray::from_slice(&self.key));
-                cipher
-                    .encrypt_in_place(nonce_ga, b"", data)
-                    .map_err(|e| io::Error::other(format!("chacha20-poly1305 encrypt: {e}")))
-            }
+        match &self.cached {
+            CachedCipher::Aes128Gcm(c) => c
+                .encrypt_in_place(nonce_ga, b"", data)
+                .map_err(|e| io::Error::other(format!("aes-128-gcm encrypt: {e}"))),
+            CachedCipher::Aes256Gcm(c) => c
+                .encrypt_in_place(nonce_ga, b"", data)
+                .map_err(|e| io::Error::other(format!("aes-256-gcm encrypt: {e}"))),
+            CachedCipher::ChaCha20(c) => c
+                .encrypt_in_place(nonce_ga, b"", data)
+                .map_err(|e| io::Error::other(format!("chacha20-poly1305 encrypt: {e}"))),
         }
     }
 
@@ -243,34 +255,25 @@ impl CipherCore {
         data: &mut Vec<u8>,
     ) -> Result<(), io::Error> {
         let nonce_ga = GenericArray::from_slice(nonce);
-        match self.cipher {
-            AeadCipher::Aes128Gcm | AeadCipher::Blake3Aes128Gcm => {
-                let cipher = Aes128Gcm::new(GenericArray::from_slice(&self.key));
-                cipher.decrypt_in_place(nonce_ga, b"", data).map_err(|e| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("aes-128-gcm decrypt: {e}"),
-                    )
-                })
-            }
-            AeadCipher::Aes256Gcm | AeadCipher::Blake3Aes256Gcm => {
-                let cipher = Aes256Gcm::new(GenericArray::from_slice(&self.key));
-                cipher.decrypt_in_place(nonce_ga, b"", data).map_err(|e| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("aes-256-gcm decrypt: {e}"),
-                    )
-                })
-            }
-            AeadCipher::ChaCha20Poly1305 | AeadCipher::Blake3ChaCha20Poly1305 => {
-                let cipher = ChaCha20Poly1305::new(GenericArray::from_slice(&self.key));
-                cipher.decrypt_in_place(nonce_ga, b"", data).map_err(|e| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("chacha20-poly1305 decrypt: {e}"),
-                    )
-                })
-            }
+        match &self.cached {
+            CachedCipher::Aes128Gcm(c) => c.decrypt_in_place(nonce_ga, b"", data).map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("aes-128-gcm decrypt: {e}"),
+                )
+            }),
+            CachedCipher::Aes256Gcm(c) => c.decrypt_in_place(nonce_ga, b"", data).map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("aes-256-gcm decrypt: {e}"),
+                )
+            }),
+            CachedCipher::ChaCha20(c) => c.decrypt_in_place(nonce_ga, b"", data).map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("chacha20-poly1305 decrypt: {e}"),
+                )
+            }),
         }
     }
 }
@@ -645,12 +648,10 @@ fn build_identity_header(
     key_len: usize,
 ) -> [u8; 16] {
     // Derive identity subkey
-    let mut context_material = Vec::with_capacity(server_key.len() + salt.len());
-    context_material.extend_from_slice(server_key);
-    context_material.extend_from_slice(salt);
     let mut identity_subkey = vec![0u8; key_len];
     let mut hasher = blake3::Hasher::new_derive_key("shadowsocks 2022 identity subkey");
-    hasher.update(&context_material);
+    hasher.update(server_key);
+    hasher.update(salt);
     hasher.finalize_xof().fill(&mut identity_subkey);
 
     // Compute psk_hash = blake3::hash(user_psk)[0..16]

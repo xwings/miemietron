@@ -174,7 +174,7 @@ async fn handle_socks5(
 
             // Per-session NAT table: keyed by (client_addr, target) to reuse
             // OutboundPacketConn across datagrams to the same destination.
-            let nat_table: Arc<DashMap<(SocketAddr, String), SocksUdpSession>> =
+            let nat_table: Arc<DashMap<(SocketAddr, Address), SocksUdpSession>> =
                 Arc::new(DashMap::new());
             let timeout_dur = Duration::from_secs(60);
 
@@ -274,7 +274,7 @@ async fn handle_socks5(
                         )
                     };
 
-                    let nat_key = (src, format!("{host}:{port}"));
+                    let nat_key = (src, target.clone());
 
                     // Check if we already have a session for this (src, target) pair
                     if let Some(mut session) = nat_table.get_mut(&nat_key) {

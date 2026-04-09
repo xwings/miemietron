@@ -13,8 +13,7 @@ use tokio::net::UdpSocket;
 use tracing::debug;
 
 use super::aead::{
-    decrypt_in_place_standalone, encrypt_in_place_standalone, encode_address, generate_salt,
-    AeadCipher,
+    decrypt_in_place_standalone, encode_address_into, encrypt_in_place_standalone, AeadCipher,
 };
 use crate::common::addr::Address;
 
@@ -62,22 +61,23 @@ impl SsUdpSocket {
     ///
     /// Constructs the packet: `[salt][encrypted(addr_header + data) + tag]`
     pub async fn send_to(&self, data: &[u8], target: &Address) -> Result<usize> {
-        let salt = generate_salt(self.cipher.salt_len());
+        let salt_len = self.cipher.salt_len();
 
-        // Derive per-packet subkey from master key + salt
-        let subkey = self.cipher.derive_subkey(&self.master_key, &salt);
-
-        // Build plaintext: addr_header + data
-        let addr_header = encode_address(target);
-        let mut plaintext = Vec::with_capacity(addr_header.len() + data.len());
-        plaintext.extend_from_slice(&addr_header);
+        // Single allocation: [salt | addr_header + data (plaintext, encrypted in-place + tag)]
+        let mut plaintext = Vec::with_capacity(data.len() + 32); // 32 covers max addr header
+        encode_address_into(target, &mut plaintext);
         plaintext.extend_from_slice(data);
+
+        // Generate salt into a stack buffer and derive subkey
+        let mut salt = vec![0u8; salt_len];
+        rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut salt);
+        let subkey = self.cipher.derive_subkey(&self.master_key, &salt);
 
         // Encrypt in place (appends tag)
         encrypt_in_place_standalone(&self.cipher, &subkey, &ZERO_NONCE, &mut plaintext)?;
 
         // Build wire packet: salt + ciphertext_with_tag
-        let mut packet = Vec::with_capacity(salt.len() + plaintext.len());
+        let mut packet = Vec::with_capacity(salt_len + plaintext.len());
         packet.extend_from_slice(&salt);
         packet.extend_from_slice(&plaintext);
 
@@ -212,6 +212,7 @@ fn parse_address(data: &[u8]) -> Result<(Address, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::aead::{encode_address, generate_salt};
     use crate::common::addr::Address;
 
     #[test]
