@@ -354,11 +354,20 @@ pub struct SelectBody {
     name: String,
 }
 
+/// mihomo compat: accept JSON body regardless of Content-Type header.
+/// Metacubexd dashboard sends `body: JSON.stringify(...)` via ky library
+/// which does NOT set Content-Type: application/json. mihomo's Go
+/// render.DecodeJSON reads the body regardless. axum's Json<T> extractor
+/// rejects requests without the header (415), breaking the dashboard.
 pub async fn put_proxy(
     State(state): State<ApiState>,
     Path(group_name): Path<String>,
-    Json(body): Json<SelectBody>,
+    body: axum::body::Bytes,
 ) -> StatusCode {
+    let body: SelectBody = match serde_json::from_slice(&body) {
+        Ok(b) => b,
+        Err(_) => return StatusCode::BAD_REQUEST,
+    };
     let proxy_manager = state.app.proxy_manager();
     if proxy_manager.select_proxy(&group_name, &body.name) {
         tracing::info!("Selected proxy '{}' in group '{}'", body.name, group_name);

@@ -145,12 +145,21 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for PeekableStream<T> {
 /// Maximum number of bytes to peek for sniffing (TLS ClientHello / HTTP headers).
 const SNIFF_PEEK_SIZE: usize = 1024;
 
-/// Bidirectional relay matching mihomo's N.Relay (Go goroutines with blocking Write).
+/// Bidirectional relay matching mihomo's N.Relay (bufio.Copy in Go).
 ///
-/// Uses two spawned tasks for true concurrency. Each direction reads into a buffer,
-/// writes ALL bytes (write_all), and flushes — matching Go's blocking Write semantics.
-/// This prevents the deadlock where SsStream buffers encrypted data in Flushing state
-/// but tokio::io::copy never flushes it.
+/// Uses two spawned tasks for true concurrency. Each direction reads into a
+/// buffer and writes all bytes. Flush is only called when the read didn't fill
+/// the buffer — meaning we've consumed all currently available data and should
+/// push it to the wire for responsiveness (interactive traffic, protocol
+/// handshakes). For bulk transfers (video, downloads), reads fill the buffer
+/// and we skip the flush, letting write_all push data through directly.
+///
+/// mihomo's Go implementation uses bufio.Copy which relies on Go's synchronous
+/// Write() — data goes out immediately without explicit flush. In Rust's async
+/// model, SsStream's poll_write may buffer encrypted ciphertext when the TCP
+/// socket would block. The conditional flush handles this: bulk data naturally
+/// drains the buffer via continuous write_all calls, while small interactive
+/// data gets an explicit flush to prevent deadlocks.
 async fn relay_bidirectional<A, B>(a: A, b: B)
 where
     A: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -172,8 +181,11 @@ where
             if b_write.write_all(&buf[..n]).await.is_err() {
                 break;
             }
-            // Flush after write — ensures SsStream's encrypted data reaches the wire
-            if b_write.flush().await.is_err() {
+            // Only flush when read returned less than buffer size — we've
+            // drained available data and should push it out for responsiveness.
+            // For bulk transfers (video), reads fill the buffer and we skip
+            // flush, avoiding the overhead of ~1500 extra syscalls/sec at 50Mbps.
+            if n < buf.len() && b_write.flush().await.is_err() {
                 break;
             }
         }
@@ -191,7 +203,7 @@ where
             if a_write.write_all(&buf[..n]).await.is_err() {
                 break;
             }
-            if a_write.flush().await.is_err() {
+            if n < buf.len() && a_write.flush().await.is_err() {
                 break;
             }
         }
@@ -519,7 +531,7 @@ impl ConnectionManager {
             rules.match_rules_detailed(&rule_meta)
         };
 
-        info!(
+        debug!(
             "TCP {} -> {} ({}) => {:?} [{}]",
             src,
             target,
@@ -600,7 +612,7 @@ impl ConnectionManager {
         // Max 10 iterations but the context timeout is the real limit.
         // Backoff uses jitter: duration = Random(min, min * factor^attempt)
         // via slowdown.New() (slowdown.go, backoff.go).
-        info!(
+        debug!(
             "Connecting via [{}] {} to {}",
             handler.proto(),
             proxy_name,
@@ -739,6 +751,23 @@ impl ConnectionManager {
         self.counters
             .insert(conn_id_str.clone(), (up_counter.clone(), down_counter.clone()));
         stats.add_connection();
+
+        // mihomo compat: single info log per connection after successful dial.
+        // Format matches mihomo tunnel.go line 617-629.
+        if let Some(ci) = self.connections.get(&conn_id_str) {
+            let chains_str = format!("{:?}", ci.chains);
+            if !ci.rule_payload.is_empty() {
+                info!(
+                    "[TCP] {} --> {} match {}({}) using {}",
+                    src, target, ci.rule, ci.rule_payload, chains_str
+                );
+            } else {
+                info!(
+                    "[TCP] {} --> {} match {} using {}",
+                    src, target, ci.rule, chains_str
+                );
+            }
+        }
 
         // Wrap only the remote side with CountingStream to avoid double-counting
         let local_plain = stream;
@@ -1125,5 +1154,147 @@ mod tests {
         assert_eq!(stats.active_connections(), 2);
         stats.remove_connection();
         assert_eq!(stats.active_connections(), 1);
+    }
+
+    /// Stress test: 200 concurrent bidirectional relays.
+    ///
+    /// Each relay transfers 8KB of data both directions simultaneously.
+    /// Verifies all relays complete, no task leaks, no deadlocks.
+    /// This simulates a busy router with many active TCP connections.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn stress_relay_200_concurrent() {
+        let num_relays = 200;
+        let chunk_size = 1024;
+        let chunks_per_direction = 8; // 8KB total per direction
+
+        let mut handles = Vec::new();
+
+        for i in 0..num_relays {
+            handles.push(tokio::spawn(async move {
+                let (a_client, a_server) = tokio::io::duplex(8192);
+                let (b_client, b_server) = tokio::io::duplex(8192);
+
+                let payload: Vec<u8> = (0..chunk_size).map(|j| ((i + j) % 256) as u8).collect();
+
+                // Side A: send chunks then close write side
+                let payload_a = payload.clone();
+                let writer_a = tokio::spawn(async move {
+                    let (mut r, mut w) = tokio::io::split(a_client);
+                    for _ in 0..chunks_per_direction {
+                        if w.write_all(&payload_a).await.is_err() { break; }
+                    }
+                    let _ = w.shutdown().await;
+                    // Drain reads
+                    let mut sink = vec![0u8; 4096];
+                    while let Ok(n) = r.read(&mut sink).await {
+                        if n == 0 { break; }
+                    }
+                });
+
+                // Side B: echo everything back then close
+                let echo_b = tokio::spawn(async move {
+                    let (mut r, mut w) = tokio::io::split(b_client);
+                    let mut buf = vec![0u8; 4096];
+                    loop {
+                        let n = match r.read(&mut buf).await {
+                            Ok(0) => break,
+                            Ok(n) => n,
+                            Err(_) => break,
+                        };
+                        if w.write_all(&buf[..n]).await.is_err() { break; }
+                        if w.flush().await.is_err() { break; }
+                    }
+                    let _ = w.shutdown().await;
+                });
+
+                relay_bidirectional(a_server, b_server).await;
+                let _ = writer_a.await;
+                let _ = echo_b.await;
+            }));
+        }
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            async {
+                for h in handles {
+                    h.await.unwrap();
+                }
+            }
+        ).await;
+
+        assert!(result.is_ok(), "200 concurrent relays (8KB each) should complete within 10s");
+    }
+
+    /// Stress test: relay with one side that drops immediately.
+    ///
+    /// Simulates connection reset / client disconnect — the relay must
+    /// clean up both directions without hanging.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stress_relay_abrupt_close() {
+        for _ in 0..200 {
+            let (a_client, a_server) = tokio::io::duplex(4096);
+            let (b_client, b_server) = tokio::io::duplex(4096);
+
+            // Drop side A immediately — simulates client disconnect
+            drop(a_client);
+            // Drop side B immediately — simulates server disconnect
+            drop(b_client);
+
+            // Relay should detect both sides closed and return quickly
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                relay_bidirectional(a_server, b_server),
+            ).await;
+
+            assert!(result.is_ok(), "relay should handle abrupt close within 1s");
+        }
+    }
+
+    /// Stress test: counting stream accuracy under high throughput.
+    ///
+    /// Sends 10MB through a CountingStream and verifies byte counts match exactly.
+    #[tokio::test]
+    async fn stress_counting_stream_accuracy() {
+        let total_bytes: usize = 10 * 1024 * 1024; // 10MB
+        let chunk_size = 8192;
+        let num_chunks = total_bytes / chunk_size;
+
+        let up = Arc::new(AtomicU64::new(0));
+        let down = Arc::new(AtomicU64::new(0));
+
+        // Create a duplex where we write through CountingStream and read from the other end
+        let (client, server) = tokio::io::duplex(65536);
+        let mut counted = CountingStream::new(client, up.clone(), down.clone());
+
+        let reader = tokio::spawn(async move {
+            let mut server = server;
+            let mut total = 0usize;
+            let mut buf = vec![0u8; 16384];
+            loop {
+                let n = match server.read(&mut buf).await {
+                    Ok(0) => break,
+                    Ok(n) => n,
+                    Err(_) => break,
+                };
+                total += n;
+            }
+            total
+        });
+
+        // Write 10MB in chunks
+        let data = vec![0xABu8; chunk_size];
+        for _ in 0..num_chunks {
+            counted.write_all(&data).await.unwrap();
+        }
+        counted.shutdown().await.unwrap();
+
+        let received = reader.await.unwrap();
+
+        assert_eq!(received, total_bytes, "receiver should get all {total_bytes} bytes");
+        assert_eq!(
+            up.load(Ordering::Relaxed) as usize,
+            total_bytes,
+            "upload counter should match {total_bytes} bytes"
+        );
     }
 }

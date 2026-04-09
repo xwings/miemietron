@@ -6,7 +6,7 @@
 //! fastest) and `FallbackGroup` (first alive).
 
 use std::collections::HashMap;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -106,6 +106,9 @@ pub fn spawn_health_checks(
         let dns = dns.clone();
 
         let lazy = checkable.lazy();
+        // mihomo compat: singleDo guard prevents overlapping health checks.
+        // If a check is still running when the next tick fires, skip it.
+        let checking = Arc::new(AtomicBool::new(false));
         let handle = tokio::spawn(async move {
             info!(
                 "Health check loop started for '{}' (interval: {:?}, lazy: {})",
@@ -117,17 +120,12 @@ pub fn spawn_health_checks(
             checkable.after_health_check();
 
             let mut ticker = time::interval(interval);
-            // The first tick fires immediately — we already did the initial
-            // check above, so skip it.
             ticker.tick().await;
 
             loop {
                 ticker.tick().await;
 
                 // mihomo compat: lazy health check mode.
-                // If lazy is enabled, skip the check if the group hasn't been
-                // used (touched) within the last interval.
-                // Matches mihomo's healthcheck.go process() logic.
                 if lazy {
                     let last = checkable.last_touch_millis();
                     let now = std::time::SystemTime::now()
@@ -135,17 +133,23 @@ pub fn spawn_health_checks(
                         .unwrap_or_default()
                         .as_millis() as u64;
                     if last == 0 || now.saturating_sub(last) > interval.as_millis() as u64 {
-                        debug!(
-                            "Skip health check for '{}' (lazy, idle)",
-                            group_name
-                        );
+                        debug!("Skip health check for '{}' (lazy, idle)", group_name);
                         continue;
                     }
                 }
 
+                // mihomo compat: singleDo dedup — skip if previous check is still running.
+                // Matches healthcheck.go line 128: `singleDo.Do(func() { ... })`.
+                if checking.swap(true, Ordering::SeqCst) {
+                    debug!("Skip health check for '{}' (previous still running)", group_name);
+                    continue;
+                }
+                let checking_flag = checking.clone();
+
                 debug!("Running health check for '{}'", group_name);
                 checkable.health_check(&proxies, &dns).await;
                 checkable.after_health_check();
+                checking_flag.store(false, Ordering::SeqCst);
             }
         });
 

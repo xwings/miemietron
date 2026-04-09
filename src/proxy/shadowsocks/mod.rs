@@ -165,7 +165,7 @@ impl ShadowsocksOutbound {
                 e
             )
         })?;
-        info!("ss: TCP connected to {}:{}", addr.ip(), addr.port());
+        debug!("ss: TCP connected to {}:{}", addr.ip(), addr.port());
         Ok(stream)
     }
 }

@@ -374,11 +374,21 @@ pin_project! {
         enc_cipher: Option<CipherCore>,
         enc_nonce: NonceCounter,
         write_state: WriteState,
+        // Reusable buffers for encryption to avoid per-write heap allocations.
+        // At 4K video throughput (~50Mbps), poll_write is called ~3000 times/sec.
+        // Without reuse, each call allocated ~32KB of Vecs (len_buf + payload_buf + out).
+        write_out_buf: Vec<u8>,
+        write_payload_buf: Vec<u8>,
 
         // Decrypt state (read path)
         dec_cipher: Option<CipherCore>,
         dec_nonce: NonceCounter,
         read_state: ReadState,
+        // Reusable read buffer — avoids Vec::new() on every state transition.
+        // The read cycle (WaitingLength→WaitingPayload→Buffered→repeat)
+        // ran ~3000 times/sec for 4K video, each allocating/dropping ~16KB Vecs.
+        // musl's allocator never returns this fragmented memory to the OS.
+        read_reuse_buf: Vec<u8>,
     }
 }
 
@@ -443,6 +453,9 @@ impl<T> SsStream<T> {
             (WriteState::Flushing { buf, pos: 0 }, nonce)
         };
 
+        // Pre-allocate write buffers for the largest possible chunk.
+        // Legacy MAX_PAYLOAD_SIZE=16383, SS2022 MAX_PAYLOAD_SIZE_2022=32734.
+        let max_chunk = if is_ss2022 { MAX_PAYLOAD_SIZE_2022 } else { MAX_PAYLOAD_SIZE };
         Self {
             inner,
             cipher_type: cipher,
@@ -452,9 +465,12 @@ impl<T> SsStream<T> {
             enc_cipher: Some(enc_cipher),
             enc_nonce,
             write_state,
+            write_out_buf: Vec::with_capacity(2 + TAG_LEN + max_chunk + TAG_LEN),
+            write_payload_buf: Vec::with_capacity(max_chunk + TAG_LEN),
             dec_cipher: None,
             dec_nonce: NonceCounter::new(),
             read_state: ReadState::WaitingSalt { buf: Vec::new() },
+            read_reuse_buf: Vec::with_capacity(max_chunk + TAG_LEN),
         }
     }
 
@@ -1392,8 +1408,10 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncRead for SsStream<T> {
                         )));
                     }
 
+                    // Reuse the read buffer instead of allocating a new Vec
+                    me.read_reuse_buf.clear();
                     *me.read_state = ReadState::WaitingPayload {
-                        buf: Vec::new(),
+                        buf: std::mem::take(me.read_reuse_buf),
                         payload_len,
                     };
                 }
@@ -1445,7 +1463,14 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncRead for SsStream<T> {
                 } => {
                     let remaining = &dec_buf[*pos..];
                     if remaining.is_empty() {
-                        *me.read_state = ReadState::WaitingLength { buf: Vec::new() };
+                        // Reclaim buffer for reuse instead of dropping + allocating
+                        if let ReadState::Buffered { buf, .. } =
+                            std::mem::replace(me.read_state, ReadState::WaitingLength { buf: Vec::new() })
+                        {
+                            *me.read_reuse_buf = buf;
+                        }
+                        // Set up WaitingLength with a small reused buffer
+                        // (the main read_reuse_buf is reserved for the larger payload)
                         continue;
                     }
 
@@ -1564,7 +1589,12 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncWrite for SsStream<T> {
                     Poll::Pending => return Poll::Pending,
                 }
             }
-            *me.write_state = WriteState::Ready;
+            // Reclaim the flushed buffer for reuse instead of dropping it
+            if let WriteState::Flushing { buf, .. } =
+                std::mem::replace(me.write_state, WriteState::Ready)
+            {
+                *me.write_out_buf = buf;
+            }
         }
 
         // Now encrypt the new data
@@ -1586,19 +1616,26 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncWrite for SsStream<T> {
         let chunk_len = std::cmp::min(max_size, data.len());
         let chunk = &data[..chunk_len];
 
-        let mut out = Vec::with_capacity(2 + TAG_LEN + chunk_len + TAG_LEN);
-
-        // Encrypt length
-        let mut len_buf = Vec::from([(chunk_len >> 8) as u8, (chunk_len & 0xFF) as u8]);
-        enc.encrypt_in_place(me.enc_nonce.current(), &mut len_buf)?;
+        // Reuse pre-allocated buffers instead of allocating new Vecs per write.
+        // Encrypt length (2 bytes -> 2 + TAG_LEN after encryption)
+        me.write_out_buf.clear();
+        me.write_out_buf.push((chunk_len >> 8) as u8);
+        me.write_out_buf.push((chunk_len & 0xFF) as u8);
+        enc.encrypt_in_place(me.enc_nonce.current(), me.write_out_buf)?;
         me.enc_nonce.increment();
-        out.extend_from_slice(&len_buf);
 
-        // Encrypt payload
-        let mut payload_buf = chunk.to_vec();
-        enc.encrypt_in_place(me.enc_nonce.current(), &mut payload_buf)?;
+        // Encrypt payload using reusable buffer
+        me.write_payload_buf.clear();
+        me.write_payload_buf.extend_from_slice(chunk);
+        enc.encrypt_in_place(me.enc_nonce.current(), me.write_payload_buf)?;
         me.enc_nonce.increment();
-        out.extend_from_slice(&payload_buf);
+
+        // Build the output: [encrypted_len + tag][encrypted_payload + tag]
+        // Swap out_buf and write_out_buf so out_buf has len prefix, then append payload
+        let out_len = me.write_out_buf.len() + me.write_payload_buf.len();
+        let mut out = std::mem::take(me.write_out_buf);
+        out.reserve(out_len - out.len());
+        out.extend_from_slice(me.write_payload_buf);
 
         // Write the encrypted chunk. Try to write all of it in a loop.
         // If the inner stream can't accept all data, buffer the remainder
@@ -1622,6 +1659,8 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncWrite for SsStream<T> {
                 }
             }
         }
+        // Write completed fully — reclaim the buffer for reuse
+        *me.write_out_buf = out;
         Poll::Ready(Ok(chunk_len))
     }
 
@@ -1650,7 +1689,14 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncWrite for SsStream<T> {
                 }
             }
         }
-        *me.write_state = WriteState::Ready;
+        // Reclaim the flushed buffer for reuse
+        if let WriteState::Flushing { buf, .. } =
+            std::mem::replace(me.write_state, WriteState::Ready)
+        {
+            *me.write_out_buf = buf;
+        } else {
+            *me.write_state = WriteState::Ready;
+        }
 
         me.inner.as_mut().poll_flush(cx)
     }

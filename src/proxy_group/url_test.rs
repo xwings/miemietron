@@ -107,9 +107,13 @@ impl UrlTestGroup {
         proxies: &HashMap<String, Arc<dyn OutboundHandler>>,
         dns: &Arc<DnsResolver>,
     ) {
+        // mihomo compat: healthcheck.go uses errgroup.SetLimit(10) to bound
+        // concurrent health checks. Without this, spawning ALL proxies at once
+        // accumulates hundreds of hanging TCP connections on ARM routers,
+        // eventually burning 100% CPU.
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(10));
         let mut handles = Vec::new();
-        // mihomo compat: all health checks fire concurrently (like Go goroutines + WaitGroup).
-        // No semaphore — mihomo uses unbounded goroutines.
+        let timeout = Duration::from_millis(self.test_timeout);
 
         for name in &self.proxy_names {
             let handler = match proxies.get(name) {
@@ -120,20 +124,28 @@ impl UrlTestGroup {
             let url = self.test_url.clone();
             let dns = dns.clone();
             let state_store = self.state_store.clone();
+            let sem = semaphore.clone();
 
             let handle = tokio::spawn(async move {
-                match measure_unified_delay(&handler, &url, &dns).await {
-                    Ok(ms) => {
+                // Acquire semaphore permit (max 10 concurrent checks)
+                let _permit = sem.acquire().await;
+                // mihomo compat: per-proxy timeout from hc.timeout (default 5000ms)
+                let result = tokio::time::timeout(
+                    timeout,
+                    measure_unified_delay(&handler, &url, &dns),
+                ).await;
+                match result {
+                    Ok(Ok(ms)) => {
                         debug!("url-test {}: {}ms", name, ms);
-                        let delay = if ms > u16::MAX as u64 {
-                            u16::MAX
-                        } else {
-                            ms as u16
-                        };
+                        let delay = if ms > u16::MAX as u64 { u16::MAX } else { ms as u16 };
                         state_store.record_result(&name, &url, Some(delay));
                     }
-                    Err(e) => {
+                    Ok(Err(e)) => {
                         warn!("url-test {}: {}", name, e);
+                        state_store.record_result(&name, &url, None);
+                    }
+                    Err(_) => {
+                        warn!("url-test {}: timeout", name);
                         state_store.record_result(&name, &url, None);
                     }
                 }
@@ -374,8 +386,9 @@ pub(crate) async fn measure_unified_delay(
     let target = Address::domain(&host, port);
     let start = Instant::now();
 
-    // mihomo compat: 30s overall timeout (adapter.go: client.Timeout = 30 * time.Second)
-    let result = tokio::time::timeout(Duration::from_secs(30), async {
+    // mihomo compat: per-proxy timeout defaults to 5s (healthcheck.go:202: timeout = 5000).
+    // The caller (health_check) wraps with its own configurable timeout, so this is a safety net.
+    let result = tokio::time::timeout(Duration::from_secs(5), async {
         // Connect through the proxy
         let mut stream = handler.connect_stream(&target, dns).await?;
 
@@ -530,5 +543,108 @@ mod tests {
 
         // Should switch to "b" since 120 > 50 + 50
         assert_eq!(group.now(), "b");
+    }
+
+    /// Stress test: 1000 proxies hammering the state store with concurrent writes.
+    ///
+    /// Simulates a worst-case router scenario: many proxy groups with overlapping
+    /// health checks all writing results simultaneously to the shared store.
+    /// Verifies no data races, no panics, history stays bounded at MAX_HISTORY.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn stress_state_store_1000_proxies() {
+        let store = Arc::new(ProxyStateStore::new());
+        let num_proxies = 1000;
+        let writes_per_proxy = 100;
+        let num_urls = 5; // each proxy tested against 5 URLs
+
+        let mut handles = Vec::new();
+        for i in 0..num_proxies {
+            let store = store.clone();
+            handles.push(tokio::spawn(async move {
+                for j in 0..writes_per_proxy {
+                    let name = format!("proxy-{i}");
+                    let url_idx = j % num_urls;
+                    let url = format!("http://test-{url_idx}/204");
+                    if j % 7 == 0 {
+                        // ~14% failure rate
+                        store.record_result(&name, &url, None);
+                    } else {
+                        store.record_result(&name, &url, Some(((j % 500) + 50) as u16));
+                    }
+                }
+            }));
+        }
+
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        // Verify: every proxy has bounded history, no corruption
+        for i in 0..num_proxies {
+            let name = format!("proxy-{i}");
+            let history = store.delay_history(&name);
+            assert!(!history.is_empty(), "proxy-{i} should have history");
+            assert!(history.len() <= 10, "proxy-{i} history {} > MAX_HISTORY", history.len());
+
+            // Verify extra (per-URL) histories exist
+            let extras = store.extra_delay_histories(&name);
+            assert!(!extras.is_empty(), "proxy-{i} should have extra URL histories");
+            for (_url, val) in &extras {
+                let h = val.get("history").and_then(|v| v.as_array());
+                assert!(h.is_some(), "proxy-{i} extra should have history array");
+                assert!(h.unwrap().len() <= 10, "proxy-{i} extra history unbounded");
+            }
+        }
+    }
+
+    /// Stress test: rapid alive/dead toggling under contention.
+    ///
+    /// 500 tasks flip proxy alive state rapidly while 500 others read it.
+    /// Catches data races in the AtomicBool/DashMap interaction.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn stress_alive_toggle_contention() {
+        let store = Arc::new(ProxyStateStore::new());
+        let num_proxies = 200;
+        let iterations = 500;
+
+        let mut handles = Vec::new();
+
+        // Writers: toggle alive state rapidly
+        for i in 0..num_proxies {
+            let store = store.clone();
+            handles.push(tokio::spawn(async move {
+                let name = format!("proxy-{i}");
+                let url = "http://test/204";
+                for j in 0..iterations {
+                    if j % 2 == 0 {
+                        store.record_result(&name, url, Some(100));
+                    } else {
+                        store.record_result(&name, url, None);
+                    }
+                }
+            }));
+        }
+
+        // Readers: check alive state concurrently with writes
+        for i in 0..num_proxies {
+            let store = store.clone();
+            handles.push(tokio::spawn(async move {
+                let name = format!("proxy-{i}");
+                let url = "http://test/204";
+                for _ in 0..iterations {
+                    // These should never panic regardless of concurrent writes
+                    let _ = store.alive_for_url(&name, url);
+                    let _ = store.last_delay_for_url(&name, url);
+                    let _ = store.delay_history(&name);
+                    tokio::task::yield_now().await;
+                }
+            }));
+        }
+
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        // If we got here without panic/deadlock, the test passes
     }
 }

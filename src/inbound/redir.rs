@@ -59,7 +59,7 @@ pub async fn run_redir_listener(port: u16, conn_manager: Arc<ConnectionManager>)
         // mihomo's redir only calls keepalive.TCPKeepAlive(conn).
         // GID 65534 handles firewall bypass for outbound.
 
-        info!("Redir TCP {} -> {} (original)", src, orig_dst);
+        debug!("Redir TCP {} -> {} (original)", src, orig_dst);
 
         let cm = conn_manager.clone();
         tokio::spawn(async move {
@@ -144,7 +144,7 @@ pub async fn run_tproxy_tcp_listener(
 
         // mihomo compat: no SO_MARK on accepted inbound sockets.
 
-        info!("TPROXY TCP {} -> {} (original)", src, orig_dst);
+        debug!("TPROXY TCP {} -> {} (original)", src, orig_dst);
 
         let cm = conn_manager.clone();
         tokio::spawn(async move {

@@ -86,9 +86,10 @@ impl FallbackGroup {
         proxies: &HashMap<String, Arc<dyn OutboundHandler>>,
         dns: &Arc<DnsResolver>,
     ) {
+        // mihomo compat: errgroup.SetLimit(10)
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(10));
         let mut handles = Vec::new();
-        // mihomo compat: all health checks fire concurrently (like Go goroutines + WaitGroup).
-        // No semaphore — mihomo uses unbounded goroutines.
+        let timeout = Duration::from_millis(self.test_timeout);
 
         for name in &self.proxy_names {
             let handler = match proxies.get(name) {
@@ -99,20 +100,26 @@ impl FallbackGroup {
             let url = self.test_url.clone();
             let dns = dns.clone();
             let state_store = self.state_store.clone();
+            let sem = semaphore.clone();
 
             let handle = tokio::spawn(async move {
-                match measure_unified_delay(&handler, &url, &dns).await {
-                    Ok(ms) => {
+                let _permit = sem.acquire().await;
+                let result = tokio::time::timeout(
+                    timeout,
+                    measure_unified_delay(&handler, &url, &dns),
+                ).await;
+                match result {
+                    Ok(Ok(ms)) => {
                         debug!("fallback {}: alive ({}ms)", name, ms);
-                        let delay = if ms > u16::MAX as u64 {
-                            u16::MAX
-                        } else {
-                            ms as u16
-                        };
+                        let delay = if ms > u16::MAX as u64 { u16::MAX } else { ms as u16 };
                         state_store.record_result(&name, &url, Some(delay));
                     }
-                    Err(e) => {
+                    Ok(Err(e)) => {
                         warn!("fallback {}: {}", name, e);
+                        state_store.record_result(&name, &url, None);
+                    }
+                    Err(_) => {
+                        warn!("fallback {}: timeout", name);
                         state_store.record_result(&name, &url, None);
                     }
                 }
