@@ -360,17 +360,6 @@ async fn async_main() -> Result<()> {
         }
     }
 
-    // Log process identity for OpenClash firewall bypass debugging
-    #[cfg(unix)]
-    {
-        let gid = unsafe { libc::getgid() };
-        let uid = unsafe { libc::getuid() };
-        let egid = unsafe { libc::getegid() };
-        eprintln!(
-            "Process identity: uid={uid} gid={gid} egid={egid} (need gid=65534 for OpenClash bypass)"
-        );
-    }
-
     // Load config FIRST so we can use its log-level for tracing init
     let config_path = resolve_config_path(&cli);
     let mut config = MiemieConfig::load(&config_path)?;
@@ -406,6 +395,17 @@ async fn async_main() -> Result<()> {
             .with(fmt_layer)
             .with(broadcast_layer)
             .init();
+    }
+
+    // Log process identity for OpenClash firewall bypass debugging
+    #[cfg(unix)]
+    {
+        let gid = unsafe { libc::getgid() };
+        let uid = unsafe { libc::getuid() };
+        let egid = unsafe { libc::getegid() };
+        info!(
+            "Process identity: uid={uid} gid={gid} egid={egid} (need gid=65534 for OpenClash bypass)"
+        );
     }
 
     info!("Loading config from: {}", config_path.display());
