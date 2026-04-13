@@ -1,3 +1,4 @@
+pub mod anytls;
 pub mod direct;
 pub mod http;
 pub mod shadowsocks;
@@ -588,6 +589,24 @@ impl ProxyManager {
                         Some(Arc::new(direct::PlaceholderOutbound::new(
                             config.name.clone(),
                             "snell",
+                            config.routing_mark,
+                        )))
+                    }
+                }
+            }
+            "anytls" => {
+                info!("Loading AnyTLS proxy: {}", config.name);
+                match anytls::AnytlsOutbound::from_config(config) {
+                    Ok(handler) => Some(Arc::new(handler)),
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to load AnyTLS proxy '{}': {}, using placeholder",
+                            config.name,
+                            e
+                        );
+                        Some(Arc::new(direct::PlaceholderOutbound::new(
+                            config.name.clone(),
+                            "anytls",
                             config.routing_mark,
                         )))
                     }
