@@ -12,7 +12,12 @@ Tested with 3 devices. Running few Youtube live stream and few 4K video.
 
 ## Tested On
 
+### Firmware
 Only tested on vanilla OpenWrt with OpenClash. The firmware used for testing is [xwingswrt](https://github.com/xwings/xwingswrt). Other variants of OpenWrt (iStoreOS, ImmortalWrt, etc.) have not been tested and may have compatibility issues.
+
+###  Rules
+- [Iran v2ray rules](https://github.com/chocolate4u/Iran-v2ray-rules) (License: **GPL-3.0**): _Enhanced v2ray/xray and v2ray/xray-clients routing rules with built-in Iranian domains and a focus on security and adblocking._
+- [Russia v2ray rules](https://github.com/runetfreedom/russia-v2ray-rules-dat) (License: **GPL-3.0**): _This repository contains automatically updated V2Ray routing rules based on data on blocked domains and addresses in Russia._
 
 ## Features
 
