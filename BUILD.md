@@ -82,10 +82,10 @@ Pushing a `v*` tag triggers GitHub Actions CI which automatically:
 ```bash
 # 1. Bump version in Cargo.toml
 # 2. Commit and tag
-git checkout released
+git checkout main
 git merge dev
 git tag v0.2.0
-git push origin released --tags
+git push origin main --tags
 ```
 
 
