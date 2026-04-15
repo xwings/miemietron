@@ -392,6 +392,11 @@ Map mihomo's Go to our Rust before touching code:
 
 #### Integration Test Procedure
 
+> **Note:** The credentials and bearer token shown below (`Clash:R8gfmOu9`,
+> `EAMRmLxz`) are examples from one local dev config. Replace them with the
+> `authentication` / `secret` values from whichever YAML and environment you're
+> actually testing against — do not copy these verbatim into other setups.
+
 Run miemietron against the active OpenClash config with a timeout:
 
 ```bash
