@@ -30,17 +30,22 @@ pub async fn get_connections(
             .uri()
             .query()
             .and_then(|q| {
-                q.split('&')
-                    .find_map(|pair| {
-                        let (k, v) = pair.split_once('=')?;
-                        if k == "interval" { v.parse::<u64>().ok() } else { None }
-                    })
+                q.split('&').find_map(|pair| {
+                    let (k, v) = pair.split_once('=')?;
+                    if k == "interval" {
+                        v.parse::<u64>().ok()
+                    } else {
+                        None
+                    }
+                })
             })
             .unwrap_or(1000);
 
         let (mut parts, _body) = request.into_parts();
         match WebSocketUpgrade::from_request_parts(&mut parts, &state).await {
-            Ok(ws) => ws.on_upgrade(move |socket| handle_connections_ws(socket, state, interval_ms)),
+            Ok(ws) => {
+                ws.on_upgrade(move |socket| handle_connections_ws(socket, state, interval_ms))
+            }
             Err(e) => e.into_response(),
         }
     } else {

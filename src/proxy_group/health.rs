@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use tokio::sync::Notify;
 use tokio::time;
 use tracing::{debug, info};
 
@@ -76,6 +77,25 @@ impl HealthCheckable {
             HealthCheckable::Fallback(_) => {}
         }
     }
+
+    /// Notify handle used by `on_dial_failed` to trigger an immediate check.
+    /// mihomo compat: matches GroupBase.healthCheck() being called from
+    /// onDialFailed paths.
+    fn health_notify(&self) -> Arc<Notify> {
+        match self {
+            HealthCheckable::UrlTest(g) => g.health_notify.clone(),
+            HealthCheckable::Fallback(g) => g.health_notify.clone(),
+        }
+    }
+
+    /// Toggle the `failedTesting` flag while a triggered check runs.
+    /// mihomo compat: groupbase.go healthCheck() sets/clears failedTesting.
+    fn set_health_testing(&self, running: bool) {
+        match self {
+            HealthCheckable::UrlTest(g) => g.set_health_testing(running),
+            HealthCheckable::Fallback(g) => g.set_health_testing(running),
+        }
+    }
 }
 
 /// Spawn background health-check tasks for all url-test and fallback groups.
@@ -106,6 +126,7 @@ pub fn spawn_health_checks(
         let dns = dns.clone();
 
         let lazy = checkable.lazy();
+        let notify = checkable.health_notify();
         // mihomo compat: singleDo guard prevents overlapping health checks.
         // If a check is still running when the next tick fires, skip it.
         let checking = Arc::new(AtomicBool::new(false));
@@ -123,10 +144,17 @@ pub fn spawn_health_checks(
             ticker.tick().await;
 
             loop {
-                ticker.tick().await;
+                // Wake on either the periodic tick or a failure-driven trigger
+                // (on_dial_failed -> do_health_check -> notify_one).
+                let triggered = tokio::select! {
+                    _ = ticker.tick() => false,
+                    _ = notify.notified() => true,
+                };
 
-                // mihomo compat: lazy health check mode.
-                if lazy {
+                // Lazy mode applies only to the periodic tick. A failure-driven
+                // trigger always runs — mihomo's GroupBase.healthCheck() does not
+                // consult the lazy/lastTouch state.
+                if !triggered && lazy {
                     let last = checkable.last_touch_millis();
                     let now = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
@@ -141,14 +169,27 @@ pub fn spawn_health_checks(
                 // mihomo compat: singleDo dedup — skip if previous check is still running.
                 // Matches healthcheck.go line 128: `singleDo.Do(func() { ... })`.
                 if checking.swap(true, Ordering::SeqCst) {
-                    debug!("Skip health check for '{}' (previous still running)", group_name);
+                    debug!(
+                        "Skip health check for '{}' (previous still running)",
+                        group_name
+                    );
                     continue;
                 }
                 let checking_flag = checking.clone();
 
-                debug!("Running health check for '{}'", group_name);
+                debug!(
+                    "Running health check for '{}' ({})",
+                    group_name,
+                    if triggered { "triggered" } else { "periodic" }
+                );
+                if triggered {
+                    checkable.set_health_testing(true);
+                }
                 checkable.health_check(&proxies, &dns).await;
                 checkable.after_health_check();
+                if triggered {
+                    checkable.set_health_testing(false);
+                }
                 checking_flag.store(false, Ordering::SeqCst);
             }
         });

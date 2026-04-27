@@ -185,10 +185,9 @@ async fn handle_socks5(
                 loop {
                     interval.tick().await;
                     let now = Instant::now();
-                    reaper_table
-                        .retain(|_key, session: &mut SocksUdpSession| {
-                            now.duration_since(session.last_active) < Duration::from_secs(60)
-                        });
+                    reaper_table.retain(|_key, session: &mut SocksUdpSession| {
+                        now.duration_since(session.last_active) < Duration::from_secs(60)
+                    });
                 }
             });
 
@@ -225,17 +224,15 @@ async fn handle_socks5(
                             if n < 5 + dlen + 2 {
                                 continue;
                             }
-                            let host =
-                                String::from_utf8_lossy(&buf[5..5 + dlen]).to_string();
-                            let port =
-                                u16::from_be_bytes([buf[5 + dlen], buf[6 + dlen]]);
+                            let host = String::from_utf8_lossy(&buf[5..5 + dlen]).to_string();
+                            let port = u16::from_be_bytes([buf[5 + dlen], buf[6 + dlen]]);
                             (host, port, 7 + dlen)
                         }
                         ATYP_IPV6 if n >= 22 => {
                             let ip = Ipv6Addr::from([
-                                buf[4], buf[5], buf[6], buf[7], buf[8], buf[9],
-                                buf[10], buf[11], buf[12], buf[13], buf[14],
-                                buf[15], buf[16], buf[17], buf[18], buf[19],
+                                buf[4], buf[5], buf[6], buf[7], buf[8], buf[9], buf[10], buf[11],
+                                buf[12], buf[13], buf[14], buf[15], buf[16], buf[17], buf[18],
+                                buf[19],
                             ]);
                             let port = u16::from_be_bytes([buf[20], buf[21]]);
                             (ip.to_string(), port, 22)
@@ -268,10 +265,7 @@ async fn handle_socks5(
                     let dst_sockaddr = if let Ok(ip) = host.parse::<std::net::IpAddr>() {
                         SocketAddr::new(ip, port)
                     } else {
-                        SocketAddr::new(
-                            std::net::IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-                            port,
-                        )
+                        SocketAddr::new(std::net::IpAddr::V4(Ipv4Addr::UNSPECIFIED), port)
                     };
 
                     let nat_key = (src, target.clone());
@@ -296,14 +290,8 @@ async fn handle_socks5(
                     let sock_ref = udp_socket.clone();
 
                     tokio::spawn(async move {
-                        match create_socks_udp_session(
-                            src,
-                            dst_sockaddr,
-                            &data,
-                            &target,
-                            &cm_ref,
-                        )
-                        .await
+                        match create_socks_udp_session(src, dst_sockaddr, &data, &target, &cm_ref)
+                            .await
                         {
                             Ok(outbound) => {
                                 let pc_rev = outbound.clone();
@@ -334,9 +322,7 @@ async fn handle_socks5(
                                                     break;
                                                 }
                                                 // Update last_active timestamp
-                                                if let Some(mut s) =
-                                                    nat_rev.get_mut(&nat_key_rev)
-                                                {
+                                                if let Some(mut s) = nat_rev.get_mut(&nat_key_rev) {
                                                     s.last_active = Instant::now();
                                                 }
                                                 // Build SOCKS5 UDP response:
@@ -345,25 +331,16 @@ async fn handle_socks5(
                                                     3 + header_for_reply.len() + rn,
                                                 );
                                                 reply.extend_from_slice(&[0, 0, 0]); // RSV + FRAG
-                                                reply.extend_from_slice(
-                                                    &header_for_reply,
-                                                ); // ATYP + addr + port
+                                                reply.extend_from_slice(&header_for_reply); // ATYP + addr + port
                                                 reply.extend_from_slice(&rbuf[..rn]);
-                                                if let Err(e) =
-                                                    sock_ref.send_to(&reply, src).await
+                                                if let Err(e) = sock_ref.send_to(&reply, src).await
                                                 {
-                                                    debug!(
-                                                        "SOCKS5 UDP reverse send error: {}",
-                                                        e
-                                                    );
+                                                    debug!("SOCKS5 UDP reverse send error: {}", e);
                                                     break;
                                                 }
                                             }
                                             Ok(Err(e)) => {
-                                                debug!(
-                                                    "SOCKS5 UDP proxy recv error: {}",
-                                                    e
-                                                );
+                                                debug!("SOCKS5 UDP proxy recv error: {}", e);
                                                 break;
                                             }
                                             Err(_) => {
@@ -439,11 +416,9 @@ async fn create_socks_udp_session(
     );
 
     match action {
-        Action::Reject | Action::RejectDrop => {
-            Err(anyhow!(
-                "SOCKS5 UDP packet rejected by rule engine: {src} -> {dst}"
-            ))
-        }
+        Action::Reject | Action::RejectDrop => Err(anyhow!(
+            "SOCKS5 UDP packet rejected by rule engine: {src} -> {dst}"
+        )),
 
         Action::Direct => {
             let handler = proxies
@@ -460,44 +435,12 @@ async fn create_socks_udp_session(
         }
 
         Action::Proxy(ref proxy_name) => {
-            // Try to route through a proxy that supports UDP
-            if let Some(handler) = proxies.resolve(proxy_name) {
-                match handler.connect_datagram(target, dns.clone()).await {
-                    Ok(pc_box) => {
-                        let pc: Arc<dyn OutboundPacketConn> = Arc::from(pc_box);
-
-                        debug!(
-                            "SOCKS5 UDP proxy '{}' session: {} -> {}",
-                            proxy_name, src, target
-                        );
-
-                        pc.send_to(initial_data, target).await?;
-                        return Ok(pc);
-                    }
-                    Err(e) => {
-                        warn!(
-                            "SOCKS5 UDP proxy '{}' connect_datagram failed: {}, falling back to DIRECT",
-                            proxy_name, e
-                        );
-                    }
-                }
-            } else {
-                warn!(
-                    "SOCKS5 UDP proxy '{}' not found, falling back to DIRECT",
-                    proxy_name
-                );
-            }
-
-            // Fallback to DIRECT
-            let direct = proxies
-                .resolve("DIRECT")
-                .ok_or_else(|| anyhow!("DIRECT handler not found"))?;
-
-            let pc: Arc<dyn OutboundPacketConn> =
-                Arc::from(direct.connect_datagram(target, dns).await?);
-
-            debug!("SOCKS5 UDP DIRECT fallback session: {} -> {}", src, target);
-
+            // No silent DIRECT fallback — see ProxyManager::dial_proxy_udp.
+            let pc = proxies.dial_proxy_udp(proxy_name, target, dns).await?;
+            debug!(
+                "SOCKS5 UDP proxy '{}' session: {} -> {}",
+                proxy_name, src, target
+            );
             pc.send_to(initial_data, target).await?;
             Ok(pc)
         }
@@ -534,7 +477,11 @@ async fn read_address(stream: &mut TcpStream, atyp: u8) -> Result<(String, u16)>
 }
 
 /// Send a SOCKS5 reply.
-async fn send_reply(stream: &mut TcpStream, rep: u8, bind_addr: &SocketAddr) -> Result<()> {
+async fn send_reply<S: AsyncWriteExt + Unpin>(
+    stream: &mut S,
+    rep: u8,
+    bind_addr: &SocketAddr,
+) -> Result<()> {
     let mut buf = Vec::with_capacity(32);
     buf.push(SOCKS5_VERSION);
     buf.push(rep);
@@ -590,16 +537,8 @@ mod tests {
 
     #[tokio::test]
     async fn send_reply_ipv4_format() {
-        // Create a pair of connected TCP streams for testing
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-
-        let connect_fut = TcpStream::connect(addr);
-        let accept_fut = listener.accept();
-
-        let (client_res, accept_res) = tokio::join!(connect_fut, accept_fut);
-        let mut client = client_res.unwrap();
-        let (mut server, _) = accept_res.unwrap();
+        // In-memory duplex stream — no privileged socket bind, no env-flake.
+        let (mut client, mut server) = tokio::io::duplex(64);
 
         let bind = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 1080));
         send_reply(&mut server, REP_SUCCESS, &bind).await.unwrap();
@@ -618,15 +557,7 @@ mod tests {
 
     #[tokio::test]
     async fn send_reply_ipv6_format() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-
-        let connect_fut = TcpStream::connect(addr);
-        let accept_fut = listener.accept();
-
-        let (client_res, accept_res) = tokio::join!(connect_fut, accept_fut);
-        let mut client = client_res.unwrap();
-        let (mut server, _) = accept_res.unwrap();
+        let (mut client, mut server) = tokio::io::duplex(64);
 
         let bind = SocketAddr::new(Ipv6Addr::LOCALHOST.into(), 9090);
         send_reply(&mut server, REP_SUCCESS, &bind).await.unwrap();

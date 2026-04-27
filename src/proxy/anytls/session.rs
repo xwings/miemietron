@@ -186,13 +186,10 @@ impl SessionInner {
                         payload.drain(..l);
                     } else if remain > 0 {
                         // payload + padding
-                        let pad_len = l
-                            .saturating_sub(remain)
-                            .saturating_sub(HEADER_OVERHEAD);
+                        let pad_len = l.saturating_sub(remain).saturating_sub(HEADER_OVERHEAD);
                         if pad_len > 0 {
-                            let mut hdr =
-                                encode_header(CMD_WASTE, 0, pad_len as u16).to_vec();
-                            hdr.extend(std::iter::repeat(0u8).take(pad_len));
+                            let mut hdr = encode_header(CMD_WASTE, 0, pad_len as u16).to_vec();
+                            hdr.extend(std::iter::repeat_n(0u8, pad_len));
                             payload.extend_from_slice(&hdr);
                         }
                         ws.writer.write_all(&payload).await?;
@@ -200,7 +197,7 @@ impl SessionInner {
                     } else {
                         // all padding
                         let mut hdr = encode_header(CMD_WASTE, 0, l as u16).to_vec();
-                        hdr.extend(std::iter::repeat(0u8).take(l));
+                        hdr.extend(std::iter::repeat_n(0u8, l));
                         ws.writer.write_all(&hdr).await?;
                     }
                 }
@@ -283,9 +280,7 @@ impl Session {
             ("client", "miemietron"),
             ("padding-md5", md5.as_str()),
         ]);
-        self.inner
-            .write_control_frame(CMD_SETTINGS, 0, &data)
-            .await
+        self.inner.write_control_frame(CMD_SETTINGS, 0, &data).await
     }
 
     /// Open a new stream on this session.
@@ -335,9 +330,7 @@ async fn recv_loop(inner: Arc<SessionInner>, mut reader: BoxedReader) -> io::Res
         if inner.is_closed() {
             return Ok(());
         }
-        if let Err(e) = reader.read_exact(&mut hdr_buf).await {
-            return Err(e);
-        }
+        reader.read_exact(&mut hdr_buf).await?;
         let hdr = Header::parse(&hdr_buf);
         let len = hdr.length as usize;
         let data = if len > 0 {
@@ -354,14 +347,12 @@ async fn recv_loop(inner: Arc<SessionInner>, mut reader: BoxedReader) -> io::Res
                     let _ = tx.send(data);
                 }
             }
-            CMD_SYNACK => {
+            CMD_SYNACK if !data.is_empty() => {
                 // Error report on stream creation (only when data is present).
-                if !data.is_empty() {
-                    let msg = format!("remote: {}", String::from_utf8_lossy(&data));
-                    if let Some(slot) = inner.remove_stream(hdr.sid) {
-                        *slot.die_err.lock() = Some(msg);
-                        slot.die_notify.notify_waiters();
-                    }
+                let msg = format!("remote: {}", String::from_utf8_lossy(&data));
+                if let Some(slot) = inner.remove_stream(hdr.sid) {
+                    *slot.die_err.lock() = Some(msg);
+                    slot.die_notify.notify_waiters();
                 }
             }
             CMD_FIN => {
@@ -375,7 +366,10 @@ async fn recv_loop(inner: Arc<SessionInner>, mut reader: BoxedReader) -> io::Res
             CMD_SETTINGS => { /* server->client direction not expected */ }
             CMD_ALERT => {
                 if !data.is_empty() {
-                    error!("anytls alert from server: {}", String::from_utf8_lossy(&data));
+                    error!(
+                        "anytls alert from server: {}",
+                        String::from_utf8_lossy(&data)
+                    );
                 }
                 inner.close().await;
                 return Ok(());
@@ -483,8 +477,7 @@ impl AsyncWrite for AnytlsStream {
             let session = Arc::clone(&this.session);
             let data = buf.to_vec();
             let n = data.len();
-            let fut: WriteFut =
-                Box::pin(async move { session.write_data_frame(sid, &data).await });
+            let fut: WriteFut = Box::pin(async move { session.write_data_frame(sid, &data).await });
             this.pending_write = Some((n, fut));
         }
         let (n, fut) = this.pending_write.as_mut().unwrap();
@@ -514,9 +507,8 @@ impl AsyncWrite for AnytlsStream {
         if this.pending_shutdown.is_none() {
             let sid = this.sid;
             let session = Arc::clone(&this.session);
-            let fut: ShutdownFut = Box::pin(async move {
-                session.write_control_frame(CMD_FIN, sid, &[]).await
-            });
+            let fut: ShutdownFut =
+                Box::pin(async move { session.write_control_frame(CMD_FIN, sid, &[]).await });
             this.pending_shutdown = Some(fut);
         }
         let fut = this.pending_shutdown.as_mut().unwrap();
@@ -545,4 +537,3 @@ impl Drop for AnytlsStream {
         }
     }
 }
-

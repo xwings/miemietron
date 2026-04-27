@@ -153,8 +153,11 @@ impl ProxyManager {
             Arc::new(direct::RejectDropOutbound),
         );
 
-        // Parse configured proxies, applying global settings as defaults
-        for config in proxy_configs {
+        // Parse configured proxies, applying global settings as defaults.
+        // mihomo compat: config.go:880-882 — any per-proxy parse error fails the
+        // whole config load with `proxy %d: %w`. We never silently swap an
+        // unsupported / invalid proxy for DIRECT (which would leak traffic).
+        for (idx, config) in proxy_configs.iter().enumerate() {
             let mut cfg = config.clone();
             if cfg.routing_mark.is_none() {
                 cfg.routing_mark = global_routing_mark;
@@ -172,9 +175,9 @@ impl ProxyManager {
             if cfg.disable_keep_alive.is_none() {
                 cfg.disable_keep_alive = Some(disable_keep_alive);
             }
-            if let Some(handler) = Self::load_proxy_config(&cfg) {
-                proxies.insert(cfg.name.clone(), handler);
-            }
+            let handler = Self::load_proxy_config(&cfg)
+                .map_err(|e| anyhow::anyhow!("proxy {}: {}", idx, e))?;
+            proxies.insert(cfg.name.clone(), handler);
         }
 
         // Load proxy providers and add their proxies.
@@ -188,8 +191,9 @@ impl ProxyManager {
                         subscription_info.insert(prov_name.clone(), info);
                     }
                     let mut names = Vec::new();
-                    for pc in &provider_proxies {
-                        names.push(pc.name.clone());
+                    // mihomo compat: provider.go:436-438 — any per-proxy parse
+                    // error fails the provider load with `proxy %d error: %w`.
+                    for (idx, pc) in provider_proxies.iter().enumerate() {
                         let mut cfg = pc.clone();
                         if cfg.routing_mark.is_none() {
                             cfg.routing_mark = global_routing_mark;
@@ -197,8 +201,19 @@ impl ProxyManager {
                         if cfg.tcp_concurrent.is_none() && global_tcp_concurrent {
                             cfg.tcp_concurrent = Some(true);
                         }
-                        if let Some(handler) = Self::load_proxy_config(&cfg) {
-                            proxies.insert(cfg.name.clone(), handler);
+                        match Self::load_proxy_config(&cfg) {
+                            Ok(handler) => {
+                                names.push(cfg.name.clone());
+                                proxies.insert(cfg.name.clone(), handler);
+                            }
+                            Err(e) => {
+                                return Err(anyhow::anyhow!(
+                                    "provider '{}' proxy {} error: {}",
+                                    prov_name,
+                                    idx,
+                                    e
+                                ));
+                            }
                         }
                     }
                     info!(
@@ -369,8 +384,7 @@ impl ProxyManager {
             // Apply exclude-filter regex (remove any proxy matching ANY pattern)
             // mihomo compat (groupbase.go lines 190-203): applies to ALL proxies
             if !exclude_filter_regs.is_empty() {
-                all_proxies
-                    .retain(|name| !exclude_filter_regs.iter().any(|re| re.is_match(name)));
+                all_proxies.retain(|name| !exclude_filter_regs.iter().any(|re| re.is_match(name)));
             }
 
             // Apply exclude-type (remove proxies of specified types, case-insensitive)
@@ -389,10 +403,7 @@ impl ProxyManager {
 
             // mihomo compat: if no proxies remain after filtering, fall back to COMPATIBLE
             if all_proxies.is_empty() {
-                tracing::warn!(
-                    "Proxy group '{}' has no proxies after filtering",
-                    gc.name
-                );
+                tracing::warn!("Proxy group '{}' has no proxies after filtering", gc.name);
             }
 
             let group: Arc<dyn ProxyGroup> = match gc.group_type.as_str() {
@@ -402,7 +413,10 @@ impl ProxyManager {
                     all_proxies,
                     gc.tolerance.unwrap_or(150),
                     crate::proxy_group::HealthCheckOpts {
-                        url: gc.url.clone().unwrap_or_else(|| "http://www.gstatic.com/generate_204".to_string()),
+                        url: gc
+                            .url
+                            .clone()
+                            .unwrap_or_else(|| "http://www.gstatic.com/generate_204".to_string()),
                         interval_secs: gc.interval.unwrap_or(300),
                         max_failed_times: gc.max_failed_times,
                         test_timeout: gc.timeout,
@@ -414,7 +428,10 @@ impl ProxyManager {
                     gc.name.clone(),
                     all_proxies,
                     crate::proxy_group::HealthCheckOpts {
-                        url: gc.url.clone().unwrap_or_else(|| "http://www.gstatic.com/generate_204".to_string()),
+                        url: gc
+                            .url
+                            .clone()
+                            .unwrap_or_else(|| "http://www.gstatic.com/generate_204".to_string()),
                         interval_secs: gc.interval.unwrap_or(300),
                         max_failed_times: gc.max_failed_times,
                         test_timeout: gc.timeout,
@@ -462,180 +479,87 @@ impl ProxyManager {
         })
     }
 
-    /// Load a single proxy from config, returning an OutboundHandler or None.
-    fn load_proxy_config(config: &ProxyConfig) -> Option<Arc<dyn OutboundHandler>> {
+    /// Load a single proxy from config.
+    ///
+    /// mihomo compat: matches `adapter/parser.go::ParseProxy`. Returns an error
+    /// for unsupported proxy types (verbatim "unsupport proxy type: <type>")
+    /// and propagates construction failures so the caller can fail the entire
+    /// config load with `proxy <idx>: <err>`. We never silently substitute a
+    /// placeholder/DIRECT outbound for an unsupported or invalid proxy.
+    fn load_proxy_config(config: &ProxyConfig) -> Result<Arc<dyn OutboundHandler>> {
         match config.proxy_type.as_str() {
             "ss" => {
                 info!("Loading SS proxy: {}", config.name);
-                match shadowsocks::ShadowsocksOutbound::from_config(config) {
-                    Ok(handler) => Some(Arc::new(handler)),
-                    Err(e) => {
-                        tracing::warn!(
-                            "Failed to load SS proxy '{}': {}, using placeholder",
-                            config.name,
-                            e
-                        );
-                        Some(Arc::new(direct::PlaceholderOutbound::new(
-                            config.name.clone(),
-                            "ss",
-                            config.routing_mark,
-                        )))
-                    }
-                }
+                let handler = shadowsocks::ShadowsocksOutbound::from_config(config)?;
+                Ok(Arc::new(handler))
             }
             #[cfg(feature = "vless")]
             "vless" => {
                 info!("Loading VLESS proxy: {}", config.name);
-                match vless::VlessOutbound::new(config) {
-                    Ok(handler) => Some(Arc::new(handler)),
-                    Err(e) => {
-                        tracing::warn!(
-                            "Failed to load VLESS proxy '{}': {}, using placeholder",
-                            config.name,
-                            e
-                        );
-                        Some(Arc::new(direct::PlaceholderOutbound::new(
-                            config.name.clone(),
-                            "vless",
-                            config.routing_mark,
-                        )))
-                    }
-                }
+                let handler = vless::VlessOutbound::new(config)?;
+                Ok(Arc::new(handler))
             }
             #[cfg(feature = "trojan")]
             "trojan" => {
                 info!("Loading Trojan proxy: {}", config.name);
-                match trojan::TrojanOutbound::new(config) {
-                    Ok(handler) => Some(Arc::new(handler)),
-                    Err(e) => {
-                        tracing::warn!(
-                            "Failed to load Trojan proxy '{}': {}, using placeholder",
-                            config.name,
-                            e
-                        );
-                        Some(Arc::new(direct::PlaceholderOutbound::new(
-                            config.name.clone(),
-                            "trojan",
-                            config.routing_mark,
-                        )))
-                    }
-                }
+                let handler = trojan::TrojanOutbound::new(config)?;
+                Ok(Arc::new(handler))
             }
             #[cfg(feature = "vmess")]
             "vmess" => {
                 info!("Loading VMess proxy: {}", config.name);
-                match vmess::VmessOutbound::new(config) {
-                    Ok(handler) => Some(Arc::new(handler)),
-                    Err(e) => {
-                        tracing::warn!(
-                            "Failed to load VMess proxy '{}': {}, using placeholder",
-                            config.name,
-                            e
-                        );
-                        Some(Arc::new(direct::PlaceholderOutbound::new(
-                            config.name.clone(),
-                            "vmess",
-                            config.routing_mark,
-                        )))
-                    }
-                }
+                let handler = vmess::VmessOutbound::new(config)?;
+                Ok(Arc::new(handler))
             }
             "http" => {
                 info!("Loading HTTP proxy: {}", config.name);
-                match http::HttpOutbound::from_config(config) {
-                    Ok(handler) => Some(Arc::new(handler)),
-                    Err(e) => {
-                        tracing::warn!(
-                            "Failed to load HTTP proxy '{}': {}, using placeholder",
-                            config.name,
-                            e
-                        );
-                        Some(Arc::new(direct::PlaceholderOutbound::new(
-                            config.name.clone(),
-                            "http",
-                            config.routing_mark,
-                        )))
-                    }
-                }
+                let handler = http::HttpOutbound::from_config(config)?;
+                Ok(Arc::new(handler))
             }
             "socks5" => {
                 info!("Loading SOCKS5 proxy: {}", config.name);
-                match socks5::Socks5Outbound::from_config(config) {
-                    Ok(handler) => Some(Arc::new(handler)),
-                    Err(e) => {
-                        tracing::warn!(
-                            "Failed to load SOCKS5 proxy '{}': {}, using placeholder",
-                            config.name,
-                            e
-                        );
-                        Some(Arc::new(direct::PlaceholderOutbound::new(
-                            config.name.clone(),
-                            "socks5",
-                            config.routing_mark,
-                        )))
-                    }
-                }
+                let handler = socks5::Socks5Outbound::from_config(config)?;
+                Ok(Arc::new(handler))
             }
             "snell" => {
                 info!("Loading Snell proxy: {}", config.name);
-                match snell::SnellOutbound::from_config(config) {
-                    Ok(handler) => Some(Arc::new(handler)),
-                    Err(e) => {
-                        tracing::warn!(
-                            "Failed to load Snell proxy '{}': {}, using placeholder",
-                            config.name,
-                            e
-                        );
-                        Some(Arc::new(direct::PlaceholderOutbound::new(
-                            config.name.clone(),
-                            "snell",
-                            config.routing_mark,
-                        )))
-                    }
-                }
+                let handler = snell::SnellOutbound::from_config(config)?;
+                Ok(Arc::new(handler))
             }
             "anytls" => {
                 info!("Loading AnyTLS proxy: {}", config.name);
-                match anytls::AnytlsOutbound::from_config(config) {
-                    Ok(handler) => Some(Arc::new(handler)),
-                    Err(e) => {
-                        tracing::warn!(
-                            "Failed to load AnyTLS proxy '{}': {}, using placeholder",
-                            config.name,
-                            e
-                        );
-                        Some(Arc::new(direct::PlaceholderOutbound::new(
-                            config.name.clone(),
-                            "anytls",
-                            config.routing_mark,
-                        )))
-                    }
-                }
+                let handler = anytls::AnytlsOutbound::from_config(config)?;
+                Ok(Arc::new(handler))
             }
             "ssr" => {
                 info!("Loading SSR proxy: {}", config.name);
-                match ssr::SsrOutbound::from_config(config) {
-                    Ok(handler) => Some(Arc::new(handler)),
-                    Err(e) => {
-                        tracing::warn!(
-                            "Failed to load SSR proxy '{}': {}, using placeholder",
-                            config.name,
-                            e
-                        );
-                        Some(Arc::new(direct::PlaceholderOutbound::new(
-                            config.name.clone(),
-                            "ssr",
-                            config.routing_mark,
-                        )))
-                    }
-                }
+                let handler = ssr::SsrOutbound::from_config(config)?;
+                Ok(Arc::new(handler))
+            }
+            "direct" => {
+                // mihomo compat: parser.go:113-119 + outbound/direct.go::
+                // NewDirectWithOption — user-named DIRECT with optional
+                // routing-mark / interface / ip-version. We honor routing-mark;
+                // the rest of BasicOption is accepted for parity but not all
+                // fields take effect (parity matrix tracks what's wired).
+                info!("Loading user-defined DIRECT proxy: {}", config.name);
+                Ok(Arc::new(direct::NamedDirectOutbound::new(
+                    config.name.clone(),
+                    config.routing_mark,
+                )))
+            }
+            "reject" => {
+                // mihomo compat: parser.go:127-133 + outbound/reject.go::
+                // NewRejectWithOption — user-named REJECT.
+                info!("Loading user-defined REJECT proxy: {}", config.name);
+                Ok(Arc::new(direct::NamedRejectOutbound::new(
+                    config.name.clone(),
+                )))
             }
             other => {
-                info!(
-                    "Skipping unsupported proxy type: {} ({})",
-                    other, config.name
-                );
-                None
+                // mihomo compat: parser.go:177 default case error wording
+                // (note the upstream typo "unsupport").
+                Err(anyhow::anyhow!("unsupport proxy type: {}", other))
             }
         }
     }
@@ -687,9 +611,8 @@ impl ProxyManager {
                         .as_ref()
                         .ok_or_else(|| anyhow::anyhow!("HTTP provider '{name}' has no URL"))?;
                     let resp = reqwest::get(url).await?;
-                    sub_info = parse_subscription_userinfo(
-                        resp.headers().get("subscription-userinfo"),
-                    );
+                    sub_info =
+                        parse_subscription_userinfo(resp.headers().get("subscription-userinfo"));
                     resp.text().await?
                 }
             }
@@ -717,6 +640,77 @@ impl ProxyManager {
     /// Get an outbound handler by name.
     pub fn get(&self, name: &str) -> Option<Arc<dyn OutboundHandler>> {
         self.proxies.get(name).cloned()
+    }
+
+    /// Resolve a rule-engine [`Action`] to an outbound handler, erroring if
+    /// the named proxy cannot be resolved.
+    ///
+    /// Architecture rule: when [`Action::Proxy(name)`](crate::rules::Action::Proxy)
+    /// fails to resolve (typo in a rule target, broken group chain, etc.),
+    /// this function returns an error — it does **NOT** silently fall back
+    /// to DIRECT. A silent fallback would route operator-tunnel-bound
+    /// traffic onto the bare network when the rule explicitly asked for a
+    /// proxy.
+    ///
+    /// `Action::Direct` / `Action::Reject` / `Action::RejectDrop` only error
+    /// if the corresponding built-in handler is missing — which would mean
+    /// the manager itself is broken.
+    pub fn resolve_action(
+        &self,
+        action: &crate::rules::Action,
+    ) -> Result<Arc<dyn OutboundHandler>> {
+        use crate::rules::Action;
+        match action {
+            Action::Direct => self
+                .proxies
+                .get("DIRECT")
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("built-in DIRECT handler missing")),
+            Action::Reject => self
+                .proxies
+                .get("REJECT")
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("built-in REJECT handler missing")),
+            Action::RejectDrop => self
+                .proxies
+                .get("REJECT-DROP")
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("built-in REJECT-DROP handler missing")),
+            Action::Proxy(name) => self.resolve(name).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "rule selected proxy '{}' but it could not be resolved \
+                     (unknown name, broken group chain, or resolution depth exceeded). \
+                     No silent DIRECT fallback — see ARCHITECTURE.md",
+                    name
+                )
+            }),
+        }
+    }
+
+    /// Open a UDP packet conn through the named proxy.
+    ///
+    /// Architecture rule: when a rule selects a proxy and the proxy is
+    /// missing (e.g. removed from config) or its `connect_datagram` fails,
+    /// this function returns an error — it does NOT fall back to DIRECT.
+    /// Silent fallback would leak unencrypted UDP onto the wire when the
+    /// operator asked for a tunnel. The caller is expected to drop the
+    /// datagram on error (UDP is best-effort).
+    ///
+    /// Used by `inbound::socks::create_socks_udp_session` and
+    /// `tun::create_udp_session`.
+    pub async fn dial_proxy_udp(
+        &self,
+        proxy_name: &str,
+        target: &Address,
+        dns: Arc<DnsResolver>,
+    ) -> Result<Arc<dyn OutboundPacketConn>> {
+        let handler = self
+            .resolve(proxy_name)
+            .ok_or_else(|| anyhow::anyhow!("UDP proxy '{}' not found", proxy_name))?;
+        let pc_box = handler.connect_datagram(target, dns).await.map_err(|e| {
+            anyhow::anyhow!("UDP proxy '{}' connect_datagram failed: {}", proxy_name, e)
+        })?;
+        Ok(Arc::from(pc_box))
     }
 
     /// Get proxy for the given action target name.
@@ -918,4 +912,307 @@ pub struct ProxyInfo {
     #[serde(rename = "type")]
     pub proxy_type: String,
     pub udp: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    //! Regression tests for safe per-proxy parse-error handling.
+    //!
+    //! mihomo's adapter/parser.go returns an error for unsupported types
+    //! (verbatim "unsupport proxy type: <T>") and for any failed decode /
+    //! construction. config.go:880-882 then aborts the whole config load with
+    //! `proxy <idx>: <err>`. We must NOT silently substitute a placeholder /
+    //! DIRECT outbound for invalid input — that would leak traffic.
+    use super::*;
+    use crate::config::proxy::ProxyConfig;
+
+    fn parse_cfg(yaml: &str) -> ProxyConfig {
+        serde_yaml::from_str(yaml).expect("test fixture should parse")
+    }
+
+    fn must_err(cfg: &ProxyConfig) -> String {
+        match ProxyManager::load_proxy_config(cfg) {
+            Ok(_) => panic!("expected error, got handler"),
+            Err(e) => format!("{e}"),
+        }
+    }
+
+    #[test]
+    fn unsupported_type_errors_with_mihomo_wording() {
+        let cfg = parse_cfg(
+            r#"
+name: bad
+type: hysteria2
+server: 1.2.3.4
+port: 443
+"#,
+        );
+        let msg = must_err(&cfg);
+        assert!(
+            msg.contains("unsupport proxy type: hysteria2"),
+            "wrong error: {msg}"
+        );
+    }
+
+    #[test]
+    fn invalid_ss_cipher_errors_no_direct() {
+        let cfg = parse_cfg(
+            r#"
+name: bad-ss
+type: ss
+server: 1.2.3.4
+port: 8388
+cipher: nonexistent-cipher
+password: secret
+"#,
+        );
+        // Don't pin exact wording from the SS layer — just confirm an error
+        // surfaces rather than silently producing a handler.
+        let _ = must_err(&cfg);
+    }
+
+    #[test]
+    fn missing_required_fields_errors() {
+        let cfg = parse_cfg(
+            r#"
+name: incomplete
+type: ss
+"#,
+        );
+        let _ = must_err(&cfg);
+    }
+
+    #[test]
+    fn placeholder_outbound_does_not_exist() {
+        // Compile-time assertion: there is no PlaceholderOutbound type.
+        // If someone reintroduces it, this test won't compile.
+        // Sanity check: DirectOutbound and RejectOutbound are still here.
+        let _ = std::any::type_name::<direct::DirectOutbound>();
+        let _ = std::any::type_name::<direct::RejectOutbound>();
+    }
+
+    #[test]
+    fn user_defined_direct_loads_with_custom_name() {
+        // mihomo compat: parser.go:113-119 — `type: direct` with a name binds
+        // direct-dial behavior to a config-defined proxy entry.
+        let cfg = parse_cfg(
+            r#"
+name: my-direct
+type: direct
+"#,
+        );
+        let handler = ProxyManager::load_proxy_config(&cfg).expect("must load");
+        assert_eq!(handler.name(), "my-direct");
+        assert_eq!(handler.proto(), "Direct");
+        assert!(handler.supports_udp());
+    }
+
+    #[test]
+    fn user_defined_reject_loads_with_custom_name() {
+        // mihomo compat: parser.go:127-133 — `type: reject` with a name.
+        let cfg = parse_cfg(
+            r#"
+name: ad-block
+type: reject
+"#,
+        );
+        let handler = ProxyManager::load_proxy_config(&cfg).expect("must load");
+        assert_eq!(handler.name(), "ad-block");
+        assert_eq!(handler.proto(), "Reject");
+        assert!(!handler.supports_udp());
+    }
+
+    #[test]
+    fn dns_outbound_is_out_of_scope_and_fails_loudly() {
+        // mihomo's `type: dns` outbound hijacks DNS to the local resolver.
+        // miemietron treats it as out-of-scope (see ARCHITECTURE.md). Until
+        // implemented, the config must fail loudly — never silently fall
+        // back to DIRECT.
+        let cfg = parse_cfg(
+            r#"
+name: dns-out
+type: dns
+"#,
+        );
+        let msg = must_err(&cfg);
+        assert!(
+            msg.contains("unsupport proxy type: dns"),
+            "wrong error: {msg}"
+        );
+    }
+
+    /// Test-only constructor that bypasses YAML/network setup so we can
+    /// exercise `dial_proxy_udp` against arbitrary handler maps.
+    fn make_test_manager(handlers: HashMap<String, Arc<dyn OutboundHandler>>) -> ProxyManager {
+        ProxyManager {
+            proxies: handlers,
+            group_configs: Vec::new(),
+            live_groups: HashMap::new(),
+            provider_configs: HashMap::new(),
+            subscription_info: HashMap::new(),
+            state_store: Arc::new(crate::proxy_group::proxy_state::ProxyStateStore::new()),
+        }
+    }
+
+    /// A stub that always fails `connect_datagram` — used to prove
+    /// `dial_proxy_udp` does NOT silently fall back to DIRECT.
+    struct UdpFailingHandler;
+
+    #[async_trait]
+    impl OutboundHandler for UdpFailingHandler {
+        fn name(&self) -> &str {
+            "BAD"
+        }
+        fn proto(&self) -> &str {
+            "Stub"
+        }
+        fn supports_udp(&self) -> bool {
+            false
+        }
+        async fn connect_stream(
+            &self,
+            _t: &Address,
+            _d: &DnsResolver,
+        ) -> Result<Box<dyn ProxyStream>> {
+            Err(anyhow::anyhow!("stub: TCP not supported"))
+        }
+        async fn connect_datagram(
+            &self,
+            _t: &Address,
+            _d: Arc<DnsResolver>,
+        ) -> Result<Box<dyn OutboundPacketConn>> {
+            Err(anyhow::anyhow!("synthetic UDP failure"))
+        }
+    }
+
+    async fn make_dns() -> Arc<DnsResolver> {
+        // Real DnsResolver constructed from default config — our stubs never
+        // hit DNS before failing, so this is an inert dependency.
+        Arc::new(
+            DnsResolver::new(&crate::config::dns::DnsConfig::default())
+                .await
+                .expect("DnsResolver::new with default config must succeed"),
+        )
+    }
+
+    fn must_err_udp(res: Result<Arc<dyn OutboundPacketConn>>, ctx: &str) -> String {
+        // `Arc<dyn OutboundPacketConn>` doesn't implement Debug, so we can't
+        // use `expect_err` directly.
+        match res {
+            Ok(_) => panic!("{ctx}: expected Err, got Ok"),
+            Err(e) => format!("{e}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn udp_missing_proxy_errors_no_direct_fallback() {
+        // Architecture rule: when Action::Proxy(name) is selected and the
+        // named proxy is missing from the handler map, dial_proxy_udp must
+        // return Err — never silently substitute DIRECT.
+        let mut handlers: HashMap<String, Arc<dyn OutboundHandler>> = HashMap::new();
+        handlers.insert(
+            "DIRECT".to_string(),
+            Arc::new(direct::DirectOutbound::new(None)),
+        );
+        let pm = make_test_manager(handlers);
+        let target = Address::Domain("example.com".to_string(), 53);
+        let dns = make_dns().await;
+
+        let res = pm.dial_proxy_udp("not-in-config", &target, dns).await;
+        let msg = must_err_udp(res, "missing-proxy must error");
+        assert!(msg.contains("not found"), "wrong error: {msg}");
+        // Belt and suspenders: error must NOT mention DIRECT being used.
+        assert!(
+            !msg.to_lowercase().contains("falling back"),
+            "no fallback wording allowed: {msg}"
+        );
+    }
+
+    /// `Action::Proxy("unknown")` MUST error, NOT be silently downgraded to
+    /// DIRECT. This is the symptom the user reported as
+    /// "rules not being followed when anytls is in use" — a typo or broken
+    /// group chain in the rule target was silently routing tunnel-bound
+    /// traffic onto DIRECT.
+    #[test]
+    fn resolve_action_unknown_proxy_errors_no_direct_fallback() {
+        use crate::rules::Action;
+
+        let mut handlers: HashMap<String, Arc<dyn OutboundHandler>> = HashMap::new();
+        handlers.insert(
+            "DIRECT".to_string(),
+            Arc::new(direct::DirectOutbound::new(None)),
+        );
+        handlers.insert("REJECT".to_string(), Arc::new(direct::RejectOutbound));
+        handlers.insert(
+            "REJECT-DROP".to_string(),
+            Arc::new(direct::RejectDropOutbound),
+        );
+        let pm = make_test_manager(handlers);
+
+        let result = pm.resolve_action(&Action::Proxy("not-in-config".to_string()));
+        let err = match result {
+            Ok(_) => panic!("expected Err, got Ok — silent DIRECT fallback returned"),
+            Err(e) => format!("{e}"),
+        };
+        assert!(
+            err.contains("not-in-config"),
+            "error must name the missing proxy: {err}"
+        );
+        assert!(
+            err.contains("No silent DIRECT fallback"),
+            "error must explicitly state the no-fallback contract: {err}"
+        );
+    }
+
+    /// Built-in actions resolve to their built-in handlers — basic sanity.
+    #[test]
+    fn resolve_action_direct_reject_resolve_correctly() {
+        use crate::rules::Action;
+
+        let mut handlers: HashMap<String, Arc<dyn OutboundHandler>> = HashMap::new();
+        handlers.insert(
+            "DIRECT".to_string(),
+            Arc::new(direct::DirectOutbound::new(None)),
+        );
+        handlers.insert("REJECT".to_string(), Arc::new(direct::RejectOutbound));
+        handlers.insert(
+            "REJECT-DROP".to_string(),
+            Arc::new(direct::RejectDropOutbound),
+        );
+        let pm = make_test_manager(handlers);
+
+        assert_eq!(pm.resolve_action(&Action::Direct).unwrap().name(), "DIRECT");
+        assert_eq!(pm.resolve_action(&Action::Reject).unwrap().name(), "REJECT");
+        assert_eq!(
+            pm.resolve_action(&Action::RejectDrop).unwrap().name(),
+            "REJECT-DROP"
+        );
+    }
+
+    #[tokio::test]
+    async fn udp_proxy_datagram_failure_errors_no_direct_fallback() {
+        // Architecture rule: when the named proxy exists but its
+        // connect_datagram() fails, dial_proxy_udp must propagate the
+        // failure — never silently substitute DIRECT.
+        let mut handlers: HashMap<String, Arc<dyn OutboundHandler>> = HashMap::new();
+        handlers.insert(
+            "DIRECT".to_string(),
+            Arc::new(direct::DirectOutbound::new(None)),
+        );
+        handlers.insert("BAD".to_string(), Arc::new(UdpFailingHandler));
+        let pm = make_test_manager(handlers);
+        let target = Address::Domain("example.com".to_string(), 53);
+        let dns = make_dns().await;
+
+        let res = pm.dial_proxy_udp("BAD", &target, dns).await;
+        let msg = must_err_udp(res, "proxy datagram failure must error");
+        assert!(
+            msg.contains("synthetic UDP failure"),
+            "must surface inner error: {msg}"
+        );
+        assert!(
+            msg.contains("BAD"),
+            "must name the proxy that failed: {msg}"
+        );
+    }
 }

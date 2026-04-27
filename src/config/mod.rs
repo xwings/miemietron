@@ -16,9 +16,15 @@ where
         fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
             f.write_str("a number or string-encoded number")
         }
-        fn visit_u64<E: de::Error>(self, v: u64) -> Result<Self::Value, E> { Ok(v as u16) }
-        fn visit_i64<E: de::Error>(self, v: i64) -> Result<Self::Value, E> { Ok(v as u16) }
-        fn visit_f64<E: de::Error>(self, v: f64) -> Result<Self::Value, E> { Ok(v as u16) }
+        fn visit_u64<E: de::Error>(self, v: u64) -> Result<Self::Value, E> {
+            Ok(v as u16)
+        }
+        fn visit_i64<E: de::Error>(self, v: i64) -> Result<Self::Value, E> {
+            Ok(v as u16)
+        }
+        fn visit_f64<E: de::Error>(self, v: f64) -> Result<Self::Value, E> {
+            Ok(v as u16)
+        }
         fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
             v.parse::<u16>().map_err(de::Error::custom)
         }
@@ -160,6 +166,14 @@ pub struct MiemieConfig {
     #[serde(default)]
     pub tunnels: Vec<serde_yaml::Value>,
 
+    /// Inbound listener blocks — `listeners: [...]` from mihomo's
+    /// `listener/parse.go::ParseListener`. Each entry must have a `type`
+    /// field; we validate it on load with `validate_listeners()` so an
+    /// unsupported type fails the config load with mihomo-compatible wording
+    /// rather than being silently dropped.
+    #[serde(default)]
+    pub listeners: Vec<serde_yaml::Value>,
+
     #[serde(default)]
     pub iptables: Option<IptablesConfig>,
 
@@ -233,7 +247,9 @@ impl SnifferConfig {
         }
         for pcfg in self.sniff.values() {
             if port_matches(&pcfg.ports, dst_port) {
-                let ovr = pcfg.override_destination.unwrap_or(self.override_destination);
+                let ovr = pcfg
+                    .override_destination
+                    .unwrap_or(self.override_destination);
                 return Some(ovr);
             }
         }
@@ -346,7 +362,29 @@ impl MiemieConfig {
     pub fn parse_str(yaml: &str) -> Result<Self> {
         let config: Self = serde_yaml::from_str(yaml)
             .map_err(|e| anyhow::anyhow!("failed to parse config: {e}"))?;
+        config.validate_listeners()?;
         Ok(config)
+    }
+
+    /// Validate the `listeners:` block.
+    ///
+    /// Architecture decision: the `listeners:` block is out of scope (see
+    /// ARCHITECTURE.md "Scope"). OpenClash drives inbounds via the top-level
+    /// `port` / `socks-port` / `mixed-port` / `redir-port` / `tproxy-port` /
+    /// `tun:` settings, which is the only listener-config surface miemietron
+    /// supports. Accepting a `listeners:` entry and silently doing nothing
+    /// would be worse than refusing the config — the operator would think
+    /// their custom listener was running. So we reject any non-empty block
+    /// at load time with a clear error.
+    fn validate_listeners(&self) -> Result<()> {
+        if !self.listeners.is_empty() {
+            return Err(anyhow::anyhow!(
+                "the `listeners:` block is out of scope (see ARCHITECTURE.md). \
+                 Configure inbounds via top-level `port` / `socks-port` / \
+                 `mixed-port` / `redir-port` / `tproxy-port` / `tun:` instead."
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -550,5 +588,53 @@ another-unknown:
         assert_eq!(config.port, 0);
         assert!(config.proxies.is_empty());
         assert!(config.rules.is_empty());
+    }
+
+    #[test]
+    fn empty_listeners_block_is_accepted() {
+        // The struct field exists for forward-compat YAML parsing; an empty
+        // or absent `listeners:` block must not trip validation.
+        MiemieConfig::parse_str("listeners: []\n").expect("empty listeners must validate");
+        MiemieConfig::parse_str("{}\n").expect("absent listeners must validate");
+    }
+
+    #[test]
+    fn non_empty_listeners_block_rejected_as_out_of_scope() {
+        // Architecture rule: any non-empty `listeners:` block is rejected at
+        // load time. Even a "supported" type like mixed isn't honored here —
+        // OpenClash drives inbounds via the top-level port settings, which is
+        // the only in-scope listener-config surface. Accepting and ignoring
+        // the block would silently break operator expectations.
+        let yamls = [
+            // would-be-supported type
+            r#"
+listeners:
+  - name: my-mixed
+    type: mixed
+    listen: 0.0.0.0:7890
+"#,
+            // out-of-scope type
+            r#"
+listeners:
+  - name: hy2-in
+    type: hysteria2
+    listen: 0.0.0.0:443
+"#,
+            // unknown type
+            r#"
+listeners:
+  - name: bad
+    type: nonexistent-listener
+    listen: 0.0.0.0:8080
+"#,
+        ];
+        for yaml in yamls {
+            let err = MiemieConfig::parse_str(yaml).expect_err("non-empty listeners must error");
+            let msg = format!("{err}");
+            assert!(
+                msg.contains("listeners") && msg.contains("out of scope"),
+                "wrong error for `{yaml}`: {msg}"
+            );
+        }
     }
 }

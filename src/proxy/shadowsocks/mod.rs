@@ -213,7 +213,9 @@ impl OutboundHandler for ShadowsocksOutbound {
                     self.identity_keys.clone(),
                 );
                 // mihomo compat: flush handshake to wire immediately (like DialConn)
-                ss.flush_handshake().await.map_err(|e| anyhow::anyhow!("ss handshake flush: {e}"))?;
+                ss.flush_handshake()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("ss handshake flush: {e}"))?;
                 Ok(Box::new(ss))
             }
 
@@ -236,7 +238,9 @@ impl OutboundHandler for ShadowsocksOutbound {
                     addr_header,
                     self.identity_keys.clone(),
                 );
-                ss.flush_handshake().await.map_err(|e| anyhow::anyhow!("ss handshake flush: {e}"))?;
+                ss.flush_handshake()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("ss handshake flush: {e}"))?;
                 Ok(Box::new(ss))
             }
 
@@ -256,11 +260,16 @@ impl OutboundHandler for ShadowsocksOutbound {
                     addr_header,
                     self.identity_keys.clone(),
                 );
-                ss.flush_handshake().await.map_err(|e| anyhow::anyhow!("ss handshake flush: {e}"))?;
+                ss.flush_handshake()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("ss handshake flush: {e}"))?;
                 Ok(Box::new(ss))
             }
 
-            Some("shadow-tls") | Some("shadowtls") | Some("shadow-tls-v2") | Some("shadow-tls-v3") => {
+            Some("shadow-tls")
+            | Some("shadowtls")
+            | Some("shadow-tls-v2")
+            | Some("shadow-tls-v3") => {
                 // shadow-tls: TLS handshake + HMAC-authenticated data, then AEAD
                 debug!("ss: using shadow-tls");
 
@@ -276,7 +285,9 @@ impl OutboundHandler for ShadowsocksOutbound {
                     addr_header,
                     self.identity_keys.clone(),
                 );
-                ss.flush_handshake().await.map_err(|e| anyhow::anyhow!("ss handshake flush: {e}"))?;
+                ss.flush_handshake()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("ss handshake flush: {e}"))?;
                 Ok(Box::new(ss))
             }
 
@@ -293,7 +304,9 @@ impl OutboundHandler for ShadowsocksOutbound {
                     addr_header,
                     self.identity_keys.clone(),
                 );
-                ss.flush_handshake().await.map_err(|e| anyhow::anyhow!("ss handshake flush: {e}"))?;
+                ss.flush_handshake()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("ss handshake flush: {e}"))?;
                 Ok(Box::new(ss))
             }
         }
@@ -317,7 +330,8 @@ impl OutboundHandler for ShadowsocksOutbound {
             self.server, self.port, self.name
         );
 
-        let socket = udp::SsUdpSocket::new(server_addr, self.cipher, self.master_key.clone()).await?;
+        let socket =
+            udp::SsUdpSocket::new(server_addr, self.cipher, self.master_key.clone()).await?;
         Ok(Box::new(socket))
     }
 }

@@ -13,7 +13,10 @@ use super::ApiState;
 ///
 /// - WebSocket: streams `{"up": delta, "down": delta}` every second
 /// - HTTP GET: returns total `{"up": total, "down": total}` snapshot
-pub async fn get_traffic(State(state): State<ApiState>, request: Request<axum::body::Body>) -> Response {
+pub async fn get_traffic(
+    State(state): State<ApiState>,
+    request: Request<axum::body::Body>,
+) -> Response {
     let is_ws = request
         .headers()
         .get(axum::http::header::UPGRADE)
@@ -56,7 +59,8 @@ async fn handle_traffic_ws(mut socket: ws::WebSocket, state: ApiState) {
             "down": delta_down,
             "upTotal": up,
             "downTotal": down,
-        }).to_string();
+        })
+        .to_string();
         if socket.send(ws::Message::Text(msg.into())).await.is_err() {
             break;
         }

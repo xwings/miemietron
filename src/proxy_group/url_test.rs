@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::Notify;
 use tracing::{debug, warn};
 
 use crate::common::addr::Address;
@@ -47,6 +48,11 @@ pub struct UrlTestGroup {
     pub(crate) last_touch: Arc<AtomicU64>,
     /// Whether this group uses lazy health checks.
     pub(crate) lazy: bool,
+    /// mihomo compat: failure-driven health check trigger.
+    /// `do_health_check` calls `notify_one()`; the background loop in
+    /// `health.rs` wakes and runs an immediate check, matching
+    /// GroupBase.healthCheck() in groupbase.go.
+    pub(crate) health_notify: Arc<Notify>,
 }
 
 impl UrlTestGroup {
@@ -74,6 +80,17 @@ impl UrlTestGroup {
             test_timeout: hc.test_timeout.unwrap_or(5000),
             last_touch: Arc::new(AtomicU64::new(0)),
             lazy: hc.lazy,
+            health_notify: Arc::new(Notify::new()),
+        }
+    }
+
+    /// Mark whether a triggered health check is currently running.
+    /// mihomo compat: `failedTesting` flag in groupbase.go controls whether
+    /// `onDialSuccess` resets the failure counter.
+    pub(crate) fn set_health_testing(&self, running: bool) {
+        self.failed_testing.store(running, Ordering::Relaxed);
+        if !running {
+            self.failed_times.store(0, Ordering::Relaxed);
         }
     }
 
@@ -130,14 +147,17 @@ impl UrlTestGroup {
                 // Acquire semaphore permit (max 10 concurrent checks)
                 let _permit = sem.acquire().await;
                 // mihomo compat: per-proxy timeout from hc.timeout (default 5000ms)
-                let result = tokio::time::timeout(
-                    timeout,
-                    measure_unified_delay(&handler, &url, &dns),
-                ).await;
+                let result =
+                    tokio::time::timeout(timeout, measure_unified_delay(&handler, &url, &dns))
+                        .await;
                 match result {
                     Ok(Ok(ms)) => {
                         debug!("url-test {}: {}ms", name, ms);
-                        let delay = if ms > u16::MAX as u64 { u16::MAX } else { ms as u16 };
+                        let delay = if ms > u16::MAX as u64 {
+                            u16::MAX
+                        } else {
+                            ms as u16
+                        };
                         state_store.record_result(&name, &url, Some(delay));
                     }
                     Ok(Err(e)) => {
@@ -173,8 +193,14 @@ impl UrlTestGroup {
 
     /// Compute the best proxy name.
     /// mihomo compat: matches urltest.go fast() — uses tolerance-aware
-    /// hysteresis to prevent flapping between proxies.
+    /// hysteresis to prevent flapping between proxies, and `fastSingle`
+    /// (10s) singleflight to dedupe concurrent callers.
     fn fast(&self) -> String {
+        let (val, _shared) = self.fast_single.do_sync(|| self.compute_fast());
+        val
+    }
+
+    fn compute_fast(&self) -> String {
         // mihomo compat: if a proxy is force-pinned via API, return it
         // (as long as it's alive — matching mihomo's fast() logic).
         if let Some(ref selected) = *self.force_selected.read() {
@@ -208,11 +234,8 @@ impl UrlTestGroup {
                 // mihomo compat: tolerance check from urltest.go fast()
                 if let Some(ref cur) = *current {
                     if self.state_store.alive_for_url(cur, &self.test_url) {
-                        let cur_delay =
-                            self.state_store.last_delay_for_url(cur, &self.test_url);
-                        if cur_delay < 0xFFFF
-                            && cur_delay <= best_delay + self.tolerance as u16
-                        {
+                        let cur_delay = self.state_store.last_delay_for_url(cur, &self.test_url);
+                        if cur_delay < 0xFFFF && cur_delay <= best_delay + self.tolerance as u16 {
                             return cur.clone();
                         }
                     }
@@ -233,20 +256,16 @@ impl UrlTestGroup {
         self.fast_single.reset();
     }
 
-    /// Trigger the onDialFailed health check logic.
-    /// mihomo compat: matches GroupBase.healthCheck() in groupbase.go
+    /// Trigger an immediate health check via the background loop.
+    /// mihomo compat: matches GroupBase.healthCheck() in groupbase.go —
+    /// signals the health.rs loop to run a fresh URL-test pass instead of
+    /// waiting for the next periodic tick.
     fn do_health_check(&self) {
         if self.failed_testing.load(Ordering::Relaxed) {
             return;
         }
-        self.failed_testing.store(true, Ordering::Relaxed);
         self.fast_single.reset();
-        // The actual health check is async and runs in the health check loop.
-        // Here we just reset the failure counters, matching mihomo's pattern
-        // where healthCheck() calls proxyProvider.HealthCheck() and then resets.
-        self.failed_testing.store(false, Ordering::Relaxed);
-        self.failed_times.store(0, Ordering::Relaxed);
-        self.fast_single.reset();
+        self.health_notify.notify_one();
     }
 }
 
@@ -329,10 +348,7 @@ impl ProxyGroup for UrlTestGroup {
                 return;
             }
             let count = prev + 1;
-            debug!(
-                "ProxyGroup: {} failed count: {}",
-                self.group_name, count
-            );
+            debug!("ProxyGroup: {} failed count: {}", self.group_name, count);
             if count >= self.max_failed_times {
                 warn!(
                     "because {} failed multiple times, activate health check",
@@ -428,7 +444,13 @@ mod tests {
     }
 
     fn make_hc(url: &str) -> HealthCheckOpts {
-        HealthCheckOpts { url: url.to_string(), interval_secs: 300, max_failed_times: None, test_timeout: None, lazy: false }
+        HealthCheckOpts {
+            url: url.to_string(),
+            interval_secs: 300,
+            max_failed_times: None,
+            test_timeout: None,
+            lazy: false,
+        }
     }
 
     #[test]
@@ -437,7 +459,13 @@ mod tests {
             "auto".to_string(),
             vec!["a".to_string(), "b".to_string()],
             150,
-            HealthCheckOpts { url: "http://test.example/204".to_string(), interval_secs: 300, max_failed_times: None, test_timeout: None, lazy: false },
+            HealthCheckOpts {
+                url: "http://test.example/204".to_string(),
+                interval_secs: 300,
+                max_failed_times: None,
+                test_timeout: None,
+                lazy: false,
+            },
             make_store(),
         );
         assert_eq!(group.name(), "auto");
@@ -475,7 +503,7 @@ mod tests {
         // Can clear force-selection
         group.clear_selection();
         assert_eq!(group.now(), "a"); // falls back to first
-        // Can't select a proxy not in the group
+                                      // Can't select a proxy not in the group
         assert!(!group.select("nonexistent"));
     }
 
@@ -501,11 +529,7 @@ mod tests {
 
         let group = UrlTestGroup::new(
             "auto".to_string(),
-            vec![
-                "slow".to_string(),
-                "fast".to_string(),
-                "medium".to_string(),
-            ],
+            vec!["slow".to_string(), "fast".to_string(), "medium".to_string()],
             50,
             make_hc(url),
             store,
@@ -531,15 +555,20 @@ mod tests {
         // First call picks "a" (lowest)
         assert_eq!(group.now(), "a");
 
-        // Now "b" becomes slightly faster, but within tolerance
+        // Now "b" becomes slightly faster, but within tolerance.
+        // In production, `record_result` is followed by `reset_fast_single()`
+        // (via health.rs after_health_check) so the singleflight cache reflects
+        // fresh state — replicate that here.
         store.record_result("a", url, Some(120));
         store.record_result("b", url, Some(110));
+        group.reset_fast_single();
 
         // Should stick with "a" since 120 <= 110 + 50
         assert_eq!(group.now(), "a");
 
         // Now "b" becomes much faster, exceeding tolerance
         store.record_result("b", url, Some(50));
+        group.reset_fast_single();
 
         // Should switch to "b" since 120 > 50 + 50
         assert_eq!(group.now(), "b");
@@ -584,11 +613,18 @@ mod tests {
             let name = format!("proxy-{i}");
             let history = store.delay_history(&name);
             assert!(!history.is_empty(), "proxy-{i} should have history");
-            assert!(history.len() <= 10, "proxy-{i} history {} > MAX_HISTORY", history.len());
+            assert!(
+                history.len() <= 10,
+                "proxy-{i} history {} > MAX_HISTORY",
+                history.len()
+            );
 
             // Verify extra (per-URL) histories exist
             let extras = store.extra_delay_histories(&name);
-            assert!(!extras.is_empty(), "proxy-{i} should have extra URL histories");
+            assert!(
+                !extras.is_empty(),
+                "proxy-{i} should have extra URL histories"
+            );
             for (_url, val) in &extras {
                 let h = val.get("history").and_then(|v| v.as_array());
                 assert!(h.is_some(), "proxy-{i} extra should have history array");

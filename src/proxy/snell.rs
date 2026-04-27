@@ -107,7 +107,10 @@ impl OutboundHandler for SnellOutbound {
         let ip = dns.resolve_proxy_server(&self.server).await?;
         let addr = std::net::SocketAddr::new(ip, self.port);
         let mut stream = tcp::connect(addr, &self.connect_opts).await?;
-        debug!("Snell v{} connected to {}:{}", self.version, self.server, self.port);
+        debug!(
+            "Snell v{} connected to {}:{}",
+            self.version, self.server, self.port
+        );
 
         // Build Snell CONNECT request header
         // Format: [version(1)] [cmd(1)] [host_len(1)] [host] [port(2)]

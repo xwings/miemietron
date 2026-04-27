@@ -128,9 +128,7 @@ impl Socks5Outbound {
                 .write_all(&[SOCKS5_VERSION, 2, AUTH_NONE, AUTH_USER_PASS])
                 .await?;
         } else {
-            stream
-                .write_all(&[SOCKS5_VERSION, 1, AUTH_NONE])
-                .await?;
+            stream.write_all(&[SOCKS5_VERSION, 1, AUTH_NONE]).await?;
         }
         stream.flush().await?;
 
@@ -138,7 +136,10 @@ impl Socks5Outbound {
         stream.read_exact(&mut resp).await?;
 
         if resp[0] != SOCKS5_VERSION {
-            return Err(anyhow!("SOCKS5 server returned invalid version: {}", resp[0]));
+            return Err(anyhow!(
+                "SOCKS5 server returned invalid version: {}",
+                resp[0]
+            ));
         }
 
         match resp[1] {
@@ -164,14 +165,19 @@ impl Socks5Outbound {
                 let mut auth_resp = [0u8; 2];
                 stream.read_exact(&mut auth_resp).await?;
                 if auth_resp[1] != 0x00 {
-                    return Err(anyhow!("SOCKS5 authentication failed (status: {})", auth_resp[1]));
+                    return Err(anyhow!(
+                        "SOCKS5 authentication failed (status: {})",
+                        auth_resp[1]
+                    ));
                 }
             }
             AUTH_NO_ACCEPTABLE => {
                 return Err(anyhow!("SOCKS5 server: no acceptable auth methods"));
             }
             other => {
-                return Err(anyhow!("SOCKS5 server chose unsupported auth method: {other}"));
+                return Err(anyhow!(
+                    "SOCKS5 server chose unsupported auth method: {other}"
+                ));
             }
         }
 
@@ -209,7 +215,10 @@ impl Socks5Outbound {
             return Err(anyhow!("SOCKS5 reply invalid version: {}", reply_head[0]));
         }
         if reply_head[1] != REP_SUCCESS {
-            return Err(anyhow!("SOCKS5 CONNECT failed with reply code: {}", reply_head[1]));
+            return Err(anyhow!(
+                "SOCKS5 CONNECT failed with reply code: {}",
+                reply_head[1]
+            ));
         }
 
         // Consume bound address (we don't need it, but must read it)

@@ -135,7 +135,6 @@ impl SsUdpSocket {
 
         Ok((copy_len, addr))
     }
-
 }
 
 /// Implement `OutboundPacketConn` for `SsUdpSocket` — delegates to existing methods.
@@ -211,8 +210,8 @@ fn parse_address(data: &[u8]) -> Result<(Address, usize)> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::aead::{encode_address, generate_salt};
+    use super::*;
     use crate::common::addr::Address;
 
     #[test]

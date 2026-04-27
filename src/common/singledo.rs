@@ -53,10 +53,7 @@ impl<T: Clone + Send> SingleDo<T> {
     ///
     /// Matches mihomo's `Single.Do()` signature.
     #[allow(dead_code)]
-    pub async fn do_once<F, Fut>(
-        &self,
-        f: F,
-    ) -> (T, Option<String>, bool)
+    pub async fn do_once<F, Fut>(&self, f: F) -> (T, Option<String>, bool)
     where
         F: FnOnce() -> Fut,
         Fut: Future<Output = (T, Option<String>)>,
@@ -134,6 +131,31 @@ impl<T: Clone + Send> SingleDo<T> {
         }
 
         (val, err, false)
+    }
+
+    /// Synchronous variant of `do_once` for cheap, non-async compute functions.
+    ///
+    /// Holds the inner mutex across `f()`, so callers must not perform blocking
+    /// or async work inside `f`. Returns `(value, shared)` where `shared` is
+    /// true if the value came from cache.
+    ///
+    /// mihomo compat: matches `Single.Do` behavior when wrapping a sync compute
+    /// (urltest.go fast()), where Go's sync.Mutex serializes concurrent callers.
+    pub fn do_sync<F: FnOnce() -> T>(&self, f: F) -> (T, bool) {
+        let mut inner = self.inner.lock();
+        if let Some(ref result) = inner.result {
+            if result.time.elapsed() < self.wait {
+                return (result.val.clone(), true);
+            }
+        }
+        inner.result = None;
+        let val = f();
+        inner.result = Some(CachedResult {
+            val: val.clone(),
+            err: None,
+            time: Instant::now(),
+        });
+        (val, false)
     }
 
     /// Clear cached result and in-flight call, forcing next call to execute.

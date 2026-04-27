@@ -61,7 +61,8 @@ impl SniffCache {
             let (count, recorded) = entry.value();
             if recorded.elapsed() >= SNIFF_SKIP_TTL {
                 drop(entry);
-                self.skip_list.insert(dst, (AtomicU8::new(1), Instant::now()));
+                self.skip_list
+                    .insert(dst, (AtomicU8::new(1), Instant::now()));
             } else {
                 let old = count.load(Ordering::Relaxed);
                 if old <= SNIFF_SKIP_THRESHOLD {
@@ -127,11 +128,7 @@ fn extract_quic_sni(data: &[u8]) -> Option<String> {
     for i in 0..data.len().saturating_sub(10) {
         // ClientHello: handshake_type=0x01, then 3 bytes length, then
         // client_version 0x0303 (TLS 1.2 in ClientHello)
-        if data[i] == 0x01
-            && i + 6 < data.len()
-            && data[i + 4] == 0x03
-            && data[i + 5] == 0x03
-        {
+        if data[i] == 0x01 && i + 6 < data.len() && data[i + 4] == 0x03 && data[i + 5] == 0x03 {
             // Try to parse as a TLS ClientHello starting at offset i
             // Reconstruct a fake TLS record: 0x16 0x03 0x01 [length] [handshake]
             let remaining = &data[i..];
@@ -340,9 +337,15 @@ mod tests {
     use super::*;
     use std::net::SocketAddr;
 
-    fn addr1() -> SocketAddr { "1.2.3.4:443".parse().unwrap() }
-    fn addr2() -> SocketAddr { "5.6.7.8:443".parse().unwrap() }
-    fn addr3() -> SocketAddr { "1.2.3.4:80".parse().unwrap() }
+    fn addr1() -> SocketAddr {
+        "1.2.3.4:443".parse().unwrap()
+    }
+    fn addr2() -> SocketAddr {
+        "5.6.7.8:443".parse().unwrap()
+    }
+    fn addr3() -> SocketAddr {
+        "1.2.3.4:80".parse().unwrap()
+    }
 
     /// Build a minimal TLS 1.2 ClientHello with a single SNI extension.
     ///

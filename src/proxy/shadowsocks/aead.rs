@@ -471,7 +471,11 @@ impl<T> SsStream<T> {
     {
         use tokio::io::AsyncWriteExt;
 
-        if let WriteState::Flushing { ref buf, ref mut pos } = self.write_state {
+        if let WriteState::Flushing {
+            ref buf,
+            ref mut pos,
+        } = self.write_state
+        {
             if *pos < buf.len() {
                 let data = buf[*pos..].to_vec();
                 self.inner.write_all(&data).await?;
@@ -1125,8 +1129,7 @@ mod tests {
             dec.decrypt_in_place(nonce.current(), &mut len_buf)
                 .expect("decrypt length chunk");
             nonce.increment();
-            let payload_len =
-                u16::from_be_bytes([len_buf[0], len_buf[1]]) as usize;
+            let payload_len = u16::from_be_bytes([len_buf[0], len_buf[1]]) as usize;
 
             // Decrypt payload (nonce=3)
             let pl_start = chunk_start + 2 + TAG_LEN;
@@ -1446,9 +1449,10 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncRead for SsStream<T> {
                     let remaining = &dec_buf[*pos..];
                     if remaining.is_empty() {
                         // Reclaim buffer for reuse instead of dropping + allocating
-                        if let ReadState::Buffered { buf, .. } =
-                            std::mem::replace(me.read_state, ReadState::WaitingLength { buf: Vec::new() })
-                        {
+                        if let ReadState::Buffered { buf, .. } = std::mem::replace(
+                            me.read_state,
+                            ReadState::WaitingLength { buf: Vec::new() },
+                        ) {
                             *me.read_reuse_buf = buf;
                         }
                         // Set up WaitingLength with a small reused buffer

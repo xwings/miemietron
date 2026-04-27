@@ -97,7 +97,10 @@ pub async fn run_ntp(config: &NtpConfig) {
         return;
     }
 
-    info!("NTP sync started (server: {}:{})", config.server, config.port);
+    info!(
+        "NTP sync started (server: {}:{})",
+        config.server, config.port
+    );
 
     let mut interval = tokio::time::interval(Duration::from_secs(config.interval.max(10)));
 

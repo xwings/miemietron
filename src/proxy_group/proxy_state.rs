@@ -70,10 +70,7 @@ impl ProxyStateStore {
     /// Returns true if no state recorded yet (matching mihomo).
     pub fn alive_for_url(&self, proxy: &str, url: &str) -> bool {
         // Check per-URL state first
-        if let Some(state) = self
-            .extra_state
-            .get(&(proxy.to_string(), url.to_string()))
-        {
+        if let Some(state) = self.extra_state.get(&(proxy.to_string(), url.to_string())) {
             return state.is_alive();
         }
         // Fall back to default state
@@ -88,10 +85,7 @@ impl ProxyStateStore {
     /// Matches mihomo's LastDelayForUrl() behavior.
     pub fn last_delay_for_url(&self, proxy: &str, url: &str) -> u16 {
         // Check per-URL state first
-        if let Some(state) = self
-            .extra_state
-            .get(&(proxy.to_string(), url.to_string()))
-        {
+        if let Some(state) = self.extra_state.get(&(proxy.to_string(), url.to_string())) {
             if !state.is_alive() {
                 return 0xFFFF;
             }

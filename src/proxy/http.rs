@@ -37,7 +37,9 @@ impl HttpOutbound {
             .as_ref()
             .ok_or_else(|| anyhow!("http proxy missing server"))?
             .clone();
-        let port = config.port.ok_or_else(|| anyhow!("http proxy missing port"))?;
+        let port = config
+            .port
+            .ok_or_else(|| anyhow!("http proxy missing port"))?;
 
         // Parse username/password from config fields
         let username = config
@@ -54,9 +56,7 @@ impl HttpOutbound {
             .and_then(|v| v.as_mapping())
             .map(|m| {
                 m.iter()
-                    .filter_map(|(k, v)| {
-                        Some((k.as_str()?.to_string(), v.as_str()?.to_string()))
-                    })
+                    .filter_map(|(k, v)| Some((k.as_str()?.to_string(), v.as_str()?.to_string())))
                     .collect()
             })
             .unwrap_or_default();
@@ -116,11 +116,7 @@ impl OutboundHandler for HttpOutbound {
 }
 
 impl HttpOutbound {
-    async fn send_connect<S>(
-        &self,
-        mut stream: S,
-        target: &Address,
-    ) -> Result<Box<dyn ProxyStream>>
+    async fn send_connect<S>(&self, mut stream: S, target: &Address) -> Result<Box<dyn ProxyStream>>
     where
         S: super::ProxyStream + 'static,
     {
@@ -130,15 +126,13 @@ impl HttpOutbound {
         };
 
         // Build CONNECT request
-        let mut req = format!(
-            "CONNECT {host_port} HTTP/1.1\r\nHost: {host_port}\r\n"
-        );
+        let mut req = format!("CONNECT {host_port} HTTP/1.1\r\nHost: {host_port}\r\n");
 
         // Add proxy authentication
         if let Some(ref username) = self.username {
             let pass = self.password.as_deref().unwrap_or("");
-            let creds = base64::engine::general_purpose::STANDARD
-                .encode(format!("{username}:{pass}"));
+            let creds =
+                base64::engine::general_purpose::STANDARD.encode(format!("{username}:{pass}"));
             req.push_str(&format!("Proxy-Authorization: Basic {creds}\r\n"));
         }
 
@@ -159,10 +153,7 @@ impl HttpOutbound {
 
         // Expect "HTTP/1.x 200 ..."
         if !status_line.contains(" 200 ") {
-            return Err(anyhow!(
-                "HTTP proxy CONNECT failed: {}",
-                status_line.trim()
-            ));
+            return Err(anyhow!("HTTP proxy CONNECT failed: {}", status_line.trim()));
         }
 
         // Consume remaining headers until empty line

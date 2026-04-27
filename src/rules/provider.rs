@@ -196,13 +196,35 @@ impl RuleProvider {
                 }
             }
             RuleFormat::Mrs => {
-                // MRS is mihomo's binary rule format. Try to parse it, fall
-                // back to treating as text if it's not actually binary.
-                match parse_mrs_format(content.as_bytes()) {
+                // mihomo's MRS format is zstd-compressed (mrs_reader.go:17).
+                // Inside the zstd stream is the magic `MRS\1`, behavior byte,
+                // counts, and strategy-specific binary content. miemietron
+                // does not yet implement the full reader (out of scope —
+                // see ARCHITECTURE.md "Scope: in vs not-in").
+                //
+                // If the file starts with the zstd frame magic, we MUST NOT
+                // silently fall back to text parsing — that produces garbage
+                // rules. Fail loudly so the operator picks a `yaml` or `text`
+                // provider instead.
+                let bytes = content.as_bytes();
+                let is_zstd = bytes.len() >= 4
+                    && bytes[0] == 0x28
+                    && bytes[1] == 0xB5
+                    && bytes[2] == 0x2F
+                    && bytes[3] == 0xFD;
+                if is_zstd {
+                    return Err(anyhow::anyhow!(
+                        "rule provider '{}': MRS (zstd) format not yet implemented; use behavior/format yaml or text",
+                        self.name
+                    ));
+                }
+
+                // Legacy plain-text-with-magic encoding — keep best-effort.
+                match parse_mrs_format(bytes) {
                     Ok(rules) if !rules.is_empty() => Ok(rules),
                     _ => {
                         tracing::debug!(
-                            "MRS binary parse failed for '{}', trying text fallback",
+                            "MRS plain-magic parse failed for '{}', trying text fallback",
                             self.name
                         );
                         Ok(parse_text_format(content))
@@ -509,5 +531,28 @@ payload:
         // We can indirectly verify by parsing through the provider's parse_content
         let result = provider.parse_content("example.com\ngoogle.com").unwrap();
         assert_eq!(result, vec!["example.com", "google.com"]);
+    }
+
+    #[test]
+    fn mrs_zstd_input_errors_not_silent_garbage() {
+        // Real mihomo MRS files start with the zstd frame magic
+        // (0x28 0xB5 0x2F 0xFD). Until we have a full zstd-MRS reader, this
+        // MUST surface as an explicit error instead of producing junk text
+        // "rules". `parse_content` reads via `.as_bytes()` so we feed the
+        // raw bytes through `from_utf8_unchecked` solely to satisfy the
+        // `&str` argument type — the parser only inspects the byte view.
+        // Build the bytes at runtime so the compiler doesn't constant-fold
+        // and trip the `invalid_from_utf8_unchecked` lint.
+        let mut bytes = Vec::with_capacity(8);
+        for b in [0x28u8, 0xB5, 0x2F, 0xFD, 0x00, 0x01, 0x02, 0x03] {
+            bytes.push(b);
+        }
+        let provider = RuleProvider::new("mrs".to_string(), "file", None, None, 0, Some("mrs"));
+        let s: &str = unsafe { std::str::from_utf8_unchecked(&bytes) };
+        let err = provider
+            .parse_content(s)
+            .expect_err("must error on zstd MRS");
+        let msg = format!("{err}");
+        assert!(msg.contains("MRS"), "wrong error: {msg}");
     }
 }

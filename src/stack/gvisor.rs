@@ -209,13 +209,8 @@ async fn run_gvisor_loop(
                     match parsed.protocol {
                         6 => {
                             // TCP
-                            handle_tcp_packet(
-                                &parsed,
-                                &mut tcp_connections,
-                                &tcp_tx,
-                                &mut tun,
-                            )
-                            .await;
+                            handle_tcp_packet(&parsed, &mut tcp_connections, &tcp_tx, &mut tun)
+                                .await;
                         }
                         17 => {
                             // UDP
@@ -229,13 +224,8 @@ async fn run_gvisor_loop(
                 if let Some(parsed) = parse_ipv6_packet(packet) {
                     match parsed.protocol {
                         6 => {
-                            handle_tcp_packet(
-                                &parsed,
-                                &mut tcp_connections,
-                                &tcp_tx,
-                                &mut tun,
-                            )
-                            .await;
+                            handle_tcp_packet(&parsed, &mut tcp_connections, &tcp_tx, &mut tun)
+                                .await;
                         }
                         17 => {
                             handle_udp_packet(&parsed, &udp_tx).await;
@@ -358,18 +348,23 @@ async fn handle_tcp_packet(
 
         let our_seq: u32 = rand::random();
 
-        connections.insert(key, TcpConnectionState {
-            our_seq: our_seq.wrapping_add(1),
-            their_seq: seq_num.wrapping_add(1),
-            established: false,
-            app_tx: to_app_tx,
-            from_app_tx,
-        });
+        connections.insert(
+            key,
+            TcpConnectionState {
+                our_seq: our_seq.wrapping_add(1),
+                their_seq: seq_num.wrapping_add(1),
+                established: false,
+                app_tx: to_app_tx,
+                from_app_tx,
+            },
+        );
 
         // Send SYN-ACK back through TUN
         let syn_ack = build_tcp_response(&TcpSegment {
-            src_ip: &packet.dst_ip, src_port: dst_port,
-            dst_ip: &packet.src_ip, dst_port: src_port,
+            src_ip: &packet.dst_ip,
+            src_port: dst_port,
+            dst_ip: &packet.src_ip,
+            dst_port: src_port,
             seq: our_seq,
             ack: seq_num.wrapping_add(1),
             flags: 0x12, // SYN+ACK
@@ -379,7 +374,6 @@ async fn handle_tcp_packet(
         let _ = tun.write_all(&syn_ack).await;
 
         debug!("Gvisor: SYN from {} -> {}, sent SYN-ACK", src, dst);
-
     } else if ack && !syn {
         if let Some(conn) = connections.get_mut(&key) {
             if !conn.established {
@@ -412,8 +406,10 @@ async fn handle_tcp_packet(
 
                 // Send ACK
                 let ack_pkt = build_tcp_response(&TcpSegment {
-                    src_ip: &packet.dst_ip, src_port: dst_port,
-                    dst_ip: &packet.src_ip, dst_port: src_port,
+                    src_ip: &packet.dst_ip,
+                    src_port: dst_port,
+                    dst_ip: &packet.src_ip,
+                    dst_port: src_port,
                     seq: conn.our_seq,
                     ack: conn.their_seq,
                     flags: 0x10, // ACK
@@ -429,8 +425,10 @@ async fn handle_tcp_packet(
         if let Some(conn) = connections.remove(&key) {
             // Send FIN-ACK
             let fin_ack = build_tcp_response(&TcpSegment {
-                src_ip: &packet.dst_ip, src_port: dst_port,
-                dst_ip: &packet.src_ip, dst_port: src_port,
+                src_ip: &packet.dst_ip,
+                src_port: dst_port,
+                dst_ip: &packet.src_ip,
+                dst_port: src_port,
                 seq: conn.our_seq,
                 ack: seq_num.wrapping_add(1),
                 flags: 0x11, // FIN+ACK
@@ -482,8 +480,12 @@ fn build_tcp_response(seg: &TcpSegment<'_>) -> Vec<u8> {
     packet[8] = 64; // TTL
     packet[9] = 6; // TCP
 
-    if let IpAddr::V4(ip) = src_ip { packet[12..16].copy_from_slice(&ip.octets()) }
-    if let IpAddr::V4(ip) = dst_ip { packet[16..20].copy_from_slice(&ip.octets()) }
+    if let IpAddr::V4(ip) = src_ip {
+        packet[12..16].copy_from_slice(&ip.octets())
+    }
+    if let IpAddr::V4(ip) = dst_ip {
+        packet[16..20].copy_from_slice(&ip.octets())
+    }
 
     // IPv4 header checksum
     let cksum = ipv4_checksum(&packet[..20]);
@@ -569,10 +571,7 @@ fn tcp_checksum(src_ip: &IpAddr, dst_ip: &IpAddr, tcp_segment: &[u8]) -> u16 {
     !sum as u16
 }
 
-async fn handle_udp_packet(
-    packet: &ParsedPacket,
-    udp_tx: &mpsc::Sender<GvisorUdpDatagram>,
-) {
+async fn handle_udp_packet(packet: &ParsedPacket, udp_tx: &mpsc::Sender<GvisorUdpDatagram>) {
     let udp_data = &packet.payload;
     if udp_data.len() < 8 {
         return;
@@ -591,4 +590,3 @@ async fn handle_udp_packet(
         data: payload.to_vec(),
     });
 }
-

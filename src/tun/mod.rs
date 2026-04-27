@@ -78,7 +78,15 @@ pub async fn run_tun(
                 "TUN {} using {} stack (user-space TCP/IP)",
                 config.device, stack_type
             );
-            run_gvisor_stack(tun_dev, &config, conn_manager, dns, &stack_type, &dns_listen).await
+            run_gvisor_stack(
+                tun_dev,
+                &config,
+                conn_manager,
+                dns,
+                &stack_type,
+                &dns_listen,
+            )
+            .await
         }
         _ => {
             // "system" stack (default) — kernel TCP/IP via iptables REDIRECT
@@ -562,25 +570,19 @@ async fn run_udp_relay(
                     tokio::spawn(async move {
                         let mut rbuf = vec![0u8; 65535];
                         loop {
-                            let recv = tokio::time::timeout(
-                                timeout_dur,
-                                pc_rev.recv_from(&mut rbuf),
-                            )
-                            .await;
+                            let recv =
+                                tokio::time::timeout(timeout_dur, pc_rev.recv_from(&mut rbuf))
+                                    .await;
 
                             match recv {
                                 Ok(Ok((rn, _))) => {
                                     if rn == 0 {
                                         break;
                                     }
-                                    if let Some(mut s) =
-                                        nat_rev.get_mut(&(src_addr, orig_dst))
-                                    {
+                                    if let Some(mut s) = nat_rev.get_mut(&(src_addr, orig_dst)) {
                                         s.last_active = Instant::now();
                                     }
-                                    if let Err(e) =
-                                        send_udp_from(orig_dst, src_addr, &rbuf[..rn])
-                                    {
+                                    if let Err(e) = send_udp_from(orig_dst, src_addr, &rbuf[..rn]) {
                                         debug!(
                                             "UDP reverse send {} -> {} error: {}",
                                             orig_dst, src_addr, e
@@ -593,10 +595,7 @@ async fn run_udp_relay(
                                     break;
                                 }
                                 Err(_) => {
-                                    debug!(
-                                        "UDP session {} -> {} timed out",
-                                        src_addr, orig_dst
-                                    );
+                                    debug!("UDP session {} -> {} timed out", src_addr, orig_dst);
                                     break;
                                 }
                             }
@@ -683,50 +682,10 @@ async fn create_udp_session(
         }
 
         Action::Proxy(ref proxy_name) => {
-            // Try to route through a proxy that supports UDP
-            if let Some(handler) = proxies.resolve(proxy_name) {
-                match handler.connect_datagram(&target, dns_arc.clone()).await {
-                    Ok(pc_box) => {
-                        let pc: Arc<dyn OutboundPacketConn> = Arc::from(pc_box);
-
-                        debug!(
-                            "UDP proxy '{}' session: {} -> {}",
-                            proxy_name, src, dst
-                        );
-
-                        pc.send_to(initial_data, &target).await?;
-
-                        return Ok(UdpSessionResult {
-                            outbound: pc,
-                            target,
-                        });
-                    }
-                    Err(e) => {
-                        warn!(
-                            "UDP proxy '{}' connect_datagram failed: {}, falling back to DIRECT",
-                            proxy_name, e
-                        );
-                    }
-                }
-            } else {
-                warn!(
-                    "UDP proxy '{}' not found, falling back to DIRECT",
-                    proxy_name
-                );
-            }
-
-            // Fallback to DIRECT
-            let direct = proxies
-                .resolve("DIRECT")
-                .ok_or_else(|| anyhow::anyhow!("DIRECT handler not found"))?;
-
-            let pc: Arc<dyn OutboundPacketConn> =
-                Arc::from(direct.connect_datagram(&target, dns_arc).await?);
-
-            debug!("UDP DIRECT fallback session: {} -> {}", src, dst);
-
+            // No silent DIRECT fallback — see ProxyManager::dial_proxy_udp.
+            let pc = proxies.dial_proxy_udp(proxy_name, &target, dns_arc).await?;
+            debug!("UDP proxy '{}' session: {} -> {}", proxy_name, src, dst);
             pc.send_to(initial_data, &target).await?;
-
             Ok(UdpSessionResult {
                 outbound: pc,
                 target,

@@ -134,10 +134,7 @@ pub async fn run_tproxy_tcp_listener(
         let orig_dst = match stream.local_addr() {
             Ok(dst) => dst,
             Err(e) => {
-                warn!(
-                    "TPROXY TCP: failed to get local_addr for {}: {}",
-                    src, e
-                );
+                warn!("TPROXY TCP: failed to get local_addr for {}: {}", src, e);
                 continue;
             }
         };

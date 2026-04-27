@@ -172,10 +172,7 @@ pub async fn resolve_proxy_server(domain: &str, config: &DnsConfig) -> Result<Ip
         .await
         {
             Ok(ip) => {
-                debug!(
-                    "DNS proxy-server-nameserver resolved {} -> {}",
-                    domain, ip
-                );
+                debug!("DNS proxy-server-nameserver resolved {} -> {}", domain, ip);
                 return Ok(ip);
             }
             Err(e) => {
@@ -202,10 +199,7 @@ pub async fn resolve_proxy_server(domain: &str, config: &DnsConfig) -> Result<Ip
                 return Ok(ip);
             }
             Err(e) => {
-                warn!(
-                    "DNS default-nameserver all failed for {}: {}",
-                    domain, e
-                );
+                warn!("DNS default-nameserver all failed for {}: {}", domain, e);
             }
         }
     }
@@ -441,13 +435,20 @@ async fn query_server(domain: &str, server: &str) -> Result<(IpAddr, u32)> {
     } else if server.starts_with("tls://") {
         resolve_dot(domain, server).await
     } else if server.starts_with("dhcp://") {
-        // DHCP DNS: mihomo reads DNS from DHCP lease on the named interface.
-        // We don't have DHCP client support — fall back to system resolver.
-        tracing::debug!("dhcp:// nameserver not supported, using system resolver for {}", domain);
-        resolve_system(domain).await
+        // mihomo's `dns/dhcp.go` reads DNS from the DHCP lease on the named
+        // interface. miemietron does not have a DHCP client — surface that as
+        // an explicit error rather than silently falling back to the system
+        // resolver, which would change routing/policy behavior in ways the
+        // operator did not configure.
+        Err(anyhow::anyhow!(
+            "DNS scheme not supported: {server} (dhcp:// requires a DHCP client; out of scope — see ARCHITECTURE.md)"
+        ))
     } else if server.starts_with("quic://") || server.starts_with("h3://") {
-        // DoQ/H3 not yet supported
-        Err(anyhow::anyhow!("DNS scheme not supported: {server}"))
+        // mihomo's `dns/doq.go` and DoH-over-H3 — both require a QUIC stack
+        // we don't yet ship. Fail loudly instead of silently masquerading.
+        Err(anyhow::anyhow!(
+            "DNS scheme not supported: {server} (DoQ / DoH-H3 out of scope — see ARCHITECTURE.md)"
+        ))
     } else if server.starts_with("system://") || server == "system" {
         resolve_system(domain).await
     } else {
@@ -974,15 +975,30 @@ mod tests {
     #[test]
     fn fakeip_range_match() {
         let range = "198.18.0.0/15";
-        assert!(is_in_fakeip_range(&IpAddr::V4(Ipv4Addr::new(198, 18, 0, 1)), range));
-        assert!(is_in_fakeip_range(&IpAddr::V4(Ipv4Addr::new(198, 19, 255, 255)), range));
-        assert!(!is_in_fakeip_range(&IpAddr::V4(Ipv4Addr::new(198, 20, 0, 1)), range));
-        assert!(!is_in_fakeip_range(&IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), range));
+        assert!(is_in_fakeip_range(
+            &IpAddr::V4(Ipv4Addr::new(198, 18, 0, 1)),
+            range
+        ));
+        assert!(is_in_fakeip_range(
+            &IpAddr::V4(Ipv4Addr::new(198, 19, 255, 255)),
+            range
+        ));
+        assert!(!is_in_fakeip_range(
+            &IpAddr::V4(Ipv4Addr::new(198, 20, 0, 1)),
+            range
+        ));
+        assert!(!is_in_fakeip_range(
+            &IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+            range
+        ));
     }
 
     #[test]
     fn fakeip_range_empty() {
-        assert!(!is_in_fakeip_range(&IpAddr::V4(Ipv4Addr::new(198, 18, 0, 1)), ""));
+        assert!(!is_in_fakeip_range(
+            &IpAddr::V4(Ipv4Addr::new(198, 18, 0, 1)),
+            ""
+        ));
     }
 
     #[test]

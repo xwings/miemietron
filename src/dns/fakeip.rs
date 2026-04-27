@@ -23,8 +23,8 @@ pub struct FakeIpPool {
     offset: AtomicU32, // Current position in ring
 
     // Full CIDR range for `contains()` / `is_fake_ip()` checks
-    cidr_base: u32,    // Network address of the CIDR
-    cidr_size: u32,    // Total number of IPs in the CIDR
+    cidr_base: u32, // Network address of the CIDR
+    cidr_size: u32, // Total number of IPs in the CIDR
 
     // Bidirectional mappings
     ip_to_domain: DashMap<IpAddr, String>,
@@ -151,7 +151,11 @@ impl FakeIpPool {
     pub fn should_bypass(&self, domain: &str) -> bool {
         // O(1) exact match check first, then O(n) suffix scan.
         let matches_filter = self.compiled_filter.exact.contains(domain)
-            || self.compiled_filter.suffixes.iter().any(|s| domain.ends_with(s.as_str()));
+            || self
+                .compiled_filter
+                .suffixes
+                .iter()
+                .any(|s| domain.ends_with(s.as_str()));
 
         match self.filter_mode {
             FilterMode::Blacklist => matches_filter,

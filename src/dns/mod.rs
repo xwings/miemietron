@@ -68,7 +68,10 @@ impl DnsResolver {
         let hosts = hosts_map
             .iter()
             .filter_map(|(domain, ip_str)| {
-                ip_str.parse::<IpAddr>().ok().map(|ip| (domain.to_lowercase(), ip))
+                ip_str
+                    .parse::<IpAddr>()
+                    .ok()
+                    .map(|ip| (domain.to_lowercase(), ip))
             })
             .collect();
 
@@ -81,10 +84,7 @@ impl DnsResolver {
             .filter_map(|f| f.strip_prefix("geosite:").map(|s| s.to_lowercase()))
             .collect();
         if !fakeip_geosite_codes.is_empty() {
-            info!(
-                "FakeIP bypass geosite codes: {:?}",
-                fakeip_geosite_codes
-            );
+            info!("FakeIP bypass geosite codes: {:?}", fakeip_geosite_codes);
         }
 
         Ok(Self {
@@ -220,7 +220,8 @@ impl DnsResolver {
     /// Remove expired entries from ip_to_host to prevent unbounded growth.
     fn evict_expired_ip_mappings(&self) {
         let now = Instant::now();
-        self.ip_to_host.retain(|_, (_, expires_at)| now < *expires_at);
+        self.ip_to_host
+            .retain(|_, (_, expires_at)| now < *expires_at);
     }
 
     /// Manually insert an IP→domain mapping.
@@ -307,7 +308,10 @@ impl DnsResolver {
                         "DNS resolution for proxy server '{domain}' failed (cached negative result)"
                     ));
                 }
-                debug!("DNS proxy-server cache hit (after dedup): {} -> {}", domain, ip);
+                debug!(
+                    "DNS proxy-server cache hit (after dedup): {} -> {}",
+                    domain, ip
+                );
                 return Ok(ip);
             }
         }
@@ -416,7 +420,11 @@ pub async fn run_dns_server(listen: &str, resolver: Arc<DnsResolver>) -> Result<
                     debug!("DNS query (UDP): {} (type {})", domain, qtype);
                     match resolver.resolve(&domain).await {
                         Ok(ip) => {
-                            let ttl = if resolver.is_fake_ip(&ip) { FAKEIP_TTL } else { DNS_DEFAULT_TTL };
+                            let ttl = if resolver.is_fake_ip(&ip) {
+                                FAKEIP_TTL
+                            } else {
+                                DNS_DEFAULT_TTL
+                            };
                             let response = build_dns_response(id, &domain, ip, qtype, ttl);
                             let _ = udp_socket_clone.send_to(&response, src).await;
                         }
@@ -492,7 +500,11 @@ async fn handle_dns_tcp_connection(
                 debug!("DNS query (TCP): {} (type {})", domain, qtype);
                 match resolver.resolve(&domain).await {
                     Ok(ip) => {
-                        let ttl = if resolver.is_fake_ip(&ip) { FAKEIP_TTL } else { DNS_DEFAULT_TTL };
+                        let ttl = if resolver.is_fake_ip(&ip) {
+                            FAKEIP_TTL
+                        } else {
+                            DNS_DEFAULT_TTL
+                        };
                         build_dns_response(id, &domain, ip, qtype, ttl)
                     }
                     Err(e) => {
@@ -660,7 +672,10 @@ mod tests {
         resolver.record_ip_mapping(ip, "example.com", 600);
 
         // Now reverse lookup should succeed
-        assert_eq!(resolver.reverse_lookup(&ip), Some("example.com".to_string()));
+        assert_eq!(
+            resolver.reverse_lookup(&ip),
+            Some("example.com".to_string())
+        );
     }
 
     #[test]
@@ -776,8 +791,14 @@ mod tests {
         resolver.record_ip_mapping(ip1, "example.com", 300);
         resolver.record_ip_mapping(ip2, "google.com", 300);
 
-        assert_eq!(resolver.reverse_lookup(&ip1), Some("example.com".to_string()));
-        assert_eq!(resolver.reverse_lookup(&ip2), Some("google.com".to_string()));
+        assert_eq!(
+            resolver.reverse_lookup(&ip1),
+            Some("example.com".to_string())
+        );
+        assert_eq!(
+            resolver.reverse_lookup(&ip2),
+            Some("google.com".to_string())
+        );
     }
 
     #[test]

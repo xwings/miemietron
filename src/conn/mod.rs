@@ -67,7 +67,6 @@ impl<T> CountingStream<T> {
             download,
         }
     }
-
 }
 
 impl<T: AsyncRead> AsyncRead for CountingStream<T> {
@@ -525,13 +524,12 @@ impl ConnectionManager {
         // or unresolved placeholder (tunnel.go:288-290). preHandleMetadata sets
         // DstIP = netip.Addr{} for FakeIP so IP-CIDR rules don't match the
         // FakeIP range. Same for HTTP proxy 0.0.0.0 placeholder.
-        let rule_dst_ip = if domain.is_some()
-            && (dns.is_fake_ip(&dst.ip()) || dst.ip().is_unspecified())
-        {
-            None
-        } else {
-            Some(dst.ip())
-        };
+        let rule_dst_ip =
+            if domain.is_some() && (dns.is_fake_ip(&dst.ip()) || dst.ip().is_unspecified()) {
+                None
+            } else {
+                Some(dst.ip())
+            };
 
         let rule_meta = RuleMetadata {
             domain: domain.clone(),
@@ -583,18 +581,11 @@ impl ConnectionManager {
             group.touch();
         }
 
-        // Get outbound handler
-        let handler = match &action {
-            Action::Direct => proxies.get("DIRECT"),
-            Action::Reject => proxies.get("REJECT"),
-            Action::RejectDrop => proxies.get("REJECT-DROP"),
-            Action::Proxy(name) => proxies.resolve(name),
-        };
-
-        let handler = match handler.or_else(|| proxies.get("DIRECT")) {
-            Some(h) => h,
-            None => return Err(anyhow::anyhow!("no proxy handler found and DIRECT missing")),
-        };
+        // Resolve the action to an outbound handler. ProxyManager::resolve_action
+        // errors if Action::Proxy(name) cannot be resolved — no silent DIRECT
+        // fallback. See ARCHITECTURE.md "Scope" and the regression tests in
+        // src/proxy/mod.rs.
+        let handler = proxies.resolve_action(&action)?;
         let proxy_name = handler.name().to_string();
         let proxy_proto = handler.proto().to_string();
 
@@ -648,8 +639,8 @@ impl ConnectionManager {
             proxy_name,
             target
         );
-        use tokio::time::{timeout, Instant};
         use rand::Rng;
+        use tokio::time::{timeout, Instant};
 
         let retry_deadline = Instant::now() + std::time::Duration::from_secs(5); // C.DefaultTCPTimeout
         const MAX_RETRIES: usize = 10;
@@ -695,7 +686,8 @@ impl ConnectionManager {
                     if attempt < MAX_RETRIES - 1 {
                         // mihomo compat: slowdown with jitter (slowdown.go, backoff.go)
                         // duration = Random(min, min * factor^attempt), capped at max
-                        let max_dur = (backoff_min_ms * backoff_factor.powi(attempt as i32)).min(backoff_max_ms);
+                        let max_dur = (backoff_min_ms * backoff_factor.powi(attempt as i32))
+                            .min(backoff_max_ms);
                         let jittered = rand::thread_rng().gen_range(backoff_min_ms..=max_dur);
                         let sleep_dur = std::time::Duration::from_millis(jittered as u64);
 
@@ -1204,13 +1196,17 @@ mod tests {
                 let writer_a = tokio::spawn(async move {
                     let (mut r, mut w) = tokio::io::split(a_client);
                     for _ in 0..chunks_per_direction {
-                        if w.write_all(&payload_a).await.is_err() { break; }
+                        if w.write_all(&payload_a).await.is_err() {
+                            break;
+                        }
                     }
                     let _ = w.shutdown().await;
                     // Drain reads
                     let mut sink = vec![0u8; 4096];
                     while let Ok(n) = r.read(&mut sink).await {
-                        if n == 0 { break; }
+                        if n == 0 {
+                            break;
+                        }
                     }
                 });
 
@@ -1224,8 +1220,12 @@ mod tests {
                             Ok(n) => n,
                             Err(_) => break,
                         };
-                        if w.write_all(&buf[..n]).await.is_err() { break; }
-                        if w.flush().await.is_err() { break; }
+                        if w.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                        if w.flush().await.is_err() {
+                            break;
+                        }
                     }
                     let _ = w.shutdown().await;
                 });
@@ -1236,16 +1236,17 @@ mod tests {
             }));
         }
 
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            async {
-                for h in handles {
-                    h.await.unwrap();
-                }
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            for h in handles {
+                h.await.unwrap();
             }
-        ).await;
+        })
+        .await;
 
-        assert!(result.is_ok(), "200 concurrent relays (8KB each) should complete within 10s");
+        assert!(
+            result.is_ok(),
+            "200 concurrent relays (8KB each) should complete within 10s"
+        );
     }
 
     /// Stress test: relay with one side that drops immediately.
@@ -1267,7 +1268,8 @@ mod tests {
             let result = tokio::time::timeout(
                 std::time::Duration::from_secs(1),
                 relay_bidirectional(a_server, b_server),
-            ).await;
+            )
+            .await;
 
             assert!(result.is_ok(), "relay should handle abrupt close within 1s");
         }
@@ -1313,7 +1315,10 @@ mod tests {
 
         let received = reader.await.unwrap();
 
-        assert_eq!(received, total_bytes, "receiver should get all {total_bytes} bytes");
+        assert_eq!(
+            received, total_bytes,
+            "receiver should get all {total_bytes} bytes"
+        );
         assert_eq!(
             up.load(Ordering::Relaxed) as usize,
             total_bytes,

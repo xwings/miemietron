@@ -133,7 +133,10 @@ pub async fn start_server(addr: &str, secret: Option<String>, state: ApiState) -
         )
         // Rule providers
         .route("/providers/rules", get(rules_api::get_rule_providers))
-        .route("/providers/rules/{name}", put(rules_api::put_rule_provider))
+        .route(
+            "/providers/rules/{name}",
+            get(rules_api::get_rule_provider).put(rules_api::put_rule_provider),
+        )
         // Rules
         .route("/rules", get(rules_api::get_rules))
         .route("/rules/disable", patch(rules_api::patch_rules_disable))

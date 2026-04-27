@@ -82,7 +82,10 @@ impl OutboundHandler for DirectOutbound {
             }
         }
 
-        debug!("DIRECT: created UDP packet conn (mark={:?})", self.routing_mark);
+        debug!(
+            "DIRECT: created UDP packet conn (mark={:?})",
+            self.routing_mark
+        );
         Ok(Box::new(DirectPacketConn { socket, dns }))
     }
 }
@@ -143,6 +146,89 @@ impl OutboundHandler for RejectOutbound {
     }
 }
 
+/// User-named DIRECT outbound (config `type: direct`).
+///
+/// mihomo compat: `adapter/outbound/direct.go::NewDirectWithOption`. Lets a
+/// config author bind a custom name to direct-dial behavior so proxy groups
+/// and rules can target it (e.g. `proxies: [{name: my-direct, type: direct}]`).
+/// The behavior is identical to the built-in DIRECT — only the display name
+/// and `routing-mark` differ.
+pub struct NamedDirectOutbound {
+    proxy_name: String,
+    inner: DirectOutbound,
+}
+
+impl NamedDirectOutbound {
+    pub fn new(name: String, routing_mark: Option<u32>) -> Self {
+        Self {
+            proxy_name: name,
+            inner: DirectOutbound::new(routing_mark),
+        }
+    }
+}
+
+#[async_trait]
+impl OutboundHandler for NamedDirectOutbound {
+    fn name(&self) -> &str {
+        &self.proxy_name
+    }
+    fn proto(&self) -> &str {
+        "Direct"
+    }
+    fn supports_udp(&self) -> bool {
+        true
+    }
+    async fn connect_stream(
+        &self,
+        target: &Address,
+        dns: &DnsResolver,
+    ) -> Result<Box<dyn ProxyStream>> {
+        self.inner.connect_stream(target, dns).await
+    }
+    async fn connect_datagram(
+        &self,
+        target: &Address,
+        dns: Arc<DnsResolver>,
+    ) -> Result<Box<dyn OutboundPacketConn>> {
+        self.inner.connect_datagram(target, dns).await
+    }
+}
+
+/// User-named REJECT outbound (config `type: reject`).
+///
+/// mihomo compat: `adapter/outbound/reject.go::NewRejectWithOption`. Same
+/// "drop the dial with EOF" behavior as the built-in REJECT, but with a
+/// caller-chosen display name.
+pub struct NamedRejectOutbound {
+    proxy_name: String,
+}
+
+impl NamedRejectOutbound {
+    pub fn new(name: String) -> Self {
+        Self { proxy_name: name }
+    }
+}
+
+#[async_trait]
+impl OutboundHandler for NamedRejectOutbound {
+    fn name(&self) -> &str {
+        &self.proxy_name
+    }
+    fn proto(&self) -> &str {
+        "Reject"
+    }
+    fn supports_udp(&self) -> bool {
+        false
+    }
+    async fn connect_stream(
+        &self,
+        _target: &Address,
+        _dns: &DnsResolver,
+    ) -> Result<Box<dyn ProxyStream>> {
+        Err(anyhow::anyhow!("connection rejected"))
+    }
+}
+
 /// RejectDrop: silently drops the connection.
 pub struct RejectDropOutbound;
 
@@ -168,51 +254,5 @@ impl OutboundHandler for RejectDropOutbound {
         // Wait briefly then drop — don't hold fds for 24 hours
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
         Err(anyhow::anyhow!("connection dropped"))
-    }
-}
-
-/// Placeholder outbound for protocols not yet implemented.
-/// Logs a warning and falls back to DIRECT.
-pub struct PlaceholderOutbound {
-    proxy_name: String,
-    proto: String,
-    routing_mark: Option<u32>,
-}
-
-impl PlaceholderOutbound {
-    pub fn new(name: String, proto: &str, routing_mark: Option<u32>) -> Self {
-        Self {
-            proxy_name: name,
-            proto: proto.to_string(),
-            routing_mark,
-        }
-    }
-}
-
-#[async_trait]
-impl OutboundHandler for PlaceholderOutbound {
-    fn name(&self) -> &str {
-        &self.proxy_name
-    }
-
-    fn proto(&self) -> &str {
-        &self.proto
-    }
-
-    fn supports_udp(&self) -> bool {
-        false
-    }
-
-    async fn connect_stream(
-        &self,
-        target: &Address,
-        dns: &DnsResolver,
-    ) -> Result<Box<dyn ProxyStream>> {
-        tracing::warn!(
-            "Proxy {} ({}) not implemented, falling back to DIRECT",
-            self.proxy_name,
-            self.proto
-        );
-        DirectOutbound::new(self.routing_mark).connect_stream(target, dns).await
     }
 }

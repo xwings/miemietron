@@ -174,10 +174,7 @@ async fn handle_http_connection(
 
         let inner = buf_reader.into_inner();
         // Prepend the reconstructed request to the stream
-        let prefixed = crate::conn::PeekableStream::new(
-            reconstructed.into_bytes(),
-            inner,
-        );
+        let prefixed = crate::conn::PeekableStream::new(reconstructed.into_bytes(), inner);
         conn_manager
             .handle_tcp_with_host(peer, dst, prefixed, "http-proxy", host_override)
             .await?;

@@ -214,10 +214,9 @@ impl OutboundHandler for TrojanOutbound {
                 }
                 "grpc" => {
                     let service_name = self.grpc_service_name();
-                    let grpc_stream =
-                        grpc::connect_grpc(reality_stream, &service_name, &self.sni)
-                            .await
-                            .context("Trojan: gRPC connect over Reality failed")?;
+                    let grpc_stream = grpc::connect_grpc(reality_stream, &service_name, &self.sni)
+                        .await
+                        .context("Trojan: gRPC connect over Reality failed")?;
 
                     let header = encode_request(&self.password_hash, CMD_TCP, target);
                     let trojan_stream = TrojanStream::new(grpc_stream, header);
@@ -225,10 +224,9 @@ impl OutboundHandler for TrojanOutbound {
                 }
                 "h2" => {
                     let (host, path) = self.h2_host_path();
-                    let h2_stream =
-                        h2_transport::connect_h2(reality_stream, &host, &path)
-                            .await
-                            .context("Trojan: H2 connect over Reality failed")?;
+                    let h2_stream = h2_transport::connect_h2(reality_stream, &host, &path)
+                        .await
+                        .context("Trojan: H2 connect over Reality failed")?;
 
                     let header = encode_request(&self.password_hash, CMD_TCP, target);
                     let trojan_stream = TrojanStream::new(h2_stream, header);
@@ -271,10 +269,9 @@ impl OutboundHandler for TrojanOutbound {
                         .context("Trojan: TLS handshake for gRPC failed")?;
 
                     let service_name = self.grpc_service_name();
-                    let grpc_stream =
-                        grpc::connect_grpc(tls_stream, &service_name, &self.sni)
-                            .await
-                            .context("Trojan: gRPC connect failed")?;
+                    let grpc_stream = grpc::connect_grpc(tls_stream, &service_name, &self.sni)
+                        .await
+                        .context("Trojan: gRPC connect failed")?;
 
                     let header = encode_request(&self.password_hash, CMD_TCP, target);
                     let trojan_stream = TrojanStream::new(grpc_stream, header);
@@ -293,10 +290,9 @@ impl OutboundHandler for TrojanOutbound {
                         .context("Trojan: TLS handshake for H2 failed")?;
 
                     let (host, path) = self.h2_host_path();
-                    let h2_stream =
-                        h2_transport::connect_h2(tls_stream, &host, &path)
-                            .await
-                            .context("Trojan: H2 connect failed")?;
+                    let h2_stream = h2_transport::connect_h2(tls_stream, &host, &path)
+                        .await
+                        .context("Trojan: H2 connect failed")?;
 
                     let header = encode_request(&self.password_hash, CMD_TCP, target);
                     let trojan_stream = TrojanStream::new(h2_stream, header);

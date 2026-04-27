@@ -172,7 +172,6 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncWrite for VisionStream<T> {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

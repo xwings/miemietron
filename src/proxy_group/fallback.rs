@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use tokio::sync::Notify;
 use tracing::{debug, warn};
 
 use crate::dns::DnsResolver;
@@ -38,6 +39,8 @@ pub struct FallbackGroup {
     pub(crate) last_touch: Arc<AtomicU64>,
     /// Whether this group uses lazy health checks.
     pub(crate) lazy: bool,
+    /// mihomo compat: failure-driven health check trigger.
+    pub(crate) health_notify: Arc<Notify>,
 }
 
 impl FallbackGroup {
@@ -61,6 +64,16 @@ impl FallbackGroup {
             test_timeout: hc.test_timeout.unwrap_or(5000),
             last_touch: Arc::new(AtomicU64::new(0)),
             lazy: hc.lazy,
+            health_notify: Arc::new(Notify::new()),
+        }
+    }
+
+    /// Mark whether a triggered health check is currently running.
+    /// mihomo compat: `failedTesting` flag in groupbase.go.
+    pub(crate) fn set_health_testing(&self, running: bool) {
+        self.failed_testing.store(running, Ordering::Relaxed);
+        if !running {
+            self.failed_times.store(0, Ordering::Relaxed);
         }
     }
 
@@ -104,14 +117,17 @@ impl FallbackGroup {
 
             let handle = tokio::spawn(async move {
                 let _permit = sem.acquire().await;
-                let result = tokio::time::timeout(
-                    timeout,
-                    measure_unified_delay(&handler, &url, &dns),
-                ).await;
+                let result =
+                    tokio::time::timeout(timeout, measure_unified_delay(&handler, &url, &dns))
+                        .await;
                 match result {
                     Ok(Ok(ms)) => {
                         debug!("fallback {}: alive ({}ms)", name, ms);
-                        let delay = if ms > u16::MAX as u64 { u16::MAX } else { ms as u16 };
+                        let delay = if ms > u16::MAX as u64 {
+                            u16::MAX
+                        } else {
+                            ms as u16
+                        };
                         state_store.record_result(&name, &url, Some(delay));
                     }
                     Ok(Err(e)) => {
@@ -147,17 +163,13 @@ impl FallbackGroup {
         result
     }
 
-    /// Trigger the onDialFailed health check logic.
-    /// mihomo compat: matches GroupBase.healthCheck() in groupbase.go
+    /// Trigger an immediate health check via the background loop.
+    /// mihomo compat: matches GroupBase.healthCheck() in groupbase.go.
     fn do_health_check(&self) {
         if self.failed_testing.load(Ordering::Relaxed) {
             return;
         }
-        self.failed_testing.store(true, Ordering::Relaxed);
-        // The actual health check is async and runs in the health check loop.
-        // Here we just reset the failure counters.
-        self.failed_testing.store(false, Ordering::Relaxed);
-        self.failed_times.store(0, Ordering::Relaxed);
+        self.health_notify.notify_one();
     }
 }
 
@@ -267,10 +279,7 @@ impl ProxyGroup for FallbackGroup {
                 return;
             }
             let count = prev + 1;
-            debug!(
-                "ProxyGroup: {} failed count: {}",
-                self.group_name, count
-            );
+            debug!("ProxyGroup: {} failed count: {}", self.group_name, count);
             if count >= self.max_failed_times {
                 warn!(
                     "because {} failed multiple times, activate health check",
@@ -307,7 +316,13 @@ mod tests {
     }
 
     fn make_hc(url: &str, interval: u64) -> HealthCheckOpts {
-        HealthCheckOpts { url: url.to_string(), interval_secs: interval, max_failed_times: None, test_timeout: None, lazy: false }
+        HealthCheckOpts {
+            url: url.to_string(),
+            interval_secs: interval,
+            max_failed_times: None,
+            test_timeout: None,
+            lazy: false,
+        }
     }
 
     #[test]

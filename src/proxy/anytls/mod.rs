@@ -11,15 +11,15 @@ pub mod session;
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use parking_lot::Mutex as PlMutex;
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::io::{split as tokio_split, AsyncRead, AsyncWrite};
+use tokio::io::{AsyncWriteExt, ReadHalf, WriteHalf};
 use tracing::debug;
 
 use super::{OutboundHandler, ProxyStream};
@@ -48,6 +48,30 @@ pub struct AnytlsOutbound {
     session_counter: AtomicU64,
     idle_sessions: Arc<PlMutex<VecDeque<Arc<Session>>>>,
     idle_timeout: Duration,
+    /// mihomo compat (`MinIdleSession`): keep at least this many sessions
+    /// "warm" in the idle pool even if they would otherwise be expired by
+    /// `idle_timeout`. Useful for high-frequency traffic where the cost of
+    /// a fresh TLS handshake matters. The runtime value is consulted by the
+    /// `sweep_idle_sessions` task; the field is also exposed for tests via
+    /// `min_idle_sessions()` so the YAML wiring can be verified.
+    min_idle_sessions: usize,
+}
+
+impl AnytlsOutbound {
+    /// Idle-session timeout. Sessions older than this are evicted by the
+    /// background sweeper unless the live count is below
+    /// `min_idle_sessions()`.
+    #[allow(dead_code)]
+    pub fn idle_timeout(&self) -> Duration {
+        self.idle_timeout
+    }
+
+    /// Minimum number of warm idle sessions the sweeper will preserve.
+    /// `0` (the default) means "evict by timeout only".
+    #[allow(dead_code)]
+    pub fn min_idle_sessions(&self) -> usize {
+        self.min_idle_sessions
+    }
 }
 
 impl AnytlsOutbound {
@@ -80,13 +104,48 @@ impl AnytlsOutbound {
             .or_else(|| config.servername.clone())
             .unwrap_or_else(|| server.clone());
 
+        // mihomo compat: `transport/anytls/session/client.go::NewClient` floor
+        // values — anything ≤ 5 s gets pulled up to 30 s. Default 30 s for both
+        // the idle timeout and the sweeper interval.
         let idle_timeout_secs = config
             .extra
             .get("idle-session-timeout")
             .and_then(|v| v.as_u64())
             .unwrap_or(30);
-        let idle_timeout =
-            Duration::from_secs(if idle_timeout_secs < 5 { 30 } else { idle_timeout_secs });
+        let idle_timeout = Duration::from_secs(if idle_timeout_secs <= 5 {
+            30
+        } else {
+            idle_timeout_secs
+        });
+        let check_interval_secs = config
+            .extra
+            .get("idle-session-check-interval")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(30);
+        let check_interval = Duration::from_secs(if check_interval_secs <= 5 {
+            30
+        } else {
+            check_interval_secs
+        });
+        let min_idle_sessions = config
+            .extra
+            .get("min-idle-session")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as usize;
+
+        let idle_sessions = Arc::new(PlMutex::new(VecDeque::new()));
+
+        // Spawn the background idle-session sweeper. Holds a Weak<...> to the
+        // pool so it self-terminates when the AnytlsOutbound is dropped (e.g.
+        // on config reload). mihomo compat:
+        // `transport/anytls/session/client.go::idleCleanup`.
+        let weak_pool = Arc::downgrade(&idle_sessions);
+        tokio::spawn(sweep_idle_sessions(
+            weak_pool,
+            check_interval,
+            idle_timeout,
+            min_idle_sessions,
+        ));
 
         Ok(Self {
             name: config.name.clone(),
@@ -101,8 +160,9 @@ impl AnytlsOutbound {
             connect_opts: ConnectOpts::from_proxy_config(config),
             padding: Arc::new(PaddingFactory::default_scheme()),
             session_counter: AtomicU64::new(0),
-            idle_sessions: Arc::new(PlMutex::new(VecDeque::new())),
+            idle_sessions,
             idle_timeout,
+            min_idle_sessions,
         })
     }
 
@@ -117,7 +177,8 @@ impl AnytlsOutbound {
             };
             match candidate {
                 Some(s) if !s.inner.is_closed() => {
-                    let idle_for = Instant::now().saturating_duration_since(*s.inner.idle_since.lock());
+                    let idle_for =
+                        Instant::now().saturating_duration_since(*s.inner.idle_since.lock());
                     if idle_for >= self.idle_timeout {
                         // Let the session drop → recv loop exits, writer closes.
                         continue;
@@ -154,7 +215,7 @@ impl AnytlsOutbound {
         prologue.extend_from_slice(&self.password_sha256);
         prologue.extend_from_slice(&(pad_len as u16).to_be_bytes());
         if pad_len > 0 {
-            prologue.extend(std::iter::repeat(0u8).take(pad_len));
+            prologue.extend(std::iter::repeat_n(0u8, pad_len));
         }
         tls_stream.write_all(&prologue).await?;
 
@@ -177,10 +238,12 @@ impl AnytlsOutbound {
             .await
             .map_err(|e| anyhow!("anytls settings write: {e}"))?;
 
-        debug!("anytls new session seq={} to {}:{}", seq, self.server, self.port);
+        debug!(
+            "anytls new session seq={} to {}:{}",
+            seq, self.server, self.port
+        );
         Ok(session)
     }
-
 }
 
 /// Ensure [`ReadHalf`]/[`WriteHalf`] are actually named to keep the generics
@@ -202,7 +265,9 @@ impl OutboundHandler for AnytlsOutbound {
 
     fn supports_udp(&self) -> bool {
         // mihomo supports anytls UDP via sing/uot; we don't (yet).
-        false && self.udp
+        // Once a sing/uot port lands, return `self.udp` here.
+        let _ = self.udp;
+        false
     }
 
     async fn connect_stream(
@@ -301,6 +366,68 @@ impl tokio::io::AsyncWrite for PoolOnDrop {
     }
 }
 
+/// Periodic sweeper for the anytls idle-session pool.
+///
+/// Mirrors `transport/anytls/session/client.go::idleCleanup` in mihomo:
+/// every `check_interval` we walk the pool newest-first, keeping any
+/// session younger than `idle_timeout`, rejuvenating sessions that would
+/// otherwise be evicted while the live count is below `min_idle`, and
+/// closing the rest.
+///
+/// Holds `Weak<...>` to the pool so the task self-terminates when the
+/// owning `AnytlsOutbound` is dropped (e.g. on config reload).
+async fn sweep_idle_sessions(
+    weak_pool: Weak<PlMutex<VecDeque<Arc<Session>>>>,
+    check_interval: Duration,
+    idle_timeout: Duration,
+    min_idle: usize,
+) {
+    let mut ticker = tokio::time::interval(check_interval);
+    ticker.tick().await; // skip the immediate first fire
+
+    loop {
+        ticker.tick().await;
+        let pool = match weak_pool.upgrade() {
+            Some(p) => p,
+            None => return, // owner dropped — exit cleanly
+        };
+
+        let now = Instant::now();
+        let mut to_close: Vec<Arc<Session>> = Vec::new();
+        {
+            let mut guard = pool.lock();
+            // Walk newest-first; the back of the VecDeque is newest by
+            // get_or_create_session / PoolOnDrop convention. Rebuild into
+            // `keep` so the survivors retain that ordering.
+            let mut active = 0usize;
+            let mut keep: VecDeque<Arc<Session>> = VecDeque::with_capacity(guard.len());
+            while let Some(session) = guard.pop_back() {
+                if session.inner.is_closed() {
+                    continue;
+                }
+                let idle_since = *session.inner.idle_since.lock();
+                let elapsed = now.saturating_duration_since(idle_since);
+                if elapsed < idle_timeout {
+                    active += 1;
+                    keep.push_back(session);
+                } else if active < min_idle {
+                    *session.inner.idle_since.lock() = now;
+                    active += 1;
+                    keep.push_back(session);
+                } else {
+                    to_close.push(session);
+                }
+            }
+            *guard = keep;
+        }
+
+        // Close outside the pool lock — close() is async.
+        for session in to_close {
+            session.inner.close().await;
+        }
+    }
+}
+
 impl Drop for PoolOnDrop {
     fn drop(&mut self) {
         if let Some(session) = self.session.take() {
@@ -312,3 +439,54 @@ impl Drop for PoolOnDrop {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg_with(extra: &str) -> ProxyConfig {
+        let yaml = format!(
+            r#"
+name: my-anytls
+type: anytls
+server: example.com
+port: 443
+password: hunter2
+{extra}
+"#
+        );
+        serde_yaml::from_str(&yaml).expect("test fixture should parse")
+    }
+
+    /// Defaults match mihomo's `transport/anytls/session/client.go::NewClient`
+    /// floor logic: anything ≤ 5 s gets normalised to 30 s, and `MinIdleSession`
+    /// defaults to 0 ("evict purely by timeout").
+    #[tokio::test]
+    async fn anytls_idle_knobs_default_to_30s_and_zero_min() {
+        let cfg = cfg_with("");
+        let outbound = AnytlsOutbound::from_config(&cfg).expect("config must load");
+        assert_eq!(outbound.idle_timeout(), Duration::from_secs(30));
+        assert_eq!(outbound.min_idle_sessions(), 0);
+    }
+
+    /// Configured non-trivial values flow through to the runtime fields and
+    /// (by extension) to the sweeper task.
+    #[tokio::test]
+    async fn anytls_idle_knobs_pick_up_explicit_values() {
+        // 60 s timeout, 45 s sweeper interval, 2 warm minimum
+        let cfg = cfg_with(
+            "idle-session-timeout: 60\nidle-session-check-interval: 45\nmin-idle-session: 2\n",
+        );
+        let outbound = AnytlsOutbound::from_config(&cfg).expect("config must load");
+        assert_eq!(outbound.idle_timeout(), Duration::from_secs(60));
+        assert_eq!(outbound.min_idle_sessions(), 2);
+    }
+
+    /// Floor: timeouts ≤ 5 s get pulled up to 30 s (matches the upstream
+    /// guard against pathologically small intervals).
+    #[tokio::test]
+    async fn anytls_idle_timeout_floors_at_5_seconds() {
+        let cfg = cfg_with("idle-session-timeout: 3\n");
+        let outbound = AnytlsOutbound::from_config(&cfg).expect("config must load");
+        assert_eq!(outbound.idle_timeout(), Duration::from_secs(30));
+    }
+}

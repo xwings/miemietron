@@ -55,11 +55,7 @@ pub async fn get_proxies(State(state): State<ApiState>) -> Json<Value> {
     let live_groups = pm.list_live_groups();
     let config = state.app.config();
     // Use config order for groups
-    let mut group_names: Vec<String> = config
-        .proxy_groups
-        .iter()
-        .map(|g| g.name.clone())
-        .collect();
+    let mut group_names: Vec<String> = config.proxy_groups.iter().map(|g| g.name.clone()).collect();
     // Add any live groups not in config (shouldn't happen, but be safe)
     for (name, _) in live_groups.iter() {
         if !group_names.contains(name) {
@@ -200,7 +196,11 @@ fn parse_expected_status(s: &str) -> Option<Vec<(u16, u16)>> {
             ranges.push((v, v));
         }
     }
-    if ranges.is_empty() { None } else { Some(ranges) }
+    if ranges.is_empty() {
+        None
+    } else {
+        Some(ranges)
+    }
 }
 
 fn status_matches(code: u16, ranges: &[(u16, u16)]) -> bool {
@@ -220,7 +220,9 @@ async fn do_delay_test(
 ) -> Result<(u16, u16), anyhow::Error> {
     let parsed: url::Url = url_str.parse()?;
     let host = parsed.host_str().unwrap_or("www.gstatic.com").to_string();
-    let port = parsed.port().unwrap_or(if parsed.scheme() == "https" { 443 } else { 80 });
+    let port = parsed
+        .port()
+        .unwrap_or(if parsed.scheme() == "https" { 443 } else { 80 });
     let path = if parsed.query().is_some() {
         format!("{}?{}", parsed.path(), parsed.query().unwrap())
     } else {
@@ -249,8 +251,10 @@ async fn do_delay_test(
                 ))
                 .with_no_client_auth(),
         ));
-        let server_name = rustls::pki_types::ServerName::try_from(host.clone())
-            .unwrap_or_else(|_| rustls::pki_types::ServerName::try_from("localhost".to_string()).unwrap());
+        let server_name =
+            rustls::pki_types::ServerName::try_from(host.clone()).unwrap_or_else(|_| {
+                rustls::pki_types::ServerName::try_from("localhost".to_string()).unwrap()
+            });
         let mut tls_stream = tls_connector.connect(server_name, stream).await?;
 
         let req = format!("HEAD {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
@@ -276,9 +280,19 @@ async fn do_delay_test(
     // mihomo compat: check expected status (satisfied flag)
     if let Some(ranges) = expected_status {
         if !status_matches(status_code, ranges) {
-            return Err(anyhow::anyhow!("expected status {}, got {}",
-                ranges.iter().map(|(a,b)| if a == b { format!("{a}") } else { format!("{a}-{b}") }).collect::<Vec<_>>().join("/"),
-                status_code));
+            return Err(anyhow::anyhow!(
+                "expected status {}, got {}",
+                ranges
+                    .iter()
+                    .map(|(a, b)| if a == b {
+                        format!("{a}")
+                    } else {
+                        format!("{a}-{b}")
+                    })
+                    .collect::<Vec<_>>()
+                    .join("/"),
+                status_code
+            ));
         }
     }
 
@@ -312,7 +326,12 @@ pub async fn get_proxy_delay(
     let handler = pm.get(&name).or_else(|| pm.resolve(&name));
     let handler = match handler {
         Some(h) => h,
-        None => return (StatusCode::NOT_FOUND, Json(json!({"message": "proxy not found"}))),
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({"message": "proxy not found"})),
+            )
+        }
     };
 
     let dns = state.app.dns_resolver();
@@ -488,7 +507,12 @@ pub async fn get_group_delay(
 
     let proxy_names = match pm.group_proxy_names(&name) {
         Some(names) => names,
-        None => return (StatusCode::NOT_FOUND, Json(json!({"message": "group not found"}))),
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({"message": "group not found"})),
+            )
+        }
     };
 
     let url_str = query

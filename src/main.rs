@@ -57,7 +57,12 @@ where
             Level::TRACE => "trace",
         };
 
-        write!(writer, "time=\"{}\" level={} msg=\"", now.format("%+"), level)?;
+        write!(
+            writer,
+            "time=\"{}\" level={} msg=\"",
+            now.format("%+"),
+            level
+        )?;
 
         // Collect the message fields
         let mut visitor = MessageVisitor(&mut writer);
@@ -112,6 +117,12 @@ struct Cli {
     #[arg(long = "ext-ctl-unix", env = "CLASH_OVERRIDE_EXTERNAL_CONTROLLER_UNIX")]
     ext_ctl_unix: Option<String>,
 
+    /// External controller named pipe (Windows; accepted for parity).
+    /// mihomo compat: see `main.go::flag.StringVar(&externalControllerPipe, ...)`.
+    /// On non-Windows this flag is accepted but has no effect.
+    #[arg(long = "ext-ctl-pipe", env = "CLASH_OVERRIDE_EXTERNAL_CONTROLLER_PIPE")]
+    ext_ctl_pipe: Option<String>,
+
     /// API secret
     #[arg(long = "secret", env = "CLASH_OVERRIDE_SECRET")]
     secret: Option<String>,
@@ -147,6 +158,21 @@ fn resolve_config_path(cli: &Cli) -> PathBuf {
     }
     let home = cli.home_dir.clone().unwrap_or_else(default_home_dir);
     home.join("config.yaml")
+}
+
+/// Decode a `--config <base64>` value and parse it as YAML.
+///
+/// mihomo compat: `main.go::main()` does
+/// `configBytes, err = base64.StdEncoding.DecodeString(configString)` — strict
+/// standard base64 (no URL-safe alphabet, no padding tolerance).
+fn decode_base64_config(s: &str) -> Result<MiemieConfig> {
+    use base64::Engine as _;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(s.as_bytes())
+        .map_err(|e| anyhow::anyhow!("--config: base64 decode failed: {e}"))?;
+    let yaml = String::from_utf8(bytes)
+        .map_err(|e| anyhow::anyhow!("--config: decoded bytes are not valid UTF-8: {e}"))?;
+    MiemieConfig::parse_str(&yaml)
 }
 
 /// Format version string to match mihomo's output exactly.
@@ -226,9 +252,8 @@ impl AppState {
         // Wire geosite checker for fake-ip-filter bypass
         {
             let re = new_rules.clone();
-            new_dns.set_geosite_checker(move |domain, code| {
-                re.geosite_matcher().lookup(domain, code)
-            });
+            new_dns
+                .set_geosite_checker(move |domain, code| re.geosite_matcher().lookup(domain, code));
         }
         // Reuse the existing proxy state store so delay history survives reloads
         let new_proxies = proxy::ProxyManager::with_state_store(
@@ -360,9 +385,26 @@ async fn async_main() -> Result<()> {
         }
     }
 
-    // Load config FIRST so we can use its log-level for tracing init
+    // Load config FIRST so we can use its log-level for tracing init.
+    //
+    // mihomo compat: precedence in main.go::main() is
+    //   1. `--config <base64>` (or `CLASH_CONFIG_STRING` env) — base64-decode
+    //      the value into the raw config bytes.
+    //   2. `-f -` — read raw config from stdin.
+    //   3. `-f <path>` — read raw config from file.
     let config_path = resolve_config_path(&cli);
-    let mut config = MiemieConfig::load(&config_path)?;
+    let mut config = if let Some(ref s) = cli.config_string {
+        decode_base64_config(s)?
+    } else if cli.config_file.as_deref().map(|p| p.to_str()) == Some(Some("-")) {
+        use std::io::Read;
+        let mut buf = String::new();
+        std::io::stdin()
+            .read_to_string(&mut buf)
+            .map_err(|e| anyhow::anyhow!("failed to read config from stdin: {e}"))?;
+        MiemieConfig::parse_str(&buf)?
+    } else {
+        MiemieConfig::load(&config_path)?
+    };
 
     // Initialize logging with the broadcast layer for the /logs API.
     // Honor config's log-level (like mihomo), but RUST_LOG env var overrides.
@@ -458,7 +500,8 @@ impl Engine {
         let config_path = self.config_path;
 
         // Start DNS resolver (without Arc yet — we need to set geosite checker after rule engine)
-        let mut dns_resolver_inner = dns::DnsResolver::with_hosts(&self.config.dns, &self.config.hosts).await?;
+        let mut dns_resolver_inner =
+            dns::DnsResolver::with_hosts(&self.config.dns, &self.config.hosts).await?;
         info!("DNS resolver started");
 
         // Load FakeIP persistence if enabled
@@ -494,9 +537,8 @@ impl Engine {
         // for Chinese domains, resolving them to real IPs instead.
         {
             let re = rule_engine.clone();
-            dns_resolver_inner.set_geosite_checker(move |domain, code| {
-                re.geosite_matcher().lookup(domain, code)
-            });
+            dns_resolver_inner
+                .set_geosite_checker(move |domain, code| re.geosite_matcher().lookup(domain, code));
         }
         let dns_resolver = Arc::new(dns_resolver_inner);
 
@@ -884,5 +926,41 @@ async fn shutdown_or_reload_signal() -> Signal {
         s = ctrl_c => s,
         s = terminate => s,
         s = hangup => s,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_base64_roundtrip_loads_yaml() {
+        // mihomo compat: --config takes a standard-base64-encoded YAML body.
+        use base64::Engine as _;
+        let yaml = "mode: rule\nmixed-port: 7890\nlog-level: info\n";
+        let encoded = base64::engine::general_purpose::STANDARD.encode(yaml);
+        let cfg = decode_base64_config(&encoded).expect("must decode");
+        assert_eq!(cfg.mode, "rule");
+        assert_eq!(cfg.mixed_port, 7890);
+        assert_eq!(cfg.log_level, "info");
+    }
+
+    #[test]
+    fn config_base64_invalid_errors() {
+        let err = decode_base64_config("not!base64@@@").expect_err("must error");
+        let msg = format!("{err}");
+        assert!(msg.contains("--config"), "wrong error: {msg}");
+    }
+
+    #[test]
+    fn config_base64_invalid_yaml_errors() {
+        // Valid base64, but the decoded text is not a YAML mapping.
+        use base64::Engine as _;
+        let encoded = base64::engine::general_purpose::STANDARD.encode("[not, a, mapping");
+        let err = decode_base64_config(&encoded).expect_err("must error");
+        let msg = format!("{err}");
+        // Either the YAML parse layer or the listener validator should refuse
+        // — either way, no silent acceptance.
+        assert!(!msg.is_empty());
     }
 }
