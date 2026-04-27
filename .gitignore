@@ -33,3 +33,4 @@ openwrt/
 
 # Claude Code
 .claude/
+.codex
