@@ -402,7 +402,7 @@ async fn create_socks_udp_session(
     conn_manager: &ConnectionManager,
 ) -> Result<Arc<dyn OutboundPacketConn>> {
     // Run rule engine to decide action
-    let (action, domain) = conn_manager.resolve_udp_action(src, dst);
+    let (action, domain) = conn_manager.resolve_udp_action(src, dst).await;
 
     let dns = conn_manager.dns_resolver();
     let proxies = conn_manager.proxy_manager();

@@ -531,7 +531,7 @@ impl ConnectionManager {
                 Some(dst.ip())
             };
 
-        let rule_meta = RuleMetadata {
+        let mut rule_meta = RuleMetadata {
             domain: domain.clone(),
             dst_ip: rule_dst_ip,
             src_ip: Some(src.ip()),
@@ -544,6 +544,23 @@ impl ConnectionManager {
             in_type: Some(conn_type),
             ..Default::default()
         };
+
+        // mihomo compat: tunnel.go match() — resolve the host to a real IP on
+        // demand when rule evaluation needs it (GEOIP / IP-CIDR / ... without
+        // no-resolve) but dst_ip was blanked for FakeIP. Resolution failure
+        // falls through to matching with dst_ip=None, exactly like mihomo.
+        if mode != "global"
+            && mode != "direct"
+            && rule_meta.dst_ip.is_none()
+            && rule_meta.domain.is_some()
+            && rules.needs_ip_resolution(&rule_meta)
+        {
+            if let Some(host) = rule_meta.domain.clone() {
+                if let Ok(ip) = dns.resolve_real_ip(&host).await {
+                    rule_meta.dst_ip = Some(ip);
+                }
+            }
+        }
 
         // Match rules
         // mihomo compat: global mode routes to proxies["GLOBAL"], direct mode to DIRECT
@@ -816,7 +833,11 @@ impl ConnectionManager {
     /// Resolve a UDP datagram's destination through the rule engine.
     ///
     /// Returns the `Action` to take and the resolved domain (if any).
-    pub fn resolve_udp_action(&self, src: SocketAddr, dst: SocketAddr) -> (Action, Option<String>) {
+    pub async fn resolve_udp_action(
+        &self,
+        src: SocketAddr,
+        dst: SocketAddr,
+    ) -> (Action, Option<String>) {
         let dns = self.app.dns_resolver();
         let rules = self.app.rule_engine();
         let config = self.app.config();
@@ -835,7 +856,7 @@ impl ConnectionManager {
             Some(dst.ip())
         };
 
-        let rule_meta = RuleMetadata {
+        let mut rule_meta = RuleMetadata {
             domain: domain.clone(),
             dst_ip: rule_dst_ip,
             src_ip: Some(src.ip()),
@@ -848,6 +869,22 @@ impl ConnectionManager {
             in_type: Some("tproxy"),
             ..Default::default()
         };
+
+        // mihomo compat: tunnel.go match() — resolve the host to a real IP on
+        // demand when an IP rule (GEOIP / IP-CIDR / ... without no-resolve) is
+        // reached but dst_ip was blanked for FakeIP. Same as the TCP path.
+        if mode != "global"
+            && mode != "direct"
+            && rule_meta.dst_ip.is_none()
+            && rule_meta.domain.is_some()
+            && rules.needs_ip_resolution(&rule_meta)
+        {
+            if let Some(host) = rule_meta.domain.clone() {
+                if let Ok(ip) = dns.resolve_real_ip(&host).await {
+                    rule_meta.dst_ip = Some(ip);
+                }
+            }
+        }
 
         // mihomo compat: global mode routes to proxies["GLOBAL"]
         let action = if mode == "global" {

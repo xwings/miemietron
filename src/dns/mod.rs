@@ -182,6 +182,44 @@ impl DnsResolver {
         Ok(ip)
     }
 
+    /// Resolve a domain to a REAL IP, never a FakeIP.
+    ///
+    /// mihomo compat: tunnel.go `match()` calls `resolver.ResolveIP()` on
+    /// demand when a rule needs the destination IP (GEOIP / IP-CIDR /
+    /// IP-SUFFIX / IP-ASN without `no-resolve`) but the connection only carries
+    /// a domain — `preHandleMetadata` blanked the FakeIP from `dst_ip`. Without
+    /// this, `GEOIP,CN,DIRECT` can never match domain traffic under fake-ip and
+    /// domestic connections leak through the proxy catch-all.
+    ///
+    /// Mirrors `resolve()` minus the FakeIP-allocate branch: hosts → DNS cache
+    /// → upstream (with fallback + GeoIP anti-poison), caching the real result.
+    /// Used solely for rule matching; the dial path still uses the domain.
+    pub async fn resolve_real_ip(&self, domain: &str) -> Result<IpAddr> {
+        // IP literal — return as-is.
+        if let Ok(ip) = domain.parse::<IpAddr>() {
+            return Ok(ip);
+        }
+
+        // Hosts map first (highest priority, like /etc/hosts).
+        if let Some(ip) = self.hosts.get(&domain.to_lowercase()) {
+            return Ok(*ip);
+        }
+
+        // DNS cache — but never trust a cached FakeIP for rule matching.
+        if let Some(ip) = self.cache.get(domain) {
+            if !self.is_fake_ip(&ip) {
+                return Ok(ip);
+            }
+        }
+
+        // Query upstream for a real IP (full fallback + anti-poison pipeline).
+        let (ip, ttl) = self.query_upstream_with_ttl(domain).await?;
+        self.cache.insert(domain.to_string(), ip, ttl);
+        // mihomo compat: withMapping() records every upstream resolution
+        self.record_ip_mapping(ip, domain, ttl);
+        Ok(ip)
+    }
+
     /// Reverse-lookup: given an IP, return the original domain.
     ///
     /// mihomo compat: matches enhancer.go FindHostByIP() — checks FakeIP pool

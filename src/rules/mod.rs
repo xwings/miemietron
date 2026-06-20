@@ -554,6 +554,46 @@ impl RuleEngine {
         self.match_rules_detailed(metadata).0
     }
 
+    /// Whether rule evaluation needs the destination host resolved to a real IP.
+    ///
+    /// mihomo compat: tunnel.go `match()` resolves the host on demand (lazily)
+    /// the first time it reaches a destination-IP rule (GEOIP / IP-CIDR /
+    /// IP-CIDR6 / IP-SUFFIX / IP-ASN, without `no-resolve`) while `DstIP` is
+    /// empty. Earlier rules that match without the IP (DOMAIN*, PROCESS*, ...)
+    /// short-circuit, so no resolution happens for them.
+    ///
+    /// The caller invokes this only when `metadata.dst_ip` is None and a domain
+    /// is known (FakeIP was blanked from `dst_ip`); it then resolves via
+    /// `DnsResolver::resolve_real_ip`, populates `dst_ip`, and re-runs
+    /// `match_rules_detailed`. Without this, `GEOIP,CN,DIRECT` never matches
+    /// domain traffic under fake-ip and domestic connections leak through the
+    /// proxy catch-all.
+    pub fn needs_ip_resolution(&self, metadata: &RuleMetadata) -> bool {
+        let domain_lower = metadata.domain.as_ref().map(|d| d.to_lowercase());
+        for (i, rule) in self.rules.iter().enumerate() {
+            // mihomo compat: skip disabled rules (toggled via PATCH /rules/disable)
+            if self
+                .rule_stats
+                .get(i)
+                .is_some_and(|s| s.disabled.load(Ordering::Relaxed))
+            {
+                continue;
+            }
+            // First destination-IP rule reached before any match → resolve once.
+            if rule_resolves_dst_ip(rule) {
+                return true;
+            }
+            // An earlier rule matches without needing the dst IP → no resolution.
+            if self
+                .match_single_rule(i, rule, metadata, domain_lower.as_deref())
+                .is_some()
+            {
+                return false;
+            }
+        }
+        false
+    }
+
     fn match_single_rule(
         &self,
         rule_idx: usize,
@@ -1149,6 +1189,18 @@ fn target_to_action(target: &str) -> Action {
     }
 }
 
+/// mihomo compat: `C.Rule.ShouldResolveIP()` — destination-IP rules resolve the
+/// host on demand unless tagged `no-resolve`. `SRC-*` rules match the (already
+/// known) source address and never trigger destination resolution.
+#[inline]
+fn rule_resolves_dst_ip(rule: &ParsedRule) -> bool {
+    let is_ip_dst_rule = matches!(
+        rule.rule_type.as_str(),
+        "GEOIP" | "IP-CIDR" | "IP-CIDR6" | "IP-SUFFIX" | "IP-ASN"
+    );
+    is_ip_dst_rule && !rule.params.iter().any(|p| p == "no-resolve")
+}
+
 /// Parse mihomo-style port specification: "80", "80/443", "1000-2000", "80-90/443/8080-9090"
 /// Also supports comma as separator (mihomo normalizes "," to "/").
 fn parse_port_spec(spec: &str) -> Vec<(u16, u16)> {
@@ -1651,6 +1703,109 @@ mod tests {
             engine.match_rules(&meta),
             Action::Proxy("Proxy".to_string())
         );
+    }
+
+    // mihomo compat: tunnel.go match() resolves the host on demand when an
+    // IP-based rule is reached with an empty DstIP. These cover the
+    // needs_ip_resolution() guard that drives that resolution in conn/mod.rs.
+
+    #[tokio::test]
+    async fn needs_ip_resolution_true_when_ip_rule_reached_without_dst_ip() {
+        let rules: Vec<RuleString> = vec![
+            "DOMAIN-SUFFIX,google.com,Proxy".to_string(),
+            "IP-CIDR,1.2.3.0/24,DIRECT".to_string(),
+            "MATCH,Proxy".to_string(),
+        ];
+        let engine = RuleEngine::new(&rules, &HashMap::new()).await.unwrap();
+
+        // Domain that no DOMAIN rule matches and no dst_ip (FakeIP cleared):
+        // evaluation reaches the IP-CIDR rule, so resolution is required.
+        let meta = RuleMetadata {
+            domain: Some("random.xyz".to_string()),
+            dst_ip: None,
+            ..Default::default()
+        };
+        assert!(engine.needs_ip_resolution(&meta));
+    }
+
+    #[tokio::test]
+    async fn needs_ip_resolution_false_when_domain_rule_matches_first() {
+        let rules: Vec<RuleString> = vec![
+            "DOMAIN-SUFFIX,google.com,Proxy".to_string(),
+            "IP-CIDR,1.2.3.0/24,DIRECT".to_string(),
+            "MATCH,Proxy".to_string(),
+        ];
+        let engine = RuleEngine::new(&rules, &HashMap::new()).await.unwrap();
+
+        // A domain rule matches before the IP-CIDR rule is ever reached.
+        let meta = RuleMetadata {
+            domain: Some("www.google.com".to_string()),
+            dst_ip: None,
+            ..Default::default()
+        };
+        assert!(!engine.needs_ip_resolution(&meta));
+    }
+
+    #[tokio::test]
+    async fn needs_ip_resolution_false_for_no_resolve_ip_rule() {
+        let rules: Vec<RuleString> = vec![
+            "IP-CIDR,1.2.3.0/24,DIRECT,no-resolve".to_string(),
+            "MATCH,Proxy".to_string(),
+        ];
+        let engine = RuleEngine::new(&rules, &HashMap::new()).await.unwrap();
+
+        // no-resolve IP rules never trigger on-demand resolution.
+        let meta = RuleMetadata {
+            domain: Some("random.xyz".to_string()),
+            dst_ip: None,
+            ..Default::default()
+        };
+        assert!(!engine.needs_ip_resolution(&meta));
+    }
+
+    #[tokio::test]
+    async fn needs_ip_resolution_false_without_any_ip_rule() {
+        let rules: Vec<RuleString> = vec![
+            "DOMAIN-SUFFIX,google.com,Proxy".to_string(),
+            "MATCH,Proxy".to_string(),
+        ];
+        let engine = RuleEngine::new(&rules, &HashMap::new()).await.unwrap();
+
+        let meta = RuleMetadata {
+            domain: Some("random.xyz".to_string()),
+            dst_ip: None,
+            ..Default::default()
+        };
+        assert!(!engine.needs_ip_resolution(&meta));
+    }
+
+    #[tokio::test]
+    async fn resolve_on_demand_flips_ip_rule_from_proxy_to_direct() {
+        // Regression for the domestic-routing leak: without a resolved dst_ip,
+        // an IP rule cannot match and the connection falls through to the proxy
+        // catch-all. Once the host is resolved to a real (domestic) IP, the IP
+        // rule matches and routes DIRECT.
+        let rules: Vec<RuleString> = vec![
+            "IP-CIDR,1.2.3.0/24,DIRECT".to_string(),
+            "MATCH,Proxy".to_string(),
+        ];
+        let engine = RuleEngine::new(&rules, &HashMap::new()).await.unwrap();
+
+        // Before resolution: dst_ip is None → leaks to the proxy catch-all.
+        let mut meta = RuleMetadata {
+            domain: Some("domestic.example".to_string()),
+            dst_ip: None,
+            ..Default::default()
+        };
+        assert!(engine.needs_ip_resolution(&meta));
+        assert_eq!(
+            engine.match_rules(&meta),
+            Action::Proxy("Proxy".to_string())
+        );
+
+        // After resolution (conn/mod.rs sets dst_ip): the IP rule matches DIRECT.
+        meta.dst_ip = Some("1.2.3.4".parse().unwrap());
+        assert_eq!(engine.match_rules(&meta), Action::Direct);
     }
 
     #[tokio::test]

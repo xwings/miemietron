@@ -279,7 +279,8 @@ async fn run_gvisor_stack(
                         } else {
                         let cm = conn_manager.clone();
                         tokio::spawn(async move {
-                            let (action, _domain) = cm.resolve_udp_action(dgram.src, dgram.dst);
+                            let (action, _domain) =
+                                cm.resolve_udp_action(dgram.src, dgram.dst).await;
                             match action {
                                 Action::Direct | Action::Proxy(_) => {
                                     if let Ok(sock) = UdpSocket::bind("0.0.0.0:0").await {
@@ -630,7 +631,7 @@ async fn create_udp_session(
     dns: &Arc<DnsResolver>,
 ) -> Result<UdpSessionResult> {
     // Run rule engine to decide action
-    let (action, domain) = conn_manager.resolve_udp_action(src, dst);
+    let (action, domain) = conn_manager.resolve_udp_action(src, dst).await;
 
     // mihomo: preHandleMetadata -- drop if FakeIP reverse lookup failed
     if domain.is_none() && dns.is_fake_ip(&dst.ip()) {

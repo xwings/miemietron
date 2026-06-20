@@ -6,7 +6,11 @@ Same CLI, same config, same REST API — for the OpenClash runtime surface.
 Anything outside that surface is explicitly carved out below; swap the binary
 for the in-scope set.
 
-**Single static musl binary, ~30k lines of Rust, 425 tests.**
+**Single static musl binary, ~30k lines of Rust, 436 tests.**
+
+This file is the control center: mission, scope, boot/connection flow, the
+OpenClash contract, and an Index of the per-subsystem docs under
+`ARCHITECTURE/`. Subsystem detail lives in those module files, not here.
 
 ## The One Rule
 
@@ -29,7 +33,7 @@ Anything outside the lists below fails the config load with mihomo's verbatim
 | Transports | TCP, TLS, WS, gRPC, H2, Reality, XTLS-Vision |
 | DNS | UDP, TCP, DoT (`tls://`), DoH (`https://`), system, fakeip, nameserver-policy, fallback with GeoIP anti-poison |
 | Rule providers | yaml + text formats (classical / domain / ipcidr) |
-| REST API | the routes implemented under `src/api/`: `/configs`, `/proxies`, `/group{,s}`, `/rules`, `/connections`, `/providers/proxies`, `/providers/rules`, `/dns/query`, `/logs`, `/traffic`, `/version`, `/memory`, UI. `/providers/rules` is partial-but-honest — see "Rule provider API" below. |
+| REST API | the routes implemented under `src/api/`: `/configs`, `/proxies`, `/group{,s}`, `/rules`, `/connections`, `/providers/proxies`, `/providers/rules`, `/dns/query`, `/logs`, `/traffic`, `/version`, `/memory`, UI. `/providers/rules` is partial-but-honest — see [ARCHITECTURE/api.md](ARCHITECTURE/api.md). |
 | CLI | `-d`, `-f`, `-f -`, `--config <base64>`, `--ext-ctl`, `--ext-ctl-unix`, `--secret`, `--ext-ui`, `-m`, `-t`, `-v` |
 
 **Out of scope** (rejected at config load):
@@ -46,7 +50,7 @@ Anything outside the lists below fails the config load with mihomo's verbatim
 | `convert-ruleset`, `generate` CLI subcommands | Offline tooling, not runtime |
 | `--ext-ctl-pipe` (Windows named-pipe controller) | Linux-only target. The flag is **accepted as a no-op** for invocation parity with mihomo wrappers; supplying it does nothing. |
 
-## Project Structure
+## Workspace Layout
 
 ```
 src/
@@ -74,6 +78,34 @@ Mapping to mihomo: `tunnel/` → `conn/`, `adapter/outbound/` → `proxy/`,
 `hub/route/` → `api/`, `component/{fakeip,tun,sniffer,keepalive}/` → their
 corresponding modules.
 
+## Boot Flow
+
+Process start through "ready" lives in the three top-level files —
+`main.rs` (CLI, `AppState`, hot reload), `store.rs` (proxy selection in
+`cache.db`), `ntp.rs` (NTP sync) — which no module doc owns.
+
+1. **`main()`** (`src/main.rs:337`): `setgid(65534)` **first** so the proxy's
+   own outbound traffic is bypassed by OpenClash's `skgid == 65534` firewall
+   rule (warns, does not abort, if it can't), then builds the multi-thread
+   tokio runtime and `block_on(async_main())`.
+2. **`async_main()`** (`src/main.rs:370`): parse CLI; short-circuit on `-v`
+   (prints `Mihomo Meta <version>`) and `-t` (tests config, exits); resolve and
+   load the config (`--config <base64>` → `-f -` stdin → `-f <path>`); init
+   logrus-format tracing at the config's `log-level`; log `uid/gid/egid` for
+   bypass debugging; apply `--ext-ctl{,-unix}` / `--secret` overrides; then
+   `Engine::new(...).run()`.
+3. **`Engine::run()`** (`src/main.rs:498`): build the DNS resolver (load the
+   FakeIP cache when `store-fake-ip`), then the rule engine (wired back into the
+   resolver as the geosite checker for `fake-ip-filter`), then the proxy manager
+   (restore selections via `store::load_selected` when `store-selected`),
+   assemble shared `AppState` and the `ConnectionManager`.
+4. **Ready**: spawn one task each for the API server, TUN, the embedded DNS
+   server, every inbound listener (from top-level port flags), proxy-group
+   health checks, and `ntp::run_ntp`.
+5. **Signal loop**: SIGHUP → `AppState::reload_from_config` (full rebuild);
+   SIGINT/SIGTERM → clean shutdown; an internal restart channel drives API-
+   triggered reloads.
+
 ## Connection Flow
 
 ```
@@ -82,53 +114,35 @@ clients → inbound listener → preHandleMetadata + sniffer → rule engine
 ```
 
 - `preHandleMetadata` clears `dst_ip` for FakeIP so domain rules match first.
+- **Resolve-on-demand** (mihomo `tunnel.go match()`): when rule evaluation
+  reaches a destination-IP rule (`GEOIP` / `IP-CIDR` / `IP-CIDR6` / `IP-SUFFIX`
+  / `IP-ASN` without `no-resolve`) and `dst_ip` was blanked for FakeIP, the
+  connection layer resolves the host to a **real** IP and re-matches. Without
+  this, `GEOIP,CN,DIRECT` cannot match domain traffic under fake-ip and
+  domestic connections leak through the proxy catch-all. See
+  [ARCHITECTURE/rules.md](ARCHITECTURE/rules.md) and
+  [ARCHITECTURE/conn.md](ARCHITECTURE/conn.md).
 - Rule engine evaluates sequentially; first match wins.
 - Bidirectional relay wraps both directions in `CountingStream` for byte counting.
 
-### Retry (matches `tunnel.go` + `slowdown.go`)
+Retry, keepalive, and relay buffer details live in
+[ARCHITECTURE/conn.md](ARCHITECTURE/conn.md). The DNS resolve/FakeIP pipeline is
+documented in [ARCHITECTURE/dns.md](ARCHITECTURE/dns.md).
 
-5-second overall ctx timeout per dial cycle, up to 10 attempts, exponential
-backoff with jitter (`base * 2^attempt + rand(0..base)`). Stops on IO error,
-auth failure, or connection refused.
-
-### TCP keepalive
-
-All outbound conns set keepalive matching `keepalive.SetNetDialer()` —
-`keep_alive_idle` and `keep_alive_interval` from config (default 30 s),
-applied via `socket2` before `connect()`.
-
-### Performance
+## Performance Notes
 
 - **jemalloc** (`tikv-jemallocator`) — musl's allocator fragments under
   high-churn crypto; jemalloc matches Go's behavior.
 - **Relay buffer pool** — mirrors mihomo's `sing/bufio` sync.Pool: 16 KB
   buffers borrowed during active I/O, returned when idle.
-- **SsStream lazy buffers** — AEAD encrypt/decrypt buffers start empty and
-  grow on first use, then `.clear()`-reuse. Idle SS connections cost zero.
+- **SsStream lazy buffers** — AEAD encrypt/decrypt buffers start empty and grow
+  on first use, then `.clear()`-reuse. Idle SS connections cost zero.
 - **Conditional flush** — relay only flushes when `read() < buf_size`. Bulk
   transfers skip flush; interactive data gets flushed.
-- **DNS map eviction** — `ip_to_host` DashMap evicts expired entries when
-  size > 4096.
+- **DNS map eviction** — `ip_to_host` DashMap evicts expired entries when size
+  > 4096.
 - **One info log per connection** after successful dial (matches
   `tunnel.go:617`); intermediate logs are debug.
-
-## DNS
-
-```
-resolve_proxy_server                     resolve (normal)
-├─ DashMap cache (120 s pos / 10 s neg)  ├─ FakeIP pool (if fakeip mode)
-├─ Per-domain singleflight               ├─ DNS cache
-└─ proxy-server-nameserver               └─ nameservers
-   (separate, never FakeIP)                 ├─ nameserver-policy
-                                            ├─ fallback (foreign IP path)
-                                            └─ GeoIP anti-poison filter
-```
-
-- `resolve_proxy_server` uses separate nameservers (never FakeIP) to avoid
-  circular resolution.
-- Singleflight dedup prevents DNS storms when many connections hit the same
-  proxy host.
-- No SO_MARK on DNS sockets — bypass relies on GID (see OpenClash section).
 
 ## OpenClash Integration
 
@@ -150,8 +164,8 @@ skgid == 65534 counter return
 Implications:
 - Set NO socket marks unless `routing-mark` is in config. mihomo defaults to
   `DefaultRoutingMark = 0` and OpenClash relies entirely on GID, not marks.
-- `PROXY_FWMARK="0x162"` in OpenClash scripts is for TPROXY/ip-rule, **not**
-  for our sockets.
+- `PROXY_FWMARK="0x162"` in OpenClash scripts is for TPROXY/ip-rule, **not** for
+  our sockets.
 
 What miemietron must do:
 1. Log `uid`, `gid`, `egid` at startup so operators can verify procd set GID 65534.
@@ -170,26 +184,6 @@ What miemietron must do:
 | 7892 | TCP | redir-port (SO_ORIGINAL_DST) | `proxy_port` |
 | 7895 | TCP+UDP | tproxy-port (IP_TRANSPARENT) | `tproxy_port` |
 | 9090 | HTTP | external-controller | `cn_dashboard_port` |
-
-## Rule provider API (partial-but-honest)
-
-mihomo's rule providers expose a `PUT /providers/rules/:name` endpoint that
-re-fetches the remote URL into a live `RuleProvider` object. miemietron
-consumes providers at engine-construction time and merges their rules into
-the engine's shared indexes — the live `RuleProvider` objects are dropped
-afterward. Two consequences:
-
-- `GET /providers/rules` and `GET /providers/rules/:name` return real
-  `ruleCount` and `updatedAt` (load-time snapshot from
-  `RuleEngine::provider_info`). They do not change between config reloads.
-- `PUT /providers/rules/:name` returns **503 Service Unavailable** with a
-  message saying "edit config and reload to re-ingest providers". Returning
-  204 would lie; returning success without effect is the silent-DIRECT
-  equivalent for provider state.
-
-To genuinely re-fetch a provider, edit the config file and SIGHUP the
-process — `RuleEngine::with_home_dir` re-runs and the new provider state is
-picked up.
 
 ## Target Platforms
 
@@ -224,8 +218,8 @@ Release profile: `opt-level = "z"`, LTO, single codegen unit, stripped,
 
 Every change: **read mihomo Go → plan the Rust → implement → `cargo check`
 clean + `cargo test` green → re-read mihomo to catch drift.** Never guess
-upstream behavior; trace error paths, fallback behavior, and log levels in
-the source.
+upstream behavior; trace error paths, fallback behavior, and log levels in the
+source.
 
 For changes that touch connection handling, DNS, rules, TUN, or sniffer, also
 run a real-config integration test:
@@ -234,7 +228,99 @@ run a real-config integration test:
 timeout 30 target/debug/miemietron -d <openclash-dir> -f <config.yaml>
 ```
 
-Then `curl` a domestic and a foreign URL through `127.0.0.1:7890` and verify
-via the REST API that proxy groups + rule chains match expectations.
-Authentication credentials and bearer tokens vary per environment — use the
-`authentication` / `secret` values from the YAML being tested.
+Then `curl` a domestic and a foreign URL through `127.0.0.1:7890` and verify via
+the REST API that proxy groups + rule chains match expectations. Authentication
+credentials and bearer tokens vary per environment — use the `authentication` /
+`secret` values from the YAML being tested. A bundled real config lives at
+`openwrt/openclash/nx.yaml` (fake-ip, `GEOIP,CN,DIRECT` domestic bypass).
+
+## Coding Discipline
+
+Behavioral guidelines to reduce common LLM coding mistakes. Merge with
+project-specific instructions as needed.
+
+**Tradeoff:** These guidelines bias toward caution over speed. For
+trivial tasks, use judgment.
+
+### 1. Think Before Coding
+
+**Don't assume. Don't hide confusion. Surface tradeoffs.**
+
+Before implementing:
+- State your assumptions explicitly. If uncertain, ask.
+- If multiple interpretations exist, present them - don't pick silently.
+- If a simpler approach exists, say so. Push back when warranted.
+- If something is unclear, stop. Name what's confusing. Ask.
+
+### 2. Simplicity First
+
+**Minimum code that solves the problem. Nothing speculative.**
+
+- No features beyond what was asked.
+- No abstractions for single-use code.
+- No "flexibility" or "configurability" that wasn't requested.
+- No error handling for impossible scenarios.
+- If you write 200 lines and it could be 50, rewrite it.
+
+Ask yourself: "Would a senior engineer say this is overcomplicated?" If
+yes, simplify.
+
+### 3. Surgical Changes
+
+**Touch only what you must. Clean up only your own mess.**
+
+When editing existing code:
+- Don't "improve" adjacent code, comments, or formatting.
+- Don't refactor things that aren't broken.
+- Match existing style, even if you'd do it differently.
+- If you notice unrelated dead code, mention it - don't delete it.
+
+When your changes create orphans:
+- Remove imports/variables/functions that YOUR changes made unused.
+- Don't remove pre-existing dead code unless asked.
+
+The test: Every changed line should trace directly to the user's request.
+
+### 4. Goal-Driven Execution
+
+**Define success criteria. Loop until verified.**
+
+Transform tasks into verifiable goals:
+- "Add validation" → "Write tests for invalid inputs, then make them pass"
+- "Fix the bug" → "Write a test that reproduces it, then make it pass"
+- "Refactor X" → "Ensure tests pass before and after"
+
+For multi-step tasks, state a brief plan:
+
+```
+1. [Step] → verify: [check]
+2. [Step] → verify: [check]
+3. [Step] → verify: [check]
+```
+
+Strong success criteria let you loop independently. Weak criteria ("make
+it work") require constant clarification.
+
+---
+
+**These guidelines are working if:** fewer unnecessary changes in diffs,
+fewer rewrites due to overcomplication, and clarifying questions come
+before implementation rather than after mistakes.
+
+## Index
+
+| Module | Doc | Owns |
+|--------|-----|------|
+| Config | [ARCHITECTURE/config.md](ARCHITECTURE/config.md) | YAML parsing, port fields, `listeners:` rejection |
+| DNS | [ARCHITECTURE/dns.md](ARCHITECTURE/dns.md) | Resolver, FakeIP, `resolve_real_ip`, upstream pipeline |
+| Connection | [ARCHITECTURE/conn.md](ARCHITECTURE/conn.md) | Tunnel, sniff, resolve-on-demand, retry, relay |
+| Inbound | [ARCHITECTURE/inbound.md](ARCHITECTURE/inbound.md) | HTTP / SOCKS5 / mixed / redir / tproxy listeners |
+| Outbounds | [ARCHITECTURE/outbounds.md](ARCHITECTURE/outbounds.md) | Protocol adapters, `ProxyManager`, anytls |
+| Proxy Groups | [ARCHITECTURE/proxy_group.md](ARCHITECTURE/proxy_group.md) | Selector / url-test / fallback / load-balance, health |
+| Rules | [ARCHITECTURE/rules.md](ARCHITECTURE/rules.md) | Rule engine, matchers, providers, resolve-on-demand |
+| Sniffer | [ARCHITECTURE/sniffer.md](ARCHITECTURE/sniffer.md) | TLS SNI + HTTP Host extraction |
+| Transport | [ARCHITECTURE/transport.md](ARCHITECTURE/transport.md) | TCP+keepalive, TLS, WS, gRPC, H2, Reality, fingerprint |
+| TUN | [ARCHITECTURE/tun.md](ARCHITECTURE/tun.md) | TUN device, routes, iptables/nftables |
+| Stack | [ARCHITECTURE/stack.md](ARCHITECTURE/stack.md) | System (SO_ORIGINAL_DST) + gvisor (smoltcp) stacks |
+| API | [ARCHITECTURE/api.md](ARCHITECTURE/api.md) | axum REST controller, auth, routes |
+| Common | [ARCHITECTURE/common.md](ARCHITECTURE/common.md) | Address, delay history, singledo |
