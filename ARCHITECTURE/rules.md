@@ -8,7 +8,7 @@ sequential rule chain (first match wins) and returns the routing `Action`
 matchers and rule providers (RULE-SET). Part of OpenClash runtime parity.
 
 ## Status
-`done`. Full mihomo rule-type parity for the in-scope set; 77 rule tests pass.
+`done`. Full mihomo rule-type parity for the in-scope set; 78 rule tests pass.
 The resolve-on-demand path (`needs_ip_resolution` / `rule_resolves_dst_ip`) was
 added to fix the fake-ip domestic-routing leak and is covered by five new tests.
 
@@ -39,7 +39,7 @@ added to fix the fake-ip domestic-routing leak and is covered by five new tests.
 - The resolved `Action::Proxy(name)` is dispatched to the [outbounds.md](outbounds.md) / [proxy_group.md](proxy_group.md) layer by the connection manager.
 
 ## How to Test
-- `cargo test rules` — pass = output contains `test result: ok` (77 tests).
+- `cargo test rules` — pass = output contains `test result: ok` (78 tests).
 - Resolve-on-demand specifically: `cargo test needs_ip_resolution` and `cargo test resolve_on_demand` cover the reached-IP-rule, earlier-domain-match, `no-resolve`, no-IP-rule, and proxy→direct-after-resolve cases.
 - Integration: `timeout 30 target/debug/miemietron -d <openclash-dir> -f <config.yaml>`, then `curl` a domestic (e.g. `GEOIP,CN,DIRECT`) and a foreign URL through `127.0.0.1:7890` and confirm via `GET /connections` that the rule + chain match expectations.
 

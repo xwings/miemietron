@@ -6,7 +6,7 @@ use std::path::Path;
 pub enum DomainType {
     /// Keyword match -- domain contains this substring.
     Plain = 0,
-    /// Regex match -- skipped (too expensive at runtime).
+    /// Regex match -- domain matches this RE2 pattern.
     Regex = 1,
     /// Suffix match -- domain ends with ".value" or equals "value".
     Domain = 2,
@@ -14,11 +14,26 @@ pub enum DomainType {
     Full = 3,
 }
 
+/// A single compiled GeoSite matcher. Built once at load from the parsed
+/// `(DomainType, value)` tuples so matching is allocation-free per connection.
+/// mihomo compat: `component/geodata/router/condition.go` matcherTypeMap ---
+/// Plain=Substr, Regex=Regex, Domain=Domain(+.value), Full=Full.
+enum SiteMatcher {
+    /// Substring keyword.
+    Plain(String),
+    /// Suffix: equals `value` or ends with `.value`.
+    Suffix(String),
+    /// Exact match.
+    Full(String),
+    /// RE2 regex, compiled verbatim (case-sensitive; input is pre-lowercased).
+    Regex(regex::Regex),
+}
+
 /// GeoSite matcher: loads mihomo's GeoSite.dat (protobuf-encoded) and matches
 /// domains against country-code groups.
 pub struct GeoSiteMatcher {
-    /// country_code (upper-cased) -> list of (type, domain_value)
-    sites: HashMap<String, Vec<(DomainType, String)>>,
+    /// country_code (upper-cased) -> list of compiled matchers
+    sites: HashMap<String, Vec<SiteMatcher>>,
 }
 
 impl GeoSiteMatcher {
@@ -37,7 +52,7 @@ impl GeoSiteMatcher {
 
         match std::fs::read(&dat_path) {
             Ok(data) => {
-                let sites = parse_geosite_dat(&data);
+                let sites = compile_sites(parse_geosite_dat(&data));
                 tracing::info!(
                     "GeoSite.dat loaded: {} site groups from {}",
                     sites.len(),
@@ -67,28 +82,31 @@ impl GeoSiteMatcher {
         };
 
         let domain_lower = domain.to_lowercase();
-        for (dtype, value) in entries {
-            match dtype {
-                DomainType::Plain => {
+        for matcher in entries {
+            match matcher {
+                SiteMatcher::Plain(value) => {
                     // Keyword: domain contains the value as a substring.
                     if domain_lower.contains(value) {
                         return true;
                     }
                 }
-                DomainType::Domain => {
+                SiteMatcher::Suffix(value) => {
                     // Suffix: domain ends with ".value" or equals "value".
                     if domain_lower == *value || domain_lower.ends_with(&format!(".{value}")) {
                         return true;
                     }
                 }
-                DomainType::Full => {
+                SiteMatcher::Full(value) => {
                     // Exact match.
                     if domain_lower == *value {
                         return true;
                     }
                 }
-                DomainType::Regex => {
-                    // Skip regex entries -- too expensive without the regex crate.
+                SiteMatcher::Regex(re) => {
+                    // RE2 unanchored match against the lowercased domain.
+                    if re.is_match(&domain_lower) {
+                        return true;
+                    }
                 }
             }
         }
@@ -262,11 +280,7 @@ fn parse_geosite_msg(buf: &[u8]) -> Option<(String, Vec<(DomainType, String)>)> 
                     return None;
                 }
                 if let Some(entry) = parse_domain_msg(&buf[pos..end]) {
-                    // Skip Regex entries to save memory -- they require the
-                    // regex crate which we deliberately avoid.
-                    if entry.0 != DomainType::Regex {
-                        domains.push(entry);
-                    }
+                    domains.push(entry);
                 }
                 pos = end;
             }
@@ -322,9 +336,53 @@ fn parse_geosite_dat(data: &[u8]) -> HashMap<String, Vec<(DomainType, String)>> 
     result
 }
 
+/// Compile parsed `(DomainType, value)` tuples into ready-to-match
+/// [`SiteMatcher`]s, one map preserving per-category order.
+///
+/// mihomo compat: a regex that fails to compile aborts config load upstream
+/// (`NewSuccinctMatcherGroup` returns the error). We instead `warn!` and skip
+/// just that one entry so a single malformed pattern in a huge DB can't take
+/// down the whole router; every other entry still matches the DB verbatim.
+fn compile_sites(
+    parsed: HashMap<String, Vec<(DomainType, String)>>,
+) -> HashMap<String, Vec<SiteMatcher>> {
+    let mut out: HashMap<String, Vec<SiteMatcher>> = HashMap::with_capacity(parsed.len());
+    for (code, entries) in parsed {
+        let mut matchers = Vec::with_capacity(entries.len());
+        for (dtype, value) in entries {
+            match dtype {
+                DomainType::Plain => matchers.push(SiteMatcher::Plain(value)),
+                DomainType::Domain => matchers.push(SiteMatcher::Suffix(value)),
+                DomainType::Full => matchers.push(SiteMatcher::Full(value)),
+                DomainType::Regex => match regex::Regex::new(&value) {
+                    Ok(re) => matchers.push(SiteMatcher::Regex(re)),
+                    Err(e) => {
+                        tracing::warn!(
+                            "GeoSite regex in category {} failed to compile ({}): {}",
+                            code,
+                            value,
+                            e
+                        );
+                    }
+                },
+            }
+        }
+        out.insert(code, matchers);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Build a matcher directly from parsed tuples (mirrors `new`'s compile
+    /// step) so tests don't need a GeoSite.dat file on disk.
+    fn matcher_from(sites: HashMap<String, Vec<(DomainType, String)>>) -> GeoSiteMatcher {
+        GeoSiteMatcher {
+            sites: compile_sites(sites),
+        }
+    }
 
     #[test]
     fn decode_varint_single_byte() {
@@ -453,22 +511,22 @@ mod tests {
     }
 
     #[test]
-    fn regex_entries_are_skipped() {
+    fn regex_entries_are_kept() {
+        // mihomo treats regex domains as authoritative; they must survive parse.
         let gs = encode_geosite("TEST", &[(1, "^regex.*pattern$"), (2, "example.com")]);
         let dat = encode_geosite_list(&[gs]);
         let map = parse_geosite_dat(&dat);
         let entries = map.get("TEST").unwrap();
-        // Regex entry (type=1) should be filtered out
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0], (DomainType::Domain, "example.com".to_string()));
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0], (DomainType::Regex, "^regex.*pattern$".to_string()));
+        assert_eq!(entries[1], (DomainType::Domain, "example.com".to_string()));
     }
 
     #[test]
     fn lookup_keyword_match() {
         let gs = encode_geosite("GOOGLE", &[(0, "google")]);
         let dat = encode_geosite_list(&[gs]);
-        let sites = parse_geosite_dat(&dat);
-        let matcher = GeoSiteMatcher { sites };
+        let matcher = matcher_from(parse_geosite_dat(&dat));
 
         assert!(matcher.lookup("www.google.com", "google"));
         assert!(matcher.lookup("mail.google.co.jp", "google"));
@@ -479,8 +537,7 @@ mod tests {
     fn lookup_suffix_match() {
         let gs = encode_geosite("CN", &[(2, "baidu.com")]);
         let dat = encode_geosite_list(&[gs]);
-        let sites = parse_geosite_dat(&dat);
-        let matcher = GeoSiteMatcher { sites };
+        let matcher = matcher_from(parse_geosite_dat(&dat));
 
         assert!(matcher.lookup("baidu.com", "cn"));
         assert!(matcher.lookup("www.baidu.com", "cn"));
@@ -492,8 +549,7 @@ mod tests {
     fn lookup_full_match() {
         let gs = encode_geosite("TEST", &[(3, "exact.example.com")]);
         let dat = encode_geosite_list(&[gs]);
-        let sites = parse_geosite_dat(&dat);
-        let matcher = GeoSiteMatcher { sites };
+        let matcher = matcher_from(parse_geosite_dat(&dat));
 
         assert!(matcher.lookup("exact.example.com", "test"));
         assert!(!matcher.lookup("sub.exact.example.com", "test"));
@@ -506,6 +562,34 @@ mod tests {
             sites: HashMap::new(),
         };
         assert!(!matcher.lookup("anything.com", "nonexistent"));
+    }
+
+    #[test]
+    fn lookup_regex_match() {
+        // A category whose only way to match some hosts is a regex entry.
+        let gs = encode_geosite("ADS", &[(2, "example.com"), (1, r".*\.ads\..*")]);
+        let dat = encode_geosite_list(&[gs]);
+        let matcher = matcher_from(parse_geosite_dat(&dat));
+
+        // Matches via the regex entry only.
+        assert!(matcher.lookup("tracker.ads.net", "ads"));
+        // Matches via the suffix entry.
+        assert!(matcher.lookup("www.example.com", "ads"));
+        // Matches neither.
+        assert!(!matcher.lookup("clean.example.org", "ads"));
+    }
+
+    #[test]
+    fn lookup_regex_is_case_insensitive_on_input() {
+        // mihomo lowercases the domain before matching; the regex itself is
+        // compiled verbatim, so a lowercase pattern still matches mixed-case
+        // input via the pre-lowering in `lookup`.
+        let gs = encode_geosite("RE", &[(1, r"^cdn[0-9]+\.example\.com$")]);
+        let dat = encode_geosite_list(&[gs]);
+        let matcher = matcher_from(parse_geosite_dat(&dat));
+
+        assert!(matcher.lookup("CDN42.Example.Com", "re"));
+        assert!(!matcher.lookup("cdn.example.com", "re"));
     }
 
     #[test]
