@@ -19,9 +19,9 @@ jobs:
       matrix:
         include:
           - target: x86_64-unknown-linux-musl
-            name: linux-amd64
+            name: linux-x86_64
           - target: aarch64-unknown-linux-musl
-            name: linux-arm64
+            name: linux-aarch64
     steps:
       - uses: actions/checkout@v4
 
