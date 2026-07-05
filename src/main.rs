@@ -139,6 +139,14 @@ struct Cli {
     #[arg(short = 't', default_value_t = false)]
     test_config: bool,
 
+    /// Age secret key for encrypted-config decryption.
+    /// mihomo compat: `main.go::flag.StringVar(&C.EncryptedConfigSecret, ...)`.
+    /// OpenClash passes this on every config test (`-age-secret-key "$SECRET_KEY"`,
+    /// empty when age encryption is off). Accepted as a no-op; encrypted configs
+    /// are not supported (an empty value — the common case — is unaffected).
+    #[arg(long = "age-secret-key", env = "CLASH_AGE_SECRET_KEY")]
+    age_secret_key: Option<String>,
+
     /// Print version and exit
     #[arg(short = 'v', long = "version-flag")]
     print_version: bool,
@@ -305,6 +313,7 @@ impl AppState {
                     rt.log_level, new_config.log_level
                 );
                 rt.log_level = new_config.log_level.clone();
+                api::reload_log_level(&new_config.log_level);
             }
         }
 
@@ -368,8 +377,41 @@ fn main() -> Result<()> {
         .block_on(async_main())
 }
 
+/// mihomo/Go `flag` uses single-dash long flags (`-ext-ctl`, `-age-secret-key`,
+/// `-secret`, …), while clap expects double-dash. OpenClash and other mihomo
+/// wrappers invoke the core with the Go-style forms. Normalize a raw argv so
+/// these are accepted verbatim, without disturbing the short flags (`-d`, `-f`,
+/// `-t`, `-v`, `-m`) or values.
+fn normalize_go_flags<I: IntoIterator<Item = String>>(args: I) -> Vec<String> {
+    // Long flags that mihomo exposes with a single dash.
+    const GO_LONG: &[&str] = &[
+        "config",
+        "ext-ctl",
+        "ext-ctl-unix",
+        "ext-ctl-pipe",
+        "ext-ui",
+        "secret",
+        "age-secret-key",
+    ];
+    args.into_iter()
+        .map(|arg| {
+            // Only rewrite `-name` / `-name=value` where `name` is a known Go
+            // long flag; leave `--foo`, short flags, and bare values alone.
+            if let Some(rest) = arg.strip_prefix('-') {
+                if !rest.starts_with('-') {
+                    let name = rest.split('=').next().unwrap_or(rest);
+                    if GO_LONG.contains(&name) {
+                        return format!("-{arg}"); // "-ext-ctl" -> "--ext-ctl"
+                    }
+                }
+            }
+            arg
+        })
+        .collect()
+}
+
 async fn async_main() -> Result<()> {
-    let cli = Cli::parse();
+    let cli = Cli::parse_from(normalize_go_flags(std::env::args()));
 
     // -v: print version in mihomo-compatible format (before logging init)
     if cli.print_version {
@@ -425,6 +467,24 @@ async fn async_main() -> Result<()> {
         let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
             .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(log_level));
 
+        // Wrap the filter in a reload layer so PATCH /configs {"log-level"} can
+        // change the effective verbosity at runtime (OpenClash's debug-log
+        // feature flips to `debug`, collects, then restores).
+        let (reloadable_filter, reload_handle) =
+            tracing_subscriber::reload::Layer::new(env_filter);
+        api::set_log_reload_fn(Box::new(move |level: &str| {
+            let target = match level {
+                "silent" => "off",
+                "error" => "error",
+                "warning" | "warn" => "warn",
+                "debug" => "debug",
+                "trace" => "trace",
+                _ => "info",
+            };
+            let _ = reload_handle
+                .modify(|f| *f = tracing_subscriber::EnvFilter::new(target));
+        }));
+
         // mihomo compat: output logs in logrus format so OpenClash can parse them.
         // Format: time="2026-04-06T14:29:34+08:00" level=info msg="..."
         let fmt_layer = tracing_subscriber::fmt::layer()
@@ -434,7 +494,7 @@ async fn async_main() -> Result<()> {
         let broadcast_layer = api::logs::BroadcastLayer::new(api::logs::global_log_broadcast());
 
         tracing_subscriber::registry()
-            .with(env_filter)
+            .with(reloadable_filter)
             .with(fmt_layer)
             .with(broadcast_layer)
             .init();

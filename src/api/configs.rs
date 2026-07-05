@@ -1,6 +1,7 @@
 use axum::{
     extract::{Query, State},
     http::StatusCode,
+    response::{IntoResponse, Response},
     Json,
 };
 use serde::Deserialize;
@@ -77,7 +78,7 @@ pub async fn put_configs(
     State(state): State<ApiState>,
     Query(query): Query<PutConfigsQuery>,
     Json(body): Json<Value>,
-) -> StatusCode {
+) -> Response {
     let force = query.force.unwrap_or(false);
 
     let result = if let Some(path_str) = body.get("path").and_then(|v| v.as_str()) {
@@ -85,7 +86,12 @@ pub async fn put_configs(
         let path = std::path::PathBuf::from(path_str);
         if !path.exists() {
             error!("PUT /configs: path does not exist: {}", path.display());
-            return StatusCode::BAD_REQUEST;
+            // mihomo returns a JSON error body; OpenClash treats any non-empty
+            // response as failure, so an empty body would mask this.
+            return config_error(
+                StatusCode::BAD_REQUEST,
+                &format!("config path not found: {}", path.display()),
+            );
         }
         info!(
             "PUT /configs: reloading from path: {} (force={})",
@@ -117,53 +123,63 @@ pub async fn put_configs(
     match result {
         Ok(()) => {
             info!("PUT /configs: reload successful");
-            StatusCode::NO_CONTENT
+            // mihomo compat: 204 with an EMPTY body. OpenClash's live-config
+            // reload (`PUT /configs?force=true`) treats any non-empty response
+            // as "Switch Failed".
+            StatusCode::NO_CONTENT.into_response()
         }
         Err(e) => {
             error!("PUT /configs: reload failed: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
+            config_error(StatusCode::BAD_REQUEST, &e.to_string())
         }
     }
 }
 
-pub async fn patch_configs(State(state): State<ApiState>, Json(body): Json<Value>) -> StatusCode {
+/// Build a mihomo-style JSON error response (`{"message": "..."}`) so callers
+/// like OpenClash that inspect the body see a real failure instead of an empty
+/// success.
+fn config_error(status: StatusCode, message: &str) -> Response {
+    (status, Json(json!({ "message": message }))).into_response()
+}
+
+pub async fn patch_configs(State(state): State<ApiState>, Json(body): Json<Value>) -> Response {
     let mut changed = false;
 
     if let Some(mode) = body.get("mode").and_then(|v| v.as_str()) {
-        let valid = matches!(mode, "rule" | "global" | "direct");
-        if valid {
-            let mut rt = state.app.runtime_config.write();
-            if rt.mode != mode {
-                info!("Tunnel mode changed: {} -> {}", rt.mode, mode);
-                rt.mode = mode.to_string();
-                changed = true;
-            }
-        } else {
-            tracing::warn!("Invalid mode value: {}", mode);
+        // mihomo compat: reject invalid modes (tunnel/mode.go errors); OpenClash
+        // inspects the response body, so a silent 204 would hide the error.
+        if !matches!(mode, "rule" | "global" | "direct") {
+            return config_error(
+                StatusCode::BAD_REQUEST,
+                &format!("invalid mode: {mode}"),
+            );
+        }
+        let mut rt = state.app.runtime_config.write();
+        if rt.mode != mode {
+            info!("Tunnel mode changed: {} -> {}", rt.mode, mode);
+            rt.mode = mode.to_string();
+            changed = true;
         }
     }
 
     if let Some(level) = body.get("log-level").and_then(|v| v.as_str()) {
-        let valid = matches!(
+        if !matches!(
             level,
             "trace" | "debug" | "info" | "warning" | "warn" | "error" | "silent"
-        );
-        if valid {
-            let mut rt = state.app.runtime_config.write();
-            if rt.log_level != level {
-                info!("Log level changed: {} -> {}", rt.log_level, level);
-                rt.log_level = level.to_string();
-                changed = true;
-                // Attempt to update the tracing filter at runtime.
-                // This requires a reload handle which we don't have yet,
-                // so we log the change for now.
-                info!(
-                    "Log level updated to '{}' (runtime filter reload pending)",
-                    level
-                );
-            }
-        } else {
-            tracing::warn!("Invalid log-level value: {}", level);
+        ) {
+            return config_error(
+                StatusCode::BAD_REQUEST,
+                &format!("invalid log-level: {level}"),
+            );
+        }
+        let mut rt = state.app.runtime_config.write();
+        if rt.log_level != level {
+            info!("Log level changed: {} -> {}", rt.log_level, level);
+            rt.log_level = level.to_string();
+            drop(rt);
+            // Apply to the live tracing filter so output actually changes.
+            super::reload_log_level(level);
+            changed = true;
         }
     }
 
@@ -211,7 +227,7 @@ pub async fn patch_configs(State(state): State<ApiState>, Json(body): Json<Value
         info!("Config patched successfully");
     }
 
-    StatusCode::NO_CONTENT
+    StatusCode::NO_CONTENT.into_response()
 }
 
 pub async fn post_configs_geo(State(_state): State<ApiState>) -> StatusCode {

@@ -9,18 +9,28 @@ use super::ApiState;
 const DEFAULT_UI_URL: &str =
     "https://github.com/MetaCubeX/metacubexd/archive/refs/heads/gh-pages.zip";
 
-/// Resolve the UI directory path from config.
+/// Resolve the UI serving root from config (the directory mounted at `/ui`).
 pub fn resolve_ui_dir(config: &crate::config::MiemieConfig) -> Option<PathBuf> {
-    if let Some(ref ui_dir) = config.external_ui {
-        let path = PathBuf::from(ui_dir);
-        if path.is_absolute() {
-            Some(path)
-        } else {
-            // Relative to working directory
-            Some(std::env::current_dir().unwrap_or_default().join(path))
-        }
+    let ui_dir = config.external_ui.as_ref()?;
+    let path = PathBuf::from(ui_dir);
+    if path.is_absolute() {
+        Some(path)
     } else {
-        None
+        // Relative to working directory
+        Some(std::env::current_dir().unwrap_or_default().join(path))
+    }
+}
+
+/// Resolve the UI download/extract target. mihomo compat
+/// (`component/updater/update_ui.go`): when `external-ui-name` is set, the zip
+/// is extracted into `<external-ui>/<name>/` so `/ui/<name>/` resolves. The
+/// serving root (`resolve_ui_dir`) stays the parent, matching OpenClash's
+/// multi-dashboard layout under `/usr/share/openclash/ui`.
+pub fn resolve_ui_download_dir(config: &crate::config::MiemieConfig) -> Option<PathBuf> {
+    let root = resolve_ui_dir(config)?;
+    match config.external_ui_name.as_deref() {
+        Some(name) if !name.is_empty() => Some(root.join(name)),
+        _ => Some(root),
     }
 }
 
@@ -130,7 +140,7 @@ fn detect_common_prefix(archive: &mut zip::ZipArchive<std::io::Cursor<&[u8]>>) -
 /// POST /upgrade/ui — download and extract the latest UI.
 pub async fn post_upgrade_ui(State(state): State<ApiState>) -> (StatusCode, Json<Value>) {
     let config = state.app.config();
-    let ui_dir = match resolve_ui_dir(&config) {
+    let ui_dir = match resolve_ui_download_dir(&config) {
         Some(dir) => dir,
         None => {
             return (

@@ -9,10 +9,13 @@ use tokio::time::{interval, Duration};
 
 use super::ApiState;
 
-/// GET /traffic — returns current traffic snapshot or streams via WebSocket.
+/// GET /traffic — streams via WebSocket, or returns a one-second rate snapshot.
 ///
-/// - WebSocket: streams `{"up": delta, "down": delta}` every second
-/// - HTTP GET: returns total `{"up": total, "down": total}` snapshot
+/// mihomo compat (`hub/route/server.go` `traffic`): `up`/`down` are per-second
+/// **rates** (bytes/sec), not cumulative totals — OpenClash's toolbar renders
+/// them directly as "B/S". The non-WS branch samples a 1-second delta so a plain
+/// `curl -m 3 /traffic` (OpenClash) sees a real rate; totals go in
+/// `upTotal`/`downTotal`.
 pub async fn get_traffic(
     State(state): State<ApiState>,
     request: Request<axum::body::Body>,
@@ -31,9 +34,16 @@ pub async fn get_traffic(
             Err(e) => e.into_response(),
         }
     } else {
+        let prev_up = state.app.stats.upload_total();
+        let prev_down = state.app.stats.download_total();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let up = state.app.stats.upload_total();
+        let down = state.app.stats.download_total();
         Json(json!({
-            "up": state.app.stats.upload_total(),
-            "down": state.app.stats.download_total(),
+            "up": up.saturating_sub(prev_up),
+            "down": down.saturating_sub(prev_down),
+            "upTotal": up,
+            "downTotal": down,
         }))
         .into_response()
     }

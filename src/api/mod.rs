@@ -22,6 +22,24 @@ use tracing::{info, warn};
 use crate::conn::ConnectionManager;
 use crate::AppState;
 
+/// Runtime log-level reload hook. Set once at startup from `main` (which owns
+/// the tracing reload handle whose concrete type is unnameable here); called by
+/// `PATCH /configs {"log-level"}` so the change affects real output.
+type LogReloadFn = Box<dyn Fn(&str) + Send + Sync>;
+static LOG_RELOAD: std::sync::OnceLock<LogReloadFn> = std::sync::OnceLock::new();
+
+/// Register the log-level reload hook (idempotent; first caller wins).
+pub fn set_log_reload_fn(f: LogReloadFn) {
+    let _ = LOG_RELOAD.set(f);
+}
+
+/// Apply a new log level to the live tracing filter, if a hook is registered.
+pub fn reload_log_level(level: &str) {
+    if let Some(f) = LOG_RELOAD.get() {
+        f(level);
+    }
+}
+
 /// Mutable runtime configuration that can be changed via PATCH /configs.
 pub struct RuntimeConfig {
     pub mode: String,
@@ -54,7 +72,7 @@ pub async fn start_server(addr: &str, secret: Option<String>, state: ApiState) -
 
     // Auto-download UI if external-ui is configured but directory is empty/missing
     let config = state.app.config();
-    if let Some(ui_dir) = ui::resolve_ui_dir(&config) {
+    if let Some(ui_dir) = ui::resolve_ui_download_dir(&config) {
         let needs_download = !ui_dir.exists()
             || ui_dir
                 .read_dir()
@@ -63,7 +81,7 @@ pub async fn start_server(addr: &str, secret: Option<String>, state: ApiState) -
 
         if needs_download {
             let url = config.external_ui_url.as_deref();
-            info!("UI directory empty, downloading metacubexd...");
+            info!("UI directory empty, downloading dashboard...");
             match ui::download_ui(&ui_dir, url).await {
                 Ok(()) => info!("UI downloaded to {}", ui_dir.display()),
                 Err(e) => warn!(
