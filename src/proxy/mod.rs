@@ -101,6 +101,8 @@ pub struct ProxyManager {
     live_groups: HashMap<String, Arc<dyn ProxyGroup>>,
     provider_configs: HashMap<String, ProxyProviderConfig>,
     subscription_info: HashMap<String, SubscriptionInfo>,
+    /// Member proxy names for each proxy provider (for `/providers/proxies`).
+    provider_proxy_names: HashMap<String, Vec<String>>,
     /// Centralized per-proxy state store shared with all groups.
     state_store: Arc<crate::proxy_group::proxy_state::ProxyStateStore>,
 }
@@ -406,21 +408,30 @@ impl ProxyManager {
                 tracing::warn!("Proxy group '{}' has no proxies after filtering", gc.name);
             }
 
+            // mihomo compat: default test URL is https (constant/adapters.go:61);
+            // `lazy` defaults to true (parser.go:51-53); `tolerance` defaults to
+            // 0 (urltest.go:19-23); `interval: 0` is coerced to 300s so the
+            // health-check timer never gets a zero period (parser.go:168-170) —
+            // a zero-period tokio interval would panic and abort the process.
+            let default_test_url = || "https://www.gstatic.com/generate_204".to_string();
+            let hc_interval = match gc.interval {
+                Some(0) | None => 300,
+                Some(n) => n,
+            };
+            let hc_lazy = gc.lazy.unwrap_or(true);
+
             let group: Arc<dyn ProxyGroup> = match gc.group_type.as_str() {
                 "select" => Arc::new(SelectorGroup::new(gc.name.clone(), all_proxies)),
                 "url-test" => Arc::new(UrlTestGroup::new(
                     gc.name.clone(),
                     all_proxies,
-                    gc.tolerance.unwrap_or(150),
+                    gc.tolerance.unwrap_or(0),
                     crate::proxy_group::HealthCheckOpts {
-                        url: gc
-                            .url
-                            .clone()
-                            .unwrap_or_else(|| "http://www.gstatic.com/generate_204".to_string()),
-                        interval_secs: gc.interval.unwrap_or(300),
+                        url: gc.url.clone().unwrap_or_else(default_test_url),
+                        interval_secs: hc_interval,
                         max_failed_times: gc.max_failed_times,
                         test_timeout: gc.timeout,
-                        lazy: gc.lazy.unwrap_or(false),
+                        lazy: hc_lazy,
                     },
                     state_store.clone(),
                 )),
@@ -428,14 +439,11 @@ impl ProxyManager {
                     gc.name.clone(),
                     all_proxies,
                     crate::proxy_group::HealthCheckOpts {
-                        url: gc
-                            .url
-                            .clone()
-                            .unwrap_or_else(|| "http://www.gstatic.com/generate_204".to_string()),
-                        interval_secs: gc.interval.unwrap_or(300),
+                        url: gc.url.clone().unwrap_or_else(default_test_url),
+                        interval_secs: hc_interval,
                         max_failed_times: gc.max_failed_times,
                         test_timeout: gc.timeout,
-                        lazy: gc.lazy.unwrap_or(false),
+                        lazy: hc_lazy,
                     },
                     state_store.clone(),
                 )),
@@ -469,12 +477,38 @@ impl ProxyManager {
             live_groups.insert(gc.name.clone(), group);
         }
 
+        // mihomo compat: register a real GLOBAL selector (config.go:963-972).
+        // Its member list is every configured group followed by every individual
+        // proxy (including built-ins), and it is a genuine, selectable Selector so
+        // `PUT/GET /proxies/GLOBAL` and `GET /group/GLOBAL` behave like any group.
+        // Only synthesized if the user didn't define their own group named GLOBAL.
+        if !live_groups.contains_key("GLOBAL") {
+            let mut global_members: Vec<String> =
+                group_configs.iter().map(|g| g.name.clone()).collect();
+            let mut seen: std::collections::HashSet<String> =
+                global_members.iter().cloned().collect();
+            for pc in proxy_configs {
+                if seen.insert(pc.name.clone()) {
+                    global_members.push(pc.name.clone());
+                }
+            }
+            for builtin in ["DIRECT", "REJECT", "REJECT-DROP"] {
+                if proxies.contains_key(builtin) && seen.insert(builtin.to_string()) {
+                    global_members.push(builtin.to_string());
+                }
+            }
+            let global: Arc<dyn ProxyGroup> =
+                Arc::new(SelectorGroup::new("GLOBAL".to_string(), global_members));
+            live_groups.insert("GLOBAL".to_string(), global);
+        }
+
         Ok(Self {
             proxies,
             group_configs: group_configs.to_vec(),
             live_groups,
             provider_configs: providers.clone(),
             subscription_info,
+            provider_proxy_names,
             state_store,
         })
     }
@@ -725,16 +759,6 @@ impl ProxyManager {
             return None;
         }
 
-        // mihomo compat: "GLOBAL" is a virtual selector that delegates to the
-        // first proxy group. Matches mihomo's proxies["GLOBAL"] behavior.
-        if target == "GLOBAL" {
-            if let Some(first_gc) = self.group_configs.first() {
-                return self.resolve_depth(&first_gc.name, depth - 1);
-            }
-            // No groups configured — fall through to DIRECT
-            return self.proxies.get("DIRECT").cloned();
-        }
-
         // Direct proxy match
         if let Some(proxy) = self.proxies.get(target) {
             return Some(proxy.clone());
@@ -835,6 +859,25 @@ impl ProxyManager {
     /// List all proxy provider configs (for API).
     pub fn list_provider_configs(&self) -> &HashMap<String, ProxyProviderConfig> {
         &self.provider_configs
+    }
+
+    /// Member proxy infos for a given proxy provider (for `/providers/proxies`).
+    pub fn provider_proxy_infos(&self, provider_name: &str) -> Vec<ProxyInfo> {
+        self.provider_proxy_names
+            .get(provider_name)
+            .map(|names| {
+                names
+                    .iter()
+                    .filter_map(|n| {
+                        self.proxies.get(n).map(|h| ProxyInfo {
+                            name: n.clone(),
+                            proxy_type: h.proto().to_string(),
+                            udp: h.supports_udp(),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// Update a proxy provider by fetching its URL and reloading proxies.
@@ -1050,6 +1093,7 @@ type: dns
             live_groups: HashMap::new(),
             provider_configs: HashMap::new(),
             subscription_info: HashMap::new(),
+            provider_proxy_names: HashMap::new(),
             state_store: Arc::new(crate::proxy_group::proxy_state::ProxyStateStore::new()),
         }
     }

@@ -646,6 +646,14 @@ impl RuleEngine {
 
             "GEOIP" => {
                 if let Some(ref ip) = metadata.dst_ip {
+                    // mihomo compat: the "lan" pseudo-country matches private/
+                    // reserved IPs without an mmdb lookup (geoip.go:105-107,154-162).
+                    if rule.payload.eq_ignore_ascii_case("lan") {
+                        if ip_is_lan(ip) {
+                            return Some(target_to_action(&rule.target));
+                        }
+                        return None;
+                    }
                     if let Some(country) = self.geoip_matcher.lookup_country(ip) {
                         let no_resolve = rule.params.iter().any(|p| p == "no-resolve");
                         let _ = no_resolve; // no-resolve only affects DNS, not matching
@@ -659,6 +667,12 @@ impl RuleEngine {
 
             "SRC-GEOIP" => {
                 if let Some(ref ip) = metadata.src_ip {
+                    if rule.payload.eq_ignore_ascii_case("lan") {
+                        if ip_is_lan(ip) {
+                            return Some(target_to_action(&rule.target));
+                        }
+                        return None;
+                    }
                     if let Some(country) = self.geoip_matcher.lookup_country(ip) {
                         if country.eq_ignore_ascii_case(&rule.payload) {
                             return Some(target_to_action(&rule.target));
@@ -927,7 +941,17 @@ impl RuleEngine {
 
             "IN-TYPE" => {
                 if let Some(in_type) = metadata.in_type {
-                    if in_type.eq_ignore_ascii_case(&rule.payload) {
+                    // mihomo compat: payload is a `/`-separated list, matched
+                    // case-insensitively; `SOCKS` expands to SOCKS4+SOCKS5
+                    // (in_type.go parseInTypes).
+                    let matched = rule.payload.split('/').any(|tp| {
+                        let tp = tp.trim();
+                        tp.eq_ignore_ascii_case(in_type)
+                            || (tp.eq_ignore_ascii_case("socks")
+                                && (in_type.eq_ignore_ascii_case("socks4")
+                                    || in_type.eq_ignore_ascii_case("socks5")))
+                    });
+                    if matched {
                         return Some(target_to_action(&rule.target));
                     }
                 }
@@ -1186,6 +1210,76 @@ fn target_to_action(target: &str) -> Action {
         "REJECT" => Action::Reject,
         "REJECT-DROP" => Action::RejectDrop,
         name => Action::Proxy(name.to_string()),
+    }
+}
+
+/// mihomo compat: map miemietron's config-syntax rule type (e.g.
+/// `DOMAIN-SUFFIX`, `GEOIP`, `RULE-SET`, `MATCH`) to mihomo's
+/// `RuleType.String()` display form (`DomainSuffix`, `GeoIP`, `RuleSet`,
+/// `Match`), which dashboards and `GET /rules` / `/connections` expect
+/// (`constant/rule.go`). Unknown types pass through unchanged.
+pub fn rule_type_display(rule_type: &str) -> &str {
+    match rule_type {
+        "DOMAIN" => "Domain",
+        "DOMAIN-SUFFIX" => "DomainSuffix",
+        "DOMAIN-KEYWORD" => "DomainKeyword",
+        "DOMAIN-REGEX" => "DomainRegex",
+        "DOMAIN-WILDCARD" => "DomainWildcard",
+        "GEOSITE" => "GeoSite",
+        "GEOIP" => "GeoIP",
+        "SRC-GEOIP" => "SrcGeoIP",
+        "IP-ASN" => "IPASN",
+        "SRC-IP-ASN" => "SrcIPASN",
+        "IP-CIDR" | "IP-CIDR6" => "IPCIDR",
+        "SRC-IP-CIDR" => "SrcIPCIDR",
+        "IP-SUFFIX" => "IPSuffix",
+        "SRC-IP-SUFFIX" => "SrcIPSuffix",
+        "SRC-PORT" => "SrcPort",
+        "DST-PORT" => "DstPort",
+        "IN-PORT" => "InPort",
+        "IN-USER" => "InUser",
+        "IN-NAME" => "InName",
+        "IN-TYPE" => "InType",
+        "PROCESS-NAME" => "ProcessName",
+        "PROCESS-PATH" => "ProcessPath",
+        "PROCESS-NAME-REGEX" => "ProcessNameRegex",
+        "PROCESS-PATH-REGEX" => "ProcessPathRegex",
+        "PROCESS-NAME-WILDCARD" => "ProcessNameWildcard",
+        "PROCESS-PATH-WILDCARD" => "ProcessPathWildcard",
+        "MATCH" => "Match",
+        "RULE-SET" => "RuleSet",
+        "NETWORK" => "Network",
+        "DSCP" => "DSCP",
+        "UID" => "Uid",
+        "SUB-RULE" => "SubRules",
+        "AND" => "AND",
+        "OR" => "OR",
+        "NOT" => "NOT",
+        other => other,
+    }
+}
+
+/// mihomo compat: `GEOIP.isLan` (`rules/common/geoip.go:154-162`) — the "lan"
+/// pseudo-country matches private, unspecified, loopback, multicast and
+/// link-local addresses without consulting the mmdb. (mihomo also treats the
+/// fake-ip broadcast address as LAN; that pool-specific case is not reproduced
+/// here since the rule engine has no fakeip handle.)
+fn ip_is_lan(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            v4.is_private()
+                || v4.is_unspecified()
+                || v4.is_loopback()
+                || v4.is_multicast()
+                || v4.is_link_local()
+        }
+        IpAddr::V6(v6) => {
+            v6.is_unspecified()
+                || v6.is_loopback()
+                || v6.is_multicast()
+                || (v6.segments()[0] & 0xffc0) == 0xfe80 // link-local fe80::/10
+                || (v6.segments()[0] & 0xfe00) == 0xfc00 // unique-local fc00::/7
+        }
     }
 }
 
@@ -1668,6 +1762,45 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(engine.match_rules(&meta), Action::Direct);
+    }
+
+    #[test]
+    fn ip_is_lan_classification() {
+        use std::net::Ipv4Addr;
+        assert!(ip_is_lan(&IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1))));
+        assert!(ip_is_lan(&IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5))));
+        assert!(ip_is_lan(&IpAddr::V4(Ipv4Addr::new(172, 16, 0, 1))));
+        assert!(ip_is_lan(&IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))));
+        assert!(ip_is_lan(&IpAddr::V4(Ipv4Addr::new(169, 254, 0, 1))));
+        assert!(!ip_is_lan(&IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))));
+        assert!(!ip_is_lan(&IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))));
+    }
+
+    #[tokio::test]
+    async fn rule_engine_geoip_lan() {
+        use std::net::Ipv4Addr;
+        // mihomo compat: GEOIP,lan matches private/reserved IPs with no mmdb.
+        let rules: Vec<RuleString> = vec![
+            "GEOIP,lan,DIRECT".to_string(),
+            "MATCH,Proxy".to_string(),
+        ];
+        let providers = HashMap::new();
+        let engine = RuleEngine::new(&rules, &providers).await.unwrap();
+
+        let lan = RuleMetadata {
+            dst_ip: Some(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1))),
+            ..Default::default()
+        };
+        assert_eq!(engine.match_rules(&lan), Action::Direct);
+
+        let public = RuleMetadata {
+            dst_ip: Some(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))),
+            ..Default::default()
+        };
+        assert_eq!(
+            engine.match_rules(&public),
+            Action::Proxy("Proxy".to_string())
+        );
     }
 
     #[tokio::test]

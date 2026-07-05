@@ -267,12 +267,14 @@ pub fn extract_tls_sni(data: &[u8]) -> Option<String> {
 
     let ch = &hs[4..];
     // Skip: version(2) + random(32) + session_id_len(1) + session_id
-    if ch.len() < 34 {
+    // Layout: ch[0..2]=client_version, ch[2..34]=random, ch[34]=session_id_len,
+    // ch[35..]=session_id. mihomo reads the length byte at the same offset
+    // (tls_sniffer.go: data[38] including the 4-byte handshake header).
+    if ch.len() < 35 {
         return None;
     }
-    let mut pos = 34;
-    let session_id_len = ch[pos - 1] as usize;
-    pos += session_id_len;
+    let session_id_len = ch[34] as usize;
+    let mut pos = 35 + session_id_len;
 
     // Skip cipher suites
     if pos + 2 > ch.len() {
@@ -347,12 +349,9 @@ mod tests {
         "1.2.3.4:80".parse().unwrap()
     }
 
-    /// Build a minimal TLS 1.2 ClientHello with a single SNI extension.
-    ///
-    /// Note: the parser interprets ch[33] (the last byte of the 32-byte random)
-    /// as the session-ID length, then continues reading from pos=34 onward.
-    /// We set random[31]=0 so the parser sees session_id_len=0, and place the
-    /// cipher-suite data directly at byte 34 (no separate session_id_len byte).
+    /// Build a minimal, RFC-conformant TLS 1.2 ClientHello with a single SNI
+    /// extension: version(2) + random(32) + session_id_len(1) + session_id +
+    /// cipher_suites + compression + extensions.
     fn build_client_hello(sni: &str) -> Vec<u8> {
         let sni_bytes = sni.as_bytes();
 
@@ -377,19 +376,19 @@ mod tests {
 
         let extensions_len = sni_ext.len() as u16;
 
-        // ClientHello body – adapted for the parser's actual byte layout:
-        //   version(2) + random(32, last byte = 0) +
+        // ClientHello body (RFC 5246 §7.4.1.2):
+        //   version(2) + random(32) + session_id_len(1) + session_id +
         //   cipher_suites_len(2) + cipher_suite(2) +
         //   comp_len(1) + comp(1) +
         //   extensions_len(2) + extensions
-        //
-        // No separate session_id_len byte: the parser reads random[31] for that.
         let mut ch_body = Vec::new();
         // Version: TLS 1.2
         ch_body.extend_from_slice(&[0x03, 0x03]);
-        // Random (32 bytes, last byte = 0 so parser reads session_id_len = 0)
-        ch_body.extend_from_slice(&[0u8; 32]);
-        // Cipher suites length: 2 (one cipher suite) -- starts at ch[34]
+        // Random (32 bytes)
+        ch_body.extend_from_slice(&[0xABu8; 32]);
+        // Session ID: length 0 (no session id bytes)
+        ch_body.push(0x00);
+        // Cipher suites length: 2 (one cipher suite)
         ch_body.extend_from_slice(&[0x00, 0x02]);
         // One cipher suite
         ch_body.extend_from_slice(&[0x00, 0x9c]);

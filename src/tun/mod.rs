@@ -7,8 +7,6 @@ use std::mem::MaybeUninit;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::os::unix::io::AsRawFd;
 use std::sync::Arc;
-use tokio::io::AsyncReadExt;
-use tokio::net::UdpSocket;
 use tokio::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 
@@ -18,14 +16,9 @@ use crate::conn::ConnectionManager;
 use crate::dns::DnsResolver;
 use crate::proxy::OutboundPacketConn;
 use crate::rules::Action;
-use crate::stack::gvisor::GvisorStack;
-use crate::stack::system::{self, SystemStack, TCP_REDIR_PORT, UDP_TPROXY_PORT};
+use crate::stack::smol::SmolStack;
+use crate::stack::system;
 use device::TunDevice;
-
-/// Routing mark used to prevent loops.
-/// Outbound proxy connections are marked with this so they use the main routing
-/// table (bypassing the TUN) via the ip rule set up in route::setup_routes.
-const FWMARK: &str = "0x162";
 
 /// Main TUN event loop.
 ///
@@ -46,103 +39,41 @@ pub async fn run_tun(
     let tun_dev = TunDevice::open(&config)?;
     info!("TUN device {} opened (MTU {})", config.device, config.mtu);
 
+    // mihomo compat: with a userspace stack + auto-route, the proxy's own
+    // outbound sockets must bypass the TUN. mihomo binds them to the physical
+    // default interface (dialer.DefaultInterfaceFinder), not a firewall mark.
     if config.auto_detect_interface {
         if let Some(iface) = route::detect_default_interface().await {
             info!("Auto-detected outbound interface: {}", iface);
-            // Store for use by outbound socket binding
-            // The interface is used by connect opts in transport/tcp.rs
+            crate::transport::tcp::set_default_outbound_interface(Some(iface));
         } else {
             tracing::warn!("auto-detect-interface enabled but could not detect default interface");
         }
     }
 
-    // Only set up routes and firewall rules when auto-route is enabled.
-    // When auto-route is false, an external manager (e.g. OpenClash) handles
-    // all firewall rules and redirects traffic to redir-port/tproxy-port instead.
+    // Only set up routes when auto-route is enabled. When auto-route is false,
+    // an external manager (e.g. OpenClash) directs traffic into the TUN.
+    //
+    // mihomo compat: the userspace stack terminates packets read directly from
+    // the TUN device — it needs NO iptables REDIRECT (sing-tun installs none).
+    // Loop avoidance is handled by binding outbound sockets to the physical
+    // interface (auto-detect-interface), set above.
     if config.auto_route {
         route::setup_routes(&config).await?;
         info!("Auto-route configured");
-
-        route::setup_iptables(&config.device, TCP_REDIR_PORT, UDP_TPROXY_PORT, FWMARK).await?;
-        info!("iptables redirect rules configured");
     } else {
-        info!(
-            "Auto-route disabled — skipping route and firewall setup (external manager expected)"
-        );
+        info!("Auto-route disabled — skipping route setup (external manager expected)");
     }
 
+    // mihomo compat: both "gvisor" and "system" stacks terminate TCP/UDP in
+    // userspace (sing-tun's gVisor and system netstacks). We implement both via
+    // the smoltcp engine; there is no kernel-iptables TUN datapath.
     let stack_type = config.stack.to_lowercase();
-    match stack_type.as_str() {
-        "gvisor" | "mixed" => {
-            info!(
-                "TUN {} using {} stack (user-space TCP/IP)",
-                config.device, stack_type
-            );
-            run_gvisor_stack(
-                tun_dev,
-                &config,
-                conn_manager,
-                dns,
-                &stack_type,
-                &dns_listen,
-            )
-            .await
-        }
-        _ => {
-            // "system" stack (default) — kernel TCP/IP via iptables REDIRECT
-            run_system_stack(tun_dev, &config, conn_manager, dns).await
-        }
-    }
-}
-
-/// Run the system stack: kernel TCP/IP via iptables REDIRECT + SO_ORIGINAL_DST.
-async fn run_system_stack(
-    tun_dev: TunDevice,
-    config: &TunConfig,
-    conn_manager: Arc<ConnectionManager>,
-    dns: Arc<DnsResolver>,
-) -> Result<()> {
-    // Start the system stack (TCP listener)
-    let stack = SystemStack::new(&config.device, TCP_REDIR_PORT).await?;
-
-    // Drain TUN fd in background
-    let tun_mtu = config.mtu;
-    tokio::spawn(async move {
-        drain_tun_device(tun_dev, tun_mtu).await;
-    });
-
-    // Start UDP relay in background
-    let udp_dns = dns.clone();
-    let udp_conn = conn_manager.clone();
-    let udp_timeout = config.udp_timeout;
-    tokio::spawn(async move {
-        if let Err(e) = run_udp_relay(UDP_TPROXY_PORT, udp_conn, udp_dns, udp_timeout).await {
-            error!("UDP relay error: {}", e);
-        }
-    });
-
-    // TCP accept loop
     info!(
-        "TUN {} ready — system stack, TCP on port {}",
-        config.device, TCP_REDIR_PORT
+        "TUN {} using {} stack (smoltcp userspace TCP/IP)",
+        config.device, stack_type
     );
-
-    loop {
-        match stack.accept_tcp().await {
-            Ok((stream, src, orig_dst)) => {
-                let cm = conn_manager.clone();
-                let dns = dns.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = handle_tcp_connection(stream, src, orig_dst, &cm, &dns).await {
-                        debug!("TCP connection {} -> {} error: {}", src, orig_dst, e);
-                    }
-                });
-            }
-            Err(e) => {
-                error!("TCP accept error: {}", e);
-            }
-        }
-    }
+    run_gvisor_stack(tun_dev, &config, conn_manager, dns, &stack_type, &dns_listen).await
 }
 
 /// Run the gvisor stack: user-space TCP/IP processing raw TUN packets.
@@ -150,42 +81,31 @@ async fn run_system_stack(
 /// In "gvisor" mode, both TCP and UDP are handled by the user-space stack.
 /// In "mixed" mode, TCP uses the user-space stack and UDP uses the kernel
 /// TPROXY path (same as system stack).
-/// Parse dns-hijack entries and DNS listen address into a set of (hijack_addr → dns_addr) mappings.
-fn parse_dns_hijack(
-    hijack_entries: &[String],
-    dns_listen: &Option<String>,
-) -> Vec<(SocketAddr, SocketAddr)> {
-    let dns_addr = dns_listen
-        .as_deref()
-        .unwrap_or("127.0.0.1:1053")
-        .parse::<SocketAddr>()
-        .unwrap_or_else(|_| "127.0.0.1:1053".parse().unwrap());
-    hijack_entries
+/// Parse dns-hijack entries into socket addresses.
+///
+/// mihomo compat (sing_tun/server.go:273-284): each entry may carry a
+/// `udp://` / `tcp://` scheme (stripped) and the literal `any` (replaced with
+/// `0.0.0.0`). Unparseable entries are skipped.
+fn parse_dns_hijack_targets(entries: &[String]) -> Vec<SocketAddr> {
+    entries
         .iter()
         .filter_map(|entry| {
-            entry
-                .parse::<SocketAddr>()
-                .ok()
-                .map(|addr| (addr, dns_addr))
+            let e = entry.rsplit("://").next().unwrap_or(entry);
+            let e = e.replacen("any", "0.0.0.0", 1);
+            e.parse::<SocketAddr>().ok()
         })
         .collect()
 }
 
-/// Check if a destination matches any dns-hijack entry.
-/// 0.0.0.0 in the hijack list matches any IP on that port.
-fn dns_hijack_target(
-    dst: SocketAddr,
-    hijack_map: &[(SocketAddr, SocketAddr)],
-) -> Option<SocketAddr> {
-    for (hijack, dns_target) in hijack_map {
-        if hijack.port() == dst.port() {
-            let ip = hijack.ip();
-            if ip.is_unspecified() || ip == dst.ip() {
-                return Some(*dns_target);
-            }
-        }
-    }
-    None
+/// Whether a destination should have its DNS hijacked to the internal resolver.
+///
+/// mihomo compat (sing_tun/dns.go ShouldHijackDns): match if the destination
+/// equals a hijack entry, or the entry's address is unspecified and the
+/// destination port is 53.
+fn dns_hijack_matches(hijack: &[SocketAddr], dst: SocketAddr) -> bool {
+    hijack
+        .iter()
+        .any(|h| *h == dst || (h.ip().is_unspecified() && dst.port() == 53))
 }
 
 async fn run_gvisor_stack(
@@ -196,106 +116,71 @@ async fn run_gvisor_stack(
     stack_type: &str,
     dns_listen: &Option<String>,
 ) -> Result<()> {
-    let gvisor = GvisorStack::start(tun_dev, config);
-    let (mut tcp_rx, mut udp_rx) = gvisor.into_channels();
+    // mihomo compat: the "gvisor" stack terminates TCP/UDP in userspace via a
+    // real netstack (sing-tun's gVisor stack). We use smoltcp, driven by the
+    // SmolStack engine. "mixed" also terminates in userspace here (mihomo's
+    // mixed = system-TCP + gvisor-UDP is not reproduced; both go through the
+    // userspace stack, which is behaviorally equivalent for the proxy tunnel).
+    let _ = stack_type;
+    let stack = SmolStack::start(tun_dev, config.mtu as usize);
+    let (mut tcp_rx, mut udp_rx) = stack.into_channels();
 
-    // Parse dns-hijack entries for UDP interception
-    let hijack_map = parse_dns_hijack(&config.dns_hijack, dns_listen);
-    if !hijack_map.is_empty() {
-        info!("DNS hijack entries: {:?}", hijack_map);
+    // dns-hijack: destinations matching an entry are answered by the internal
+    // resolver in-stack, both TCP and UDP (mihomo sing_tun/dns.go ShouldHijackDns).
+    let hijack = Arc::new(parse_dns_hijack_targets(&config.dns_hijack));
+    if !hijack.is_empty() {
+        info!("TUN dns-hijack active for: {:?}", hijack);
     }
+    let _ = dns_listen; // hijacked queries are served locally, not forwarded
 
-    // For "mixed" mode, also start the kernel UDP relay
-    let is_mixed = stack_type == "mixed";
-    if is_mixed {
-        let udp_dns = dns.clone();
-        let udp_conn = conn_manager.clone();
-        let udp_timeout = config.udp_timeout;
-        tokio::spawn(async move {
-            if let Err(e) = run_udp_relay(UDP_TPROXY_PORT, udp_conn, udp_dns, udp_timeout).await {
-                error!("UDP relay error (mixed mode): {}", e);
-            }
-        });
-    }
+    let udp_timeout = Duration::from_secs(config.udp_timeout);
 
     info!(
-        "TUN {} ready — {} stack, processing raw packets",
-        config.device, stack_type
+        "TUN {} ready — smoltcp userspace stack",
+        config.device
     );
 
-    // Handle TCP connections from the gvisor stack
-    // UDP is handled by kernel TPROXY in mixed mode, or by gvisor in full mode
-    if is_mixed {
-        // Mixed mode: only process TCP from gvisor
-        loop {
-            match tcp_rx.recv().await {
-                Some(stream) => {
-                    let src = stream.src;
-                    let dst = stream.dst;
-                    let cm = conn_manager.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = cm.handle_tcp(src, dst, stream).await {
-                            debug!("Gvisor TCP {} -> {} error: {}", src, dst, e);
-                        }
-                    });
-                }
-                None => {
-                    error!("Gvisor TCP channel closed");
+    loop {
+        tokio::select! {
+            tcp = tcp_rx.recv() => {
+                let Some(stream) = tcp else {
+                    error!("smoltcp TCP channel closed");
                     break;
-                }
+                };
+                let src = stream.src;
+                let dst = stream.dst;
+                let cm = conn_manager.clone();
+                let dns = dns.clone();
+                let hijack = hijack.clone();
+                tokio::spawn(async move {
+                    if dns_hijack_matches(&hijack, dst) {
+                        if let Err(e) = handle_hijacked_dns_tcp(stream, &dns).await {
+                            debug!("DNS hijack tcp:{} error: {}", dst, e);
+                        }
+                        return;
+                    }
+                    if let Err(e) = cm.handle_tcp(src, dst, stream).await {
+                        debug!("TUN TCP {} -> {} error: {}", src, dst, e);
+                    }
+                });
             }
-        }
-    } else {
-        // Full gvisor mode: process both TCP and UDP
-        loop {
-            tokio::select! {
-                tcp = tcp_rx.recv() => {
-                    match tcp {
-                        Some(stream) => {
-                            let src = stream.src;
-                            let dst = stream.dst;
-                            let cm = conn_manager.clone();
-                            tokio::spawn(async move {
-                                if let Err(e) = cm.handle_tcp(src, dst, stream).await {
-                                    debug!("Gvisor TCP {} -> {} error: {}", src, dst, e);
-                                }
-                            });
-                        }
-                        None => {
-                            error!("Gvisor TCP channel closed");
-                            break;
-                        }
+            udp = udp_rx.recv() => {
+                let Some(flow) = udp else {
+                    error!("smoltcp UDP channel closed");
+                    break;
+                };
+                let cm = conn_manager.clone();
+                let dns = dns.clone();
+                let hijack = hijack.clone();
+                tokio::spawn(async move {
+                    if dns_hijack_matches(&hijack, flow.dst) {
+                        handle_hijacked_dns_udp(flow, &dns).await;
+                        return;
                     }
-                }
-                udp = udp_rx.recv() => {
-                    if let Some(dgram) = udp {
-                        // Check dns-hijack: redirect DNS queries to internal resolver
-                        if let Some(dns_target) = dns_hijack_target(dgram.dst, &hijack_map) {
-                            tokio::spawn(async move {
-                                if let Ok(sock) = UdpSocket::bind("0.0.0.0:0").await {
-                                    let _ = sock.send_to(&dgram.data, dns_target).await;
-                                }
-                            });
-                        } else {
-                        let cm = conn_manager.clone();
-                        tokio::spawn(async move {
-                            let (action, _domain) =
-                                cm.resolve_udp_action(dgram.src, dgram.dst).await;
-                            match action {
-                                Action::Direct | Action::Proxy(_) => {
-                                    if let Ok(sock) = UdpSocket::bind("0.0.0.0:0").await {
-                                        let _ = sock.send_to(&dgram.data, dgram.dst).await;
-                                    }
-                                }
-                                _ => {}
-                            }
-                        });
-                        }
-                    } else {
-                        error!("Gvisor UDP channel closed");
-                        break;
+                    if let Err(e) = handle_tun_udp_flow(flow, &cm, &dns, udp_timeout).await {
+                        debug!("TUN UDP flow error: {}", e);
                     }
-                }
+                });
             }
         }
     }
@@ -303,78 +188,108 @@ async fn run_gvisor_stack(
     Ok(())
 }
 
-/// Handle a single redirected TCP connection end-to-end.
-async fn handle_tcp_connection(
-    stream: tokio::net::TcpStream,
-    src: SocketAddr,
-    orig_dst: SocketAddr,
-    conn_manager: &ConnectionManager,
-    _dns: &DnsResolver,
-) -> Result<()> {
-    // Set the routing mark on the accepted socket so any data we send back
-    // doesn't get re-routed into the TUN.  (The proxy outbound connections
-    // should also be marked, but that happens inside the proxy handlers.)
-    set_socket_mark(&stream, 0x162);
-
-    debug!("Handling TCP {} -> {}", src, orig_dst);
-
-    // ConnectionManager::handle_tcp does:
-    // - FakeIP reverse lookup (if dst IP is in fake-ip range)
-    // - Rule matching
-    // - Proxy connection
-    // - Bidirectional relay
-    conn_manager.handle_tcp(src, orig_dst, stream).await
-}
-
-/// Set SO_MARK on a tokio TcpStream so outgoing packets are marked for
-/// routing purposes (bypass TUN).
-fn set_socket_mark(stream: &tokio::net::TcpStream, mark: u32) {
-    use std::os::unix::io::AsRawFd;
-    let fd = stream.as_raw_fd();
-    let ret = unsafe {
-        libc::setsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_MARK,
-            &mark as *const u32 as *const libc::c_void,
-            std::mem::size_of::<u32>() as libc::socklen_t,
-        )
-    };
-    if ret != 0 {
-        debug!(
-            "setsockopt SO_MARK failed: {} (non-fatal, need CAP_NET_ADMIN)",
-            std::io::Error::last_os_error()
-        );
-    }
-}
-
-/// Read and discard packets from the TUN device.
-///
-/// The kernel enqueues IP packets on the TUN fd.  When we use iptables
-/// REDIRECT, the kernel still delivers copies to the TUN read side.
-/// If nobody reads them the internal buffer fills up and new packets are
-/// dropped (which blocks the redirected TCP connections from working).
-async fn drain_tun_device(mut tun: TunDevice, mtu: u32) {
-    let mut buf = vec![0u8; mtu as usize + 64];
-    loop {
-        match tun.read(&mut buf).await {
-            Ok(0) => {
-                warn!("TUN device closed, stopping drain");
+/// Answer a hijacked DNS-over-UDP flow entirely from the internal resolver,
+/// relaying each query's response back through the stack to the client.
+async fn handle_hijacked_dns_udp(mut flow: crate::stack::smol::SmolUdpFlow, dns: &Arc<DnsResolver>) {
+    debug!("[DNS] hijack udp:{} from {}", flow.dst, flow.src);
+    // The first datagram is already queued in flow.rx.
+    while let Some(query) = flow.rx.recv().await {
+        if let Some(resp) = crate::dns::process_dns_query(&query, dns).await {
+            if !flow.reply.send(resp).await {
                 break;
-            }
-            Ok(_n) => {
-                // Packet consumed and discarded.  TCP/UDP processing happens
-                // through the redirected sockets, not here.
-            }
-            Err(e) => {
-                // EAGAIN / EWOULDBLOCK are normal; anything else is worth
-                // logging once.
-                if e.kind() != std::io::ErrorKind::WouldBlock {
-                    debug!("TUN read error (drain): {}", e);
-                }
             }
         }
     }
+}
+
+/// Answer a hijacked DNS-over-TCP connection (2-byte length-prefixed messages)
+/// from the internal resolver.
+async fn handle_hijacked_dns_tcp(
+    mut stream: crate::stack::smol::SmolTcpStream,
+    dns: &Arc<DnsResolver>,
+) -> Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    debug!("[DNS] hijack tcp:{}", stream.dst);
+    loop {
+        let mut len_buf = [0u8; 2];
+        match stream.read_exact(&mut len_buf).await {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
+            Err(e) => return Err(e.into()),
+        }
+        let msg_len = u16::from_be_bytes(len_buf) as usize;
+        if msg_len == 0 || msg_len > 65535 {
+            return Ok(());
+        }
+        let mut msg = vec![0u8; msg_len];
+        stream.read_exact(&mut msg).await?;
+        if let Some(resp) = crate::dns::process_dns_query(&msg, dns).await {
+            stream.write_all(&(resp.len() as u16).to_be_bytes()).await?;
+            stream.write_all(&resp).await?;
+        }
+    }
+}
+
+/// Relay one smoltcp UDP flow through the proxy tunnel: rule-match once, dial
+/// the outbound (DIRECT or proxy) via the handler's `connect_datagram`, forward
+/// every client datagram, and pump replies back through `flow.reply`. This is
+/// the userspace-stack equivalent of the TPROXY UDP relay — proxied UDP is
+/// actually proxied (not leaked DIRECT) and replies reach the client.
+async fn handle_tun_udp_flow(
+    mut flow: crate::stack::smol::SmolUdpFlow,
+    conn_manager: &ConnectionManager,
+    dns: &Arc<DnsResolver>,
+    udp_timeout: Duration,
+) -> Result<()> {
+    let src = flow.src;
+    let dst = flow.dst;
+
+    // First datagram drives session creation (and rule matching).
+    let first = match flow.rx.recv().await {
+        Some(d) => d,
+        None => return Ok(()),
+    };
+    let session = create_udp_session(src, dst, &first, conn_manager, dns).await?;
+    let outbound = session.outbound;
+    let target = session.target;
+
+    // Reverse path: outbound -> client, back through the stack.
+    let reply = flow.reply.clone();
+    let pc_rev = outbound.clone();
+    let reverse = tokio::spawn(async move {
+        let mut rbuf = vec![0u8; 65535];
+        loop {
+            match tokio::time::timeout(udp_timeout, pc_rev.recv_from(&mut rbuf)).await {
+                Ok(Ok((rn, _))) if rn > 0 => {
+                    if !reply.send(rbuf[..rn].to_vec()).await {
+                        break; // client flow gone
+                    }
+                }
+                Ok(Ok(_)) => break, // 0-length = closed
+                Ok(Err(e)) => {
+                    debug!("TUN UDP proxy recv error: {}", e);
+                    break;
+                }
+                Err(_) => break, // idle timeout
+            }
+        }
+    });
+
+    // Forward path: client -> outbound.
+    loop {
+        match tokio::time::timeout(udp_timeout, flow.rx.recv()).await {
+            Ok(Some(data)) => {
+                if let Err(e) = outbound.send_to(&data, &target).await {
+                    debug!("TUN UDP send {} -> {} error: {}", src, target, e);
+                    break;
+                }
+            }
+            Ok(None) => break, // client flow closed
+            Err(_) => break,   // idle timeout
+        }
+    }
+    reverse.abort();
+    Ok(())
 }
 
 /// A live UDP session tracked in the NAT table.
@@ -750,11 +665,11 @@ pub async fn run_tproxy_udp_listener(
     run_udp_relay(port, conn_manager, dns, 300).await
 }
 
-/// Cleanup guard that removes iptables rules when the TUN module shuts down.
-/// This is called from the Engine when it aborts the TUN task.
+/// Cleanup guard that removes the TUN routes when the module shuts down.
+/// This is called from the Engine when it aborts the TUN task. The userspace
+/// stack installs no iptables rules, so only routes need tearing down.
 pub async fn cleanup(config: &TunConfig) -> Result<()> {
     if config.auto_route {
-        route::cleanup_iptables(&config.device).await?;
         route::cleanup_routes(config).await?;
     }
     Ok(())

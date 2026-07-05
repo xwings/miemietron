@@ -76,8 +76,27 @@ impl SsrOutbound {
             .get("obfs")
             .and_then(|v| v.as_str())
             .unwrap_or("plain");
-        let obfs = SsrObfs::from_name(obfs_name)
-            .ok_or_else(|| anyhow!("ssr: unsupported obfs plugin '{obfs_name}'"))?;
+        // mihomo compat: obfs.PickObfs returns "Obfs <name> not supported" for
+        // unknown names, wrapped by NewShadowSocksR as
+        // "ssr <addr> initialize obfs error: ...". Unknown -> reject.
+        let obfs = SsrObfs::from_name(obfs_name).ok_or_else(|| {
+            anyhow!(
+                "ssr {}:{} initialize obfs error: Obfs {} not supported",
+                server,
+                port,
+                obfs_name
+            )
+        })?;
+        // Recognized but unimplemented obfs must FAIL LOUD at load, never
+        // silently degrade to plain (CLAUDE.md "never silent fallback").
+        if !obfs.is_implemented() {
+            return Err(anyhow!(
+                "ssr {}:{} obfs {} not supported",
+                server,
+                port,
+                obfs.as_str()
+            ));
+        }
 
         let obfs_param = config
             .extra
@@ -91,8 +110,27 @@ impl SsrOutbound {
             .get("protocol")
             .and_then(|v| v.as_str())
             .unwrap_or("origin");
-        let protocol = SsrProtocol::from_name(protocol_name)
-            .ok_or_else(|| anyhow!("ssr: unsupported protocol plugin '{protocol_name}'"))?;
+        // mihomo compat: protocol.PickProtocol returns
+        // "protocol <name> not supported" for unknown names, wrapped by
+        // NewShadowSocksR as "ssr <addr> initialize protocol error: ...".
+        let protocol = SsrProtocol::from_name(protocol_name).ok_or_else(|| {
+            anyhow!(
+                "ssr {}:{} initialize protocol error: protocol {} not supported",
+                server,
+                port,
+                protocol_name
+            )
+        })?;
+        // Recognized but unimplemented protocols must FAIL LOUD at load, never
+        // silently degrade to origin passthrough.
+        if !protocol.is_implemented() {
+            return Err(anyhow!(
+                "ssr {}:{} protocol {} not supported",
+                server,
+                port,
+                protocol.as_str()
+            ));
+        }
 
         let protocol_param = config
             .extra
@@ -204,9 +242,11 @@ mod tests {
 
     fn make_ssr_config() -> ProxyConfig {
         let mut extra = HashMap::new();
+        // Use implemented obfs/protocol so the base config loads successfully;
+        // rejection of unimplemented plugins is covered by dedicated tests.
         extra.insert(
             "obfs".to_string(),
-            serde_yaml::Value::String("http_simple".to_string()),
+            serde_yaml::Value::String("plain".to_string()),
         );
         extra.insert(
             "obfs-param".to_string(),
@@ -214,7 +254,7 @@ mod tests {
         );
         extra.insert(
             "protocol".to_string(),
-            serde_yaml::Value::String("auth_aes128_md5".to_string()),
+            serde_yaml::Value::String("origin".to_string()),
         );
         extra.insert(
             "protocol-param".to_string(),
@@ -282,9 +322,9 @@ mod tests {
         assert_eq!(outbound.port, 8388);
         assert_eq!(outbound.cipher, SsrCipher::Aes256Cfb);
         assert_eq!(outbound.password, "test-password");
-        assert_eq!(outbound.obfs, SsrObfs::HttpSimple);
+        assert_eq!(outbound.obfs, SsrObfs::Plain);
         assert_eq!(outbound.obfs_param, "cdn.example.com");
-        assert_eq!(outbound.protocol, SsrProtocol::AuthAes128Md5);
+        assert_eq!(outbound.protocol, SsrProtocol::Origin);
         assert_eq!(outbound.protocol_param, "12345:abcdef");
         assert!(outbound.udp);
     }
@@ -376,6 +416,78 @@ mod tests {
     fn ssr_unsupported_cipher_fails() {
         let mut config = make_ssr_config();
         config.cipher = Some("blowfish-cfb".to_string());
+        assert!(SsrOutbound::from_config(&config).is_err());
+    }
+
+    /// Recognized-but-unimplemented protocols must FAIL LOUD at config load,
+    /// never silently degrade to origin passthrough.
+    #[test]
+    fn ssr_unimplemented_protocol_rejected_at_load() {
+        for proto in [
+            "auth_sha1_v4",
+            "auth_aes128_md5",
+            "auth_aes128_sha1",
+            "auth_chain_a",
+            "auth_chain_b",
+        ] {
+            let mut config = make_ssr_config();
+            config.extra.insert(
+                "protocol".to_string(),
+                serde_yaml::Value::String(proto.to_string()),
+            );
+            let err = match SsrOutbound::from_config(&config) {
+                Ok(_) => panic!("protocol {proto} must be rejected"),
+                Err(e) => e.to_string(),
+            };
+            assert!(
+                err.contains(&format!("protocol {proto} not supported")),
+                "unexpected error for {proto}: {err}"
+            );
+        }
+    }
+
+    /// Recognized-but-unimplemented obfs must FAIL LOUD at config load, never
+    /// silently degrade to plain.
+    #[test]
+    fn ssr_unimplemented_obfs_rejected_at_load() {
+        for obfs in [
+            "http_simple",
+            "http_post",
+            "random_head",
+            "tls1.2_ticket_auth",
+            "tls1.2_ticket_fastauth",
+        ] {
+            let mut config = make_ssr_config();
+            config.extra.insert(
+                "obfs".to_string(),
+                serde_yaml::Value::String(obfs.to_string()),
+            );
+            let err = match SsrOutbound::from_config(&config) {
+                Ok(_) => panic!("obfs {obfs} must be rejected"),
+                Err(e) => e.to_string(),
+            };
+            assert!(
+                err.contains(&format!("obfs {obfs} not supported")),
+                "unexpected error for {obfs}: {err}"
+            );
+        }
+    }
+
+    /// Truly unknown names hit mihomo's "<...> not supported" parse error too.
+    #[test]
+    fn ssr_unknown_protocol_and_obfs_rejected() {
+        let mut config = make_ssr_config();
+        config.extra.insert(
+            "protocol".to_string(),
+            serde_yaml::Value::String("does_not_exist".to_string()),
+        );
+        assert!(SsrOutbound::from_config(&config).is_err());
+
+        let mut config = make_ssr_config();
+        config.extra.insert(
+            "obfs".to_string(),
+            serde_yaml::Value::String("does_not_exist".to_string()),
+        );
         assert!(SsrOutbound::from_config(&config).is_err());
     }
 }

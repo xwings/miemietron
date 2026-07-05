@@ -422,6 +422,30 @@ impl DnsResolver {
 }
 
 /// Run a DNS server that listens for queries on both UDP and TCP.
+/// Process a raw DNS query packet and produce a raw DNS response packet.
+///
+/// Shared by the embedded UDP/TCP DNS servers and the TUN dns-hijack path
+/// (mihomo `resolver.RelayDnsPacket`): a hijacked query is answered by the
+/// internal resolver rather than being forwarded to its original destination.
+/// Returns `None` if the query can't be parsed.
+pub async fn process_dns_query(data: &[u8], resolver: &DnsResolver) -> Option<Vec<u8>> {
+    let (id, domain, qtype) = parse_dns_query(data)?;
+    match resolver.resolve(&domain).await {
+        Ok(ip) => {
+            let ttl = if resolver.is_fake_ip(&ip) {
+                FAKEIP_TTL
+            } else {
+                DNS_DEFAULT_TTL
+            };
+            Some(build_dns_response(id, &domain, ip, qtype, ttl))
+        }
+        Err(e) => {
+            debug!("DNS resolve failed for {}: {}", domain, e);
+            Some(build_dns_servfail(id))
+        }
+    }
+}
+
 pub async fn run_dns_server(listen: &str, resolver: Arc<DnsResolver>) -> Result<()> {
     let addr: SocketAddr = listen
         .parse()

@@ -28,9 +28,11 @@ pub struct TunConfig {
     pub inet6_address: Vec<String>,
 
     // Routing
-    #[serde(default)]
+    // mihomo compat: auto-route and auto-detect-interface both default to true
+    // (config.go:538-539).
+    #[serde(default = "default_true")]
     pub auto_route: bool,
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub auto_detect_interface: bool,
 
     #[serde(default)]
@@ -47,7 +49,8 @@ pub struct TunConfig {
     pub inet6_route_exclude_address: Vec<String>,
 
     // DNS hijacking
-    #[serde(default)]
+    // mihomo compat: default hijacks all DNS ("0.0.0.0:53", config.go:537).
+    #[serde(default = "default_dns_hijack")]
     pub dns_hijack: Vec<String>,
 
     // Filtering
@@ -120,15 +123,15 @@ impl Default for TunConfig {
             gso_max_size: default_gso_max_size(),
             inet4_address: default_inet4_address(),
             inet6_address: vec![],
-            auto_route: false,
-            auto_detect_interface: false,
+            auto_route: true,
+            auto_detect_interface: true,
             route_address: vec![],
             route_exclude_address: vec![],
             inet4_route_address: vec![],
             inet6_route_address: vec![],
             inet4_route_exclude_address: vec![],
             inet6_route_exclude_address: vec![],
-            dns_hijack: vec![],
+            dns_hijack: default_dns_hijack(),
             include_interface: vec![],
             exclude_interface: vec![],
             include_uid: vec![],
@@ -139,8 +142,7 @@ impl Default for TunConfig {
             exclude_package: vec![],
             exclude_src_port: vec![],
             exclude_dst_port: vec![],
-            udp_timeout: default_udp_timeout(),
-            endpoint_independent_nat: false,
+            udp_timeout: default_udp_timeout(),            endpoint_independent_nat: false,
             disable_icmp_forwarding: false,
             ip_route2_table_index: default_ip_route2_table_index(),
             ip_route2_rule_index: default_ip_route2_rule_index(),
@@ -157,12 +159,23 @@ impl Default for TunConfig {
     }
 }
 
+fn default_true() -> bool {
+    true
+}
+
 fn default_device() -> String {
-    "utun".to_string()
+    // mihomo compat: default TUN interface name is "Meta" (sing_tun InterfaceName).
+    "Meta".to_string()
 }
 
 fn default_stack() -> String {
-    "system".to_string()
+    // mihomo compat: default stack is gvisor (config.go:536, C.TunGvisor).
+    "gvisor".to_string()
+}
+
+fn default_dns_hijack() -> Vec<String> {
+    // mihomo compat: hijack all DNS by default (config.go:537).
+    vec!["0.0.0.0:53".to_string()]
 }
 
 fn default_mtu() -> u32 {
@@ -202,22 +215,23 @@ mod tests {
         let config: TunConfig = serde_yaml::from_str(yaml).unwrap();
 
         assert!(!config.enable);
-        assert_eq!(config.device, "utun");
-        assert_eq!(config.stack, "system");
+        assert_eq!(config.device, "Meta");
+        assert_eq!(config.stack, "gvisor");
         assert_eq!(config.mtu, 9000);
         assert!(!config.gso);
         assert_eq!(config.gso_max_size, 65536);
         assert_eq!(config.inet4_address, vec!["198.18.0.1/30"]);
         assert!(config.inet6_address.is_empty());
-        assert!(!config.auto_route);
-        assert!(!config.auto_detect_interface);
+        // mihomo compat: auto-route + auto-detect-interface default true.
+        assert!(config.auto_route);
+        assert!(config.auto_detect_interface);
         assert!(config.route_address.is_empty());
         assert!(config.route_exclude_address.is_empty());
         assert!(config.inet4_route_address.is_empty());
         assert!(config.inet6_route_address.is_empty());
         assert!(config.inet4_route_exclude_address.is_empty());
         assert!(config.inet6_route_exclude_address.is_empty());
-        assert!(config.dns_hijack.is_empty());
+        assert_eq!(config.dns_hijack, vec!["0.0.0.0:53"]);
         assert!(config.include_interface.is_empty());
         assert!(config.exclude_interface.is_empty());
         assert!(config.include_uid.is_empty());
@@ -372,8 +386,8 @@ mtu: 1400
         assert!(config.enable);
         assert_eq!(config.mtu, 1400);
         // Everything else should be default
-        assert_eq!(config.device, "utun");
-        assert_eq!(config.stack, "system");
+        assert_eq!(config.device, "Meta");
+        assert_eq!(config.stack, "gvisor");
         assert_eq!(config.gso_max_size, 65536);
         assert_eq!(config.udp_timeout, 300);
     }

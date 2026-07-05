@@ -75,6 +75,12 @@ impl TunDevice {
     }
 }
 
+impl AsRawFd for TunDevice {
+    fn as_raw_fd(&self) -> RawFd {
+        self.fd
+    }
+}
+
 impl Drop for TunDevice {
     fn drop(&mut self) {
         unsafe { libc::close(self.fd) };

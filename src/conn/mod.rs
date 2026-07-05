@@ -177,8 +177,30 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for PeekableStream<T> {
     }
 }
 
+/// mihomo compat: map miemietron's internal inbound tag to mihomo's
+/// `Type.String()` value (`constant/metadata.go`). This is the vocabulary used
+/// for the `/connections` `type` field and for `IN-TYPE` rule matching — so
+/// `IN-TYPE,HTTP` / `IN-TYPE,SOCKS5` / `IN-TYPE,REDIR` behave like mihomo.
+pub(crate) fn inbound_type_display(conn_type: &'static str) -> &'static str {
+    match conn_type {
+        // A CONNECT request through the HTTP proxy is still Type HTTP in mihomo;
+        // the HTTPS type is reserved for a TLS-terminating listener (out of scope).
+        "http-proxy" | "http-connect" => "HTTP",
+        "socks5" => "Socks5",
+        "socks4" => "Socks4",
+        "redir" => "Redir",
+        "tproxy" => "TProxy",
+        "tun" => "Tun",
+        other => other,
+    }
+}
+
 /// Maximum number of bytes to peek for sniffing (TLS ClientHello / HTTP headers).
 const SNIFF_PEEK_SIZE: usize = 1024;
+
+/// mihomo compat: read deadline for the sniff peek (dispatcher.go uses 1s).
+/// Bounds server-speaks-first protocols so they can't stall the dial.
+const SNIFF_PEEK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Bidirectional relay matching mihomo's N.Relay (sing/bufio.Copy).
 /// Conditional flush: only when read < buf size (interactive data).
@@ -411,10 +433,23 @@ impl ConnectionManager {
 
         let mut peek_arr = [0u8; SNIFF_PEEK_SIZE]; // stack, not heap
         let peeked_len = if sniff_override.is_some() && !skip_sniff {
-            match tokio::io::AsyncReadExt::read(&mut stream, &mut peek_arr).await {
-                Ok(n) => n,
-                Err(e) => {
+            // mihomo compat: the sniff peek is bounded by a read deadline
+            // (component/sniffer/dispatcher.go SetReadDeadline(now+1s)). Without
+            // it, a server-speaks-first protocol (SMTP/IMAP/MySQL) on a sniffed
+            // port blocks the connection forever before dialing.
+            match tokio::time::timeout(
+                SNIFF_PEEK_TIMEOUT,
+                tokio::io::AsyncReadExt::read(&mut stream, &mut peek_arr),
+            )
+            .await
+            {
+                Ok(Ok(n)) => n,
+                Ok(Err(e)) => {
                     debug!("Sniff peek read failed: {}", e);
+                    0
+                }
+                Err(_) => {
+                    debug!("[Sniffer] peek timed out for {}, proceeding without sniff", dst);
                     0
                 }
             }
@@ -541,7 +576,7 @@ impl ConnectionManager {
             process_name: proc_name.clone(),
             process_path: proc_path.clone(),
             in_port,
-            in_type: Some(conn_type),
+            in_type: Some(inbound_type_display(conn_type)),
             ..Default::default()
         };
 
@@ -617,8 +652,10 @@ impl ConnectionManager {
             vec![proxy_name.clone()]
         };
 
-        // Determine the rule string for the connection entry
-        let rule_str = rule_type;
+        // Determine the rule string for the connection entry.
+        // mihomo compat: the /connections `rule` field uses RuleType.String()
+        // display form (e.g. "DomainSuffix", "Match"), not config syntax.
+        let rule_str = crate::rules::rule_type_display(&rule_type).to_string();
 
         // mihomo compat: check hosts map for domain overrides before dialing.
         // Matches mihomo's resolveMetadata: if host is in DefaultHosts and the
@@ -763,7 +800,7 @@ impl ConnectionManager {
             id: conn_id.clone(),
             metadata: ConnectionMetadata {
                 network: "tcp",
-                conn_type,
+                conn_type: inbound_type_display(conn_type),
                 source_ip: src.ip(),
                 destination_ip: dst.ip(),
                 source_port: src.port(),

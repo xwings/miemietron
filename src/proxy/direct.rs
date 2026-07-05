@@ -82,6 +82,24 @@ impl OutboundHandler for DirectOutbound {
             }
         }
 
+        // mihomo compat: bind the DIRECT UDP socket to the auto-detected physical
+        // interface (when set) so proxied/direct UDP under a userspace TUN stack
+        // bypasses the TUN instead of looping back into it.
+        #[cfg(target_os = "linux")]
+        if let Some(iface) = crate::transport::tcp::default_outbound_interface_public() {
+            use std::os::unix::io::AsRawFd;
+            let fd = socket.as_raw_fd();
+            unsafe {
+                libc::setsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_BINDTODEVICE,
+                    iface.as_ptr() as *const libc::c_void,
+                    iface.len() as libc::socklen_t,
+                );
+            }
+        }
+
         debug!(
             "DIRECT: created UDP packet conn (mark={:?})",
             self.routing_mark

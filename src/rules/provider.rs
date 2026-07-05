@@ -256,21 +256,15 @@ fn parse_yaml_format(content: &str) -> Result<Vec<String>> {
     let parsed: YamlRules = serde_yaml::from_str(content)
         .map_err(|e| anyhow::anyhow!("failed to parse YAML rule provider: {e}"))?;
 
+    // mihomo compat: payload lines are fed verbatim into the behavior strategy
+    // (rules/provider/provider.go rulesParse → domain trie). The `+.`/`.` suffix
+    // markers are interpreted downstream by the behavior handler, so they MUST
+    // NOT be stripped here — doing so silently degrades DOMAIN-SUFFIX to exact
+    // DOMAIN match and breaks every Loyalsoldier-style domain list.
     Ok(parsed
         .payload
         .into_iter()
-        .map(|s| {
-            // YAML payload lines may include leading "+ " or "- " prefixes
-            let s = s.trim();
-            if let Some(stripped) = s.strip_prefix("'+.") {
-                // Common pattern: '+.domain.com' means DOMAIN-SUFFIX
-                stripped.trim_end_matches('\'').to_string()
-            } else if let Some(stripped) = s.strip_prefix('+') {
-                stripped.trim_start_matches('.').to_string()
-            } else {
-                s.to_string()
-            }
-        })
+        .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect())
 }
@@ -436,14 +430,20 @@ payload:
 
     #[test]
     fn parse_yaml_with_plus_dot_prefix() {
+        // mihomo compat: `+.`/`.` suffix markers are preserved verbatim; the
+        // behavior handler interprets them (DOMAIN-SUFFIX vs DOMAIN). Stripping
+        // them here would silently downgrade suffix rules to exact matches.
         let content = r#"
 payload:
-  - "'+.example.com'"
+  - "+.example.com"
   - "+.google.com"
   - "plain.com"
 "#;
         let rules = parse_yaml_format(content).unwrap();
-        assert_eq!(rules, vec!["example.com", "google.com", "plain.com"]);
+        assert_eq!(
+            rules,
+            vec!["+.example.com", "+.google.com", "plain.com"]
+        );
     }
 
     #[test]

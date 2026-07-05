@@ -1,9 +1,37 @@
 use std::net::SocketAddr;
+use std::sync::RwLock;
 use std::time::Duration;
 
 use anyhow::Result;
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::TcpStream;
+
+/// mihomo compat: `dialer.DefaultInterfaceFinder` / `DefaultRoutingMark`. When
+/// TUN `auto-detect-interface` is on (or a top-level `interface-name` is set),
+/// outbound sockets that don't specify their own interface bind to the physical
+/// default interface so the proxy's own traffic bypasses the TUN — this is how
+/// mihomo avoids routing loops, NOT via a firewall mark on our sockets.
+static DEFAULT_OUTBOUND_INTERFACE: RwLock<Option<String>> = RwLock::new(None);
+
+/// Set (or clear) the global default outbound interface used for loop avoidance.
+pub fn set_default_outbound_interface(iface: Option<String>) {
+    if let Ok(mut guard) = DEFAULT_OUTBOUND_INTERFACE.write() {
+        *guard = iface;
+    }
+}
+
+fn default_outbound_interface() -> Option<String> {
+    DEFAULT_OUTBOUND_INTERFACE
+        .read()
+        .ok()
+        .and_then(|g| g.clone())
+}
+
+/// Public accessor for the global default outbound interface (used by the
+/// DIRECT UDP path to bind its socket for loop avoidance).
+pub fn default_outbound_interface_public() -> Option<String> {
+    default_outbound_interface()
+}
 
 /// Connect options for outbound TCP connections.
 #[derive(Default)]
@@ -49,10 +77,15 @@ pub async fn connect(addr: SocketAddr, opts: &ConnectOpts) -> Result<TcpStream> 
         }
     }
 
-    // Bind to specific interface
-    if let Some(ref iface) = opts.interface {
-        #[cfg(target_os = "linux")]
-        {
+    // Bind to a specific interface: the proxy's own setting wins, otherwise
+    // fall back to the global auto-detected default interface (loop avoidance).
+    #[cfg(target_os = "linux")]
+    {
+        let iface = opts
+            .interface
+            .clone()
+            .or_else(default_outbound_interface);
+        if let Some(iface) = iface {
             socket.bind_device(Some(iface.as_bytes()))?;
         }
     }

@@ -107,7 +107,8 @@ impl OutboundHandler for VlessOutbound {
     }
 
     fn proto(&self) -> &str {
-        "vless"
+        // mihomo compat: AdapterType.String() == "Vless" (adapters.go).
+        "Vless"
     }
 
     fn supports_udp(&self) -> bool {

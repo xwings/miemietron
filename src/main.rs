@@ -272,11 +272,12 @@ impl AppState {
         .await?;
 
         // If store-selected is enabled, restore saved selections
+        // mihomo compat: store-selected defaults to true when unset (config.go:568).
         let store_selected = new_config
             .profile
             .as_ref()
             .map(|p| p.store_selected)
-            .unwrap_or(false);
+            .unwrap_or(true);
         if store_selected {
             let saved = store::load_selected(home_dir);
             if !saved.is_empty() {
@@ -463,18 +464,32 @@ async fn async_main() -> Result<()> {
         config.secret = Some(s.clone());
     }
 
-    // -t: test config and exit
-    if cli.test_config {
-        info!("Configuration test successful");
-        return Ok(());
-    }
-
-    info!("Starting miemietron {}...", VERSION);
-
     // Store home_dir for GeoIP/GeoSite loading
     let home_dir = cli.home_dir.clone().unwrap_or_else(default_home_dir);
 
     let engine = Engine::new(config, home_dir, config_path).await?;
+
+    // -t: mihomo compat — run the full parse (proxies, groups, rules, providers,
+    // DNS), not just a YAML shape check, then exit. This is the pre-switch safety
+    // net; a config that would abort at startup must fail `-t` too (main.go:164).
+    if cli.test_config {
+        match engine.validate().await {
+            Ok(()) => {
+                println!(
+                    "configuration file {} test is successful",
+                    engine.config_path.display()
+                );
+                return Ok(());
+            }
+            Err(e) => {
+                println!("configuration file test failed: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    info!("Starting miemietron {}...", VERSION);
+
     engine.run().await?;
 
     Ok(())
@@ -493,6 +508,34 @@ impl Engine {
             home_dir,
             config_path,
         })
+    }
+
+    /// Full semantic validation for `-t`: build the DNS resolver, rule engine,
+    /// and proxy manager (the fallible parsers that catch unsupported proxy
+    /// types, bad group references, malformed rules and providers) without
+    /// starting any listeners or servers. Mirrors mihomo's `executor.Parse`.
+    async fn validate(&self) -> Result<()> {
+        let _dns = dns::DnsResolver::with_hosts(&self.config.dns, &self.config.hosts).await?;
+        let mut rule_engine =
+            rules::RuleEngine::with_home_dir(&self.config.rules, &self.config.rule_providers, &self.home_dir)
+                .await?;
+        rule_engine.set_sub_rules(&self.config.sub_rules);
+        let state_store = Arc::new(proxy_group::proxy_state::ProxyStateStore::new());
+        let _pm = proxy::ProxyManager::with_state_store(
+            &self.config.proxies,
+            &self.config.proxy_groups,
+            &self.config.proxy_providers,
+            &proxy::ProxyGlobalOpts {
+                routing_mark: self.config.routing_mark,
+                tcp_concurrent: self.config.tcp_concurrent,
+                keep_alive_idle: self.config.keep_alive_idle,
+                keep_alive_interval: self.config.keep_alive_interval,
+                disable_keep_alive: self.config.disable_keep_alive,
+            },
+            state_store,
+        )
+        .await?;
+        Ok(())
     }
 
     async fn run(self) -> Result<()> {
@@ -563,13 +606,14 @@ impl Engine {
             .await?,
         );
 
-        // Restore saved proxy selections if store-selected is enabled
+        // Restore saved proxy selections if store-selected is enabled.
+        // mihomo compat: store-selected defaults to true when unset (config.go:568).
         let store_selected = self
             .config
             .profile
             .as_ref()
             .map(|p| p.store_selected)
-            .unwrap_or(false);
+            .unwrap_or(true);
         if store_selected {
             let saved = store::load_selected(&home_dir);
             if !saved.is_empty() {

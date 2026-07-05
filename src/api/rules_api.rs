@@ -30,7 +30,7 @@ pub async fn get_rules(State(state): State<ApiState>) -> Json<Value> {
                 .unwrap_or((0, false));
             json!({
                 "index": i,
-                "type": r.rule_type,
+                "type": crate::rules::rule_type_display(&r.rule_type),
                 "payload": r.payload,
                 "proxy": r.target,
                 "size": size,

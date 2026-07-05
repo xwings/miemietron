@@ -15,6 +15,7 @@ vmess = []
 [dependencies]
 # Async runtime
 tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"   # sync::PollSender for the smoltcp stack's async streams
 
 # TLS & Crypto
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
@@ -33,6 +34,7 @@ chacha20 = "0.9"
 aes = "0.8"
 cipher = "0.4"
 blake3 = "1"
+argon2 = "0.5"
 rand = "0.8"
 digest = "0.10"
 webpki-roots = "0.26"

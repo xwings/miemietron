@@ -179,7 +179,8 @@ impl OutboundHandler for TrojanOutbound {
     }
 
     fn proto(&self) -> &str {
-        "trojan"
+        // mihomo compat: AdapterType.String() == "Trojan" (adapters.go:206).
+        "Trojan"
     }
 
     fn supports_udp(&self) -> bool {

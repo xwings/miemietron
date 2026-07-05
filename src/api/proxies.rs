@@ -5,7 +5,6 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::collections::HashMap;
 use std::time::Instant;
 
 use super::ApiState;
@@ -45,6 +44,19 @@ fn proxy_extra(state: &ApiState, name: &str) -> Value {
     Value::Object(extras.into_iter().collect())
 }
 
+/// Build the full JSON object for a single (non-group) proxy, matching mihomo's
+/// `adapter.Proxy.MarshalJSON` fields that dashboards read.
+fn proxy_json(state: &ApiState, name: &str, proxy_type: &str, udp: bool) -> Value {
+    json!({
+        "name": name,
+        "type": proxy_type,
+        "udp": udp,
+        "history": proxy_history(state, name),
+        "extra": proxy_extra(state, name),
+        "alive": proxy_alive(state, name),
+    })
+}
+
 pub async fn get_proxies(State(state): State<ApiState>) -> Json<Value> {
     // mihomo compat: ordered map — GLOBAL first, then groups (config order),
     // then DIRECT/REJECT, then individual proxies.
@@ -63,23 +75,27 @@ pub async fn get_proxies(State(state): State<ApiState>) -> Json<Value> {
         }
     }
 
-    // 1. GLOBAL first
-    let first_group = group_names.first().cloned().unwrap_or_default();
-    proxies.insert(
-        "GLOBAL".to_string(),
-        json!({
-            "name": "GLOBAL",
-            "type": "Selector",
-            "udp": true,
-            "history": proxy_history(&state, "GLOBAL"),
-            "all": group_names,
-            "now": first_group,
-            "alive": proxy_alive(&state, "GLOBAL"),
-        }),
-    );
+    // 1. GLOBAL first — a real live selector (see ProxyManager GLOBAL setup).
+    if let Some(global) = live_groups.get("GLOBAL") {
+        proxies.insert(
+            "GLOBAL".to_string(),
+            json!({
+                "name": "GLOBAL",
+                "type": global.group_type(),
+                "udp": true,
+                "history": proxy_history(&state, "GLOBAL"),
+                "all": global.all(),
+                "now": global.now(),
+                "alive": proxy_alive(&state, "GLOBAL"),
+            }),
+        );
+    }
 
-    // 2. Proxy groups in config order
+    // 2. Proxy groups in config order (GLOBAL already emitted above)
     for name in &group_names {
+        if name == "GLOBAL" {
+            continue;
+        }
         if let Some(group) = live_groups.get(name) {
             proxies.insert(
                 name.clone(),
@@ -449,13 +465,26 @@ pub async fn delete_proxy(State(state): State<ApiState>, Path(name): Path<String
 }
 
 pub async fn get_groups(State(state): State<ApiState>) -> Json<Value> {
-    let groups: HashMap<String, Value> = state
-        .app
-        .proxy_manager()
-        .list_live_groups()
-        .iter()
-        .map(|(name, group)| {
-            let val = json!({
+    // mihomo compat: `groups.go:getGroups` returns `{"proxies": [<group>...]}`
+    // as an ARRAY (a `[]C.Proxy`), in tunnel-proxy order. Dashboards iterate it
+    // as a list — an object map breaks metacubexd's group page.
+    let pm = state.app.proxy_manager();
+    let live_groups = pm.list_live_groups();
+    let config = state.app.config();
+
+    // Config order for groups, then any live groups not in config.
+    let mut group_names: Vec<String> =
+        config.proxy_groups.iter().map(|g| g.name.clone()).collect();
+    for (name, _) in live_groups.iter() {
+        if !group_names.contains(name) {
+            group_names.push(name.clone());
+        }
+    }
+
+    let mut groups: Vec<Value> = Vec::with_capacity(group_names.len());
+    for name in &group_names {
+        if let Some(group) = live_groups.get(name) {
+            groups.push(json!({
                 "name": name,
                 "type": group.group_type(),
                 "udp": true,
@@ -463,10 +492,9 @@ pub async fn get_groups(State(state): State<ApiState>) -> Json<Value> {
                 "all": group.all(),
                 "now": group.now(),
                 "alive": proxy_alive(&state, name),
-            });
-            (name.clone(), val)
-        })
-        .collect();
+            }));
+        }
+    }
 
     Json(json!({ "proxies": groups }))
 }
@@ -579,41 +607,85 @@ pub async fn get_group_delay(
     (StatusCode::OK, Json(Value::Object(result)))
 }
 
-pub async fn get_providers(State(state): State<ApiState>) -> Json<Value> {
-    let providers: HashMap<String, Value> = state
+/// Build the list of all non-group proxy objects (the members of the reserved
+/// `default` provider). mihomo's `default` Compatible provider contains every
+/// configured proxy (`config.go:961`, `provider.ReservedName`).
+fn all_proxy_objects(state: &ApiState) -> Vec<Value> {
+    state
         .app
         .proxy_manager()
-        .list_provider_configs()
+        .list_proxies()
         .iter()
-        .map(|(name, config)| {
-            let val = json!({
-                "name": name,
-                "type": config.provider_type,
-                "vehicleType": if config.url.is_some() { "HTTP" } else { "File" },
-                "updatedAt": "",
-                "subscriptionInfo": {},
-                "proxies": [],
-            });
-            (name.clone(), val)
-        })
+        .map(|p| proxy_json(state, &p.name, &p.proxy_type, p.udp))
+        .collect()
+}
+
+pub async fn get_providers(State(state): State<ApiState>) -> Json<Value> {
+    let mut providers = serde_json::Map::new();
+
+    // mihomo compat: the reserved `default` Compatible provider holds every
+    // proxy. yacd/metacubexd enumerate all proxies through it, so it must exist
+    // with `type: "Proxy"` and a populated `proxies` array (provider.go:35-44).
+    providers.insert(
+        "default".to_string(),
+        json!({
+            "name": "default",
+            "type": "Proxy",
+            "vehicleType": "Compatible",
+            "proxies": all_proxy_objects(&state),
+        }),
+    );
+
+    for (name, config) in state.app.proxy_manager().list_provider_configs().iter() {
+        providers.insert(
+            name.clone(),
+            provider_json(&state, name, config),
+        );
+    }
+    Json(json!({ "providers": Value::Object(providers) }))
+}
+
+/// Build a proxy-provider JSON object matching mihomo's marshaled shape:
+/// `type` is always `"Proxy"`; `vehicleType` reflects the source; `proxies` is
+/// the provider's member proxies (provider.go:130-141).
+fn provider_json(
+    state: &ApiState,
+    name: &str,
+    config: &crate::config::proxy::ProxyProviderConfig,
+) -> Value {
+    let members: Vec<Value> = state
+        .app
+        .proxy_manager()
+        .provider_proxy_infos(name)
+        .into_iter()
+        .map(|p| proxy_json(state, &p.name, &p.proxy_type, p.udp))
         .collect();
-    Json(json!({ "providers": providers }))
+    json!({
+        "name": name,
+        "type": "Proxy",
+        "vehicleType": if config.url.is_some() { "HTTP" } else { "File" },
+        "updatedAt": "",
+        "subscriptionInfo": {},
+        "proxies": members,
+    })
 }
 
 pub async fn get_provider(
     State(state): State<ApiState>,
     Path(name): Path<String>,
 ) -> Result<Json<Value>, StatusCode> {
+    // mihomo compat: the reserved `default` provider is addressable by name.
+    if name == "default" {
+        return Ok(Json(json!({
+            "name": "default",
+            "type": "Proxy",
+            "vehicleType": "Compatible",
+            "proxies": all_proxy_objects(&state),
+        })));
+    }
     let proxy_manager = state.app.proxy_manager();
     if let Some(config) = proxy_manager.get_provider_config(&name) {
-        Ok(Json(json!({
-            "name": name,
-            "type": config.provider_type,
-            "vehicleType": if config.url.is_some() { "HTTP" } else { "File" },
-            "updatedAt": "",
-            "subscriptionInfo": {},
-            "proxies": [],
-        })))
+        Ok(Json(provider_json(&state, &name, config)))
     } else {
         Err(StatusCode::NOT_FOUND)
     }

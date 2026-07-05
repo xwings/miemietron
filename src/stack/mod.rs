@@ -1,10 +1,11 @@
 // Network stack abstraction.
 //
 // The "system" stack uses the kernel's TCP/IP via iptables REDIRECT + SO_ORIGINAL_DST.
-// The "gvisor" stack uses a user-space TCP/IP stack (smoltcp) to process raw IP packets.
-// The "mixed" stack uses gvisor for TCP and system for UDP.
+// The "gvisor" (and "mixed") stack uses a real user-space TCP/IP stack (smoltcp,
+// in `smol`) that terminates TCP/UDP from the TUN device — the faithful
+// equivalent of mihomo's sing-tun gVisor stack.
 
-pub mod gvisor;
+pub mod smol;
 pub mod system;
 
 use anyhow::Result;

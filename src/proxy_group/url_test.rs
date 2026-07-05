@@ -399,6 +399,7 @@ pub(crate) async fn measure_unified_delay(
         parsed.path()
     };
 
+    let is_https = parsed.scheme() == "https";
     let target = Address::domain(&host, port);
     let start = Instant::now();
 
@@ -406,28 +407,55 @@ pub(crate) async fn measure_unified_delay(
     // The caller (health_check) wraps with its own configurable timeout, so this is a safety net.
     let result = tokio::time::timeout(Duration::from_secs(5), async {
         // Connect through the proxy
-        let mut stream = handler.connect_stream(&target, dns).await?;
+        let stream = handler.connect_stream(&target, dns).await?;
 
-        // Send HTTP HEAD request
-        // mihomo compat: uses Go's http.NewRequest(HEAD, url, nil) which adds standard headers
+        // mihomo compat: adapter.go URLTest uses a real net/http client that
+        // performs the TLS handshake for https:// test URLs. Sending a plaintext
+        // HEAD to a :443 endpoint makes the TLS server reply with an alert, which
+        // we would misread as "dead" and mark every node down. So for https we
+        // must wrap the proxied stream in TLS before the HEAD.
         let req = format!(
             "HEAD {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: clash\r\nConnection: close\r\n\r\n"
         );
-        stream.write_all(req.as_bytes()).await?;
-
-        // Read until we get the status line
-        let mut buf = [0u8; 256];
-        let n = stream.read(&mut buf).await?;
-
-        let response = String::from_utf8_lossy(&buf[..n]);
-        if !response.starts_with("HTTP/") {
+        let ok = if is_https {
+            let provider = rustls::crypto::ring::default_provider();
+            let tls_connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(
+                rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(provider))
+                    .with_safe_default_protocol_versions()
+                    .expect("tls config")
+                    .dangerous()
+                    .with_custom_certificate_verifier(std::sync::Arc::new(
+                        crate::transport::tls::NoVerifier::new(),
+                    ))
+                    .with_no_client_auth(),
+            ));
+            let server_name = rustls::pki_types::ServerName::try_from(host.clone())
+                .unwrap_or_else(|_| {
+                    rustls::pki_types::ServerName::try_from("localhost".to_string()).unwrap()
+                });
+            let mut tls_stream = tls_connector.connect(server_name, stream).await?;
+            tls_stream.write_all(req.as_bytes()).await?;
+            let mut buf = [0u8; 256];
+            let n = tls_stream.read(&mut buf).await?;
+            let response = String::from_utf8_lossy(&buf[..n]);
+            let ok = response.starts_with("HTTP/");
+            let _ = tls_stream.shutdown().await;
+            ok
+        } else {
+            let mut stream = stream;
+            stream.write_all(req.as_bytes()).await?;
+            let mut buf = [0u8; 256];
+            let n = stream.read(&mut buf).await?;
+            let response = String::from_utf8_lossy(&buf[..n]);
+            let ok = response.starts_with("HTTP/");
             let _ = stream.shutdown().await;
+            ok
+        };
+
+        if !ok {
             return Err(anyhow::anyhow!("invalid HTTP response"));
         }
-
-        let elapsed = start.elapsed().as_millis() as u64;
-        let _ = stream.shutdown().await;
-        Ok::<u64, anyhow::Error>(elapsed)
+        Ok::<u64, anyhow::Error>(start.elapsed().as_millis() as u64)
     })
     .await
     .map_err(|_| anyhow::anyhow!("connect timeout"))??;

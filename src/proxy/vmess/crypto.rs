@@ -29,7 +29,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-use super::header::VmessSecurity;
+use super::header::{resp_header_keys, sha256_16, RespHeaderKeys, VmessSecurity};
 
 /// Maximum VMess chunk payload size (V2Ray uses 2^14 - 1 = 16383, but we
 /// align to common practice of 16384 bytes).
@@ -158,11 +158,18 @@ pin_project! {
         write_count: u16,
         write_state: WriteState,
 
-        // Read-side state
+        // Read-side state (data chunks).
         read_cipher: VmessCipher,
         read_iv: [u8; 16],
         read_count: u16,
         read_state: ReadState,
+
+        // Response-header AEAD keys (AES-128-GCM, fixed nonces, no AAD).
+        // mihomo compat: separate from the body cipher (conn.go recvResponse).
+        resp_header_len_cipher: Aes128Gcm,
+        resp_header_len_nonce: [u8; 12],
+        resp_header_payload_cipher: Aes128Gcm,
+        resp_header_payload_nonce: [u8; 12],
 
         // Read buffer: accumulates encrypted bytes from the wire.
         read_raw: Vec<u8>,
@@ -192,25 +199,20 @@ impl<T> VmessStream<T> {
         response_auth: u8,
         security: VmessSecurity,
     ) -> Self {
-        // For the response, V2Ray uses:
-        //   response_key = MD5(body_key)
-        //   response_iv = MD5(body_iv)
-        let response_key = {
-            let mut h = Md5::new();
-            h.update(body_key);
-            let r = h.finalize();
-            let mut k = [0u8; 16];
-            k.copy_from_slice(&r);
-            k
-        };
-        let response_iv = {
-            let mut h = Md5::new();
-            h.update(body_iv);
-            let r = h.finalize();
-            let mut k = [0u8; 16];
-            k.copy_from_slice(&r);
-            k
-        };
+        // mihomo compat (conn.go newConn, AEAD branch):
+        //   respBodyKey = SHA256(reqBodyKey)[:16]
+        //   respBodyIV  = SHA256(reqBodyIV)[:16]
+        // These key both the response-header AEAD and the data-chunk reader.
+        let response_key = sha256_16(&body_key);
+        let response_iv = sha256_16(&body_iv);
+
+        // Response-header AEAD is always AES-128-GCM regardless of body security.
+        let RespHeaderKeys {
+            len_key,
+            len_iv,
+            payload_key,
+            payload_iv,
+        } = resp_header_keys(&response_key, &response_iv);
 
         Self {
             inner,
@@ -222,6 +224,12 @@ impl<T> VmessStream<T> {
             read_iv: response_iv,
             read_count: 0,
             read_state: ReadState::ReadResponseHeader,
+            resp_header_len_cipher: Aes128Gcm::new_from_slice(&len_key)
+                .expect("AES-128-GCM key length valid"),
+            resp_header_len_nonce: len_iv,
+            resp_header_payload_cipher: Aes128Gcm::new_from_slice(&payload_key)
+                .expect("AES-128-GCM key length valid"),
+            resp_header_payload_nonce: payload_iv,
             read_raw: Vec::new(),
             read_plaintext: Vec::new(),
             read_plaintext_pos: 0,
@@ -286,27 +294,18 @@ impl<T: AsyncRead + AsyncWrite + Unpin> AsyncRead for VmessStream<T> {
                 }
 
                 ReadState::ReadResponseHeader => {
-                    // AEAD response header: 4 bytes encrypted with AES-128-GCM.
-                    // Actually the response header in AEAD mode is:
-                    //   [response_auth(1) + option(1) + cmd_len(1) + cmd(cmd_len)]
-                    // encrypted as a single AEAD block. The length is prepended as
-                    // 2 bytes + 16 byte tag, then payload + 16 byte tag.
-                    // For simplicity (most servers send a minimal response):
-                    // total = 4 bytes plaintext, encrypted as (2+16) + (4+16) = 38 bytes.
-                    //
-                    // V2Ray AEAD response: the response header is encrypted using
-                    // response_key and response_iv similar to the request header AEAD
-                    // construction. The exact format:
-                    //   [Header Length: 2 bytes AES-128-GCM + 16 tag] = 18 bytes
-                    //   [Header Payload: N bytes AES-128-GCM + 16 tag]
-                    //
-                    // We need to read 18 bytes first (encrypted length + tag), decrypt
-                    // to get the payload length, then read that many + 16 bytes.
+                    // mihomo compat (conn.go recvResponse, AEAD branch):
+                    //   [Encrypted Header Length: 2 + 16 = 18 bytes]  (AES-128-GCM,
+                    //     key/nonce = kdf(respBodyKey/IV, "AEAD Resp Header Len ..."),
+                    //     no AAD, FIXED nonce)
+                    //   [Encrypted Header Payload: len + 16 bytes]    (AES-128-GCM,
+                    //     key/nonce = kdf(respBodyKey/IV, "AEAD Resp Header ..."),
+                    //     no AAD, FIXED nonce)
+                    // The response header is independent of the data-chunk cipher
+                    // and does not advance the data-chunk counter.
+                    const LEN_BLOCK: usize = 18;
 
-                    let tag_size = this.read_cipher.tag_size();
-                    let length_block_size = 2 + tag_size;
-
-                    match try_fill(this.inner.as_mut(), cx, this.read_raw, length_block_size) {
+                    match try_fill(this.inner.as_mut(), cx, this.read_raw, LEN_BLOCK) {
                         Poll::Ready(Ok(true)) => {}
                         Poll::Ready(Ok(false)) => {
                             return Poll::Ready(Err(io::Error::new(
@@ -318,13 +317,19 @@ impl<T: AsyncRead + AsyncWrite + Unpin> AsyncRead for VmessStream<T> {
                         Poll::Pending => return Poll::Pending,
                     }
 
-                    let resp_nonce = build_nonce(*this.read_count, this.read_iv);
-                    *this.read_count = this.read_count.wrapping_add(1);
-
                     let length_plaintext = this
-                        .read_cipher
-                        .decrypt(&resp_nonce, &this.read_raw[..length_block_size])?;
-                    this.read_raw.drain(..length_block_size);
+                        .resp_header_len_cipher
+                        .decrypt(
+                            AesNonce::from_slice(this.resp_header_len_nonce),
+                            &this.read_raw[..LEN_BLOCK],
+                        )
+                        .map_err(|e| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!("VMess response length decrypt failed: {e}"),
+                            )
+                        })?;
+                    this.read_raw.drain(..LEN_BLOCK);
 
                     if length_plaintext.len() < 2 {
                         return Poll::Ready(Err(io::Error::new(
@@ -335,7 +340,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> AsyncRead for VmessStream<T> {
 
                     let payload_len =
                         u16::from_be_bytes([length_plaintext[0], length_plaintext[1]]) as usize;
-                    let payload_block_size = payload_len + tag_size;
+                    let payload_block_size = payload_len + 16;
 
                     match try_fill(this.inner.as_mut(), cx, this.read_raw, payload_block_size) {
                         Poll::Ready(Ok(true)) => {}
@@ -349,20 +354,38 @@ impl<T: AsyncRead + AsyncWrite + Unpin> AsyncRead for VmessStream<T> {
                         Poll::Pending => return Poll::Pending,
                     }
 
-                    let resp_payload_nonce = build_nonce(*this.read_count, this.read_iv);
-                    *this.read_count = this.read_count.wrapping_add(1);
-
                     let payload_plaintext = this
-                        .read_cipher
-                        .decrypt(&resp_payload_nonce, &this.read_raw[..payload_block_size])?;
+                        .resp_header_payload_cipher
+                        .decrypt(
+                            AesNonce::from_slice(this.resp_header_payload_nonce),
+                            &this.read_raw[..payload_block_size],
+                        )
+                        .map_err(|e| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!("VMess response payload decrypt failed: {e}"),
+                            )
+                        })?;
                     this.read_raw.drain(..payload_block_size);
 
-                    // Validate response_auth.
-                    if !payload_plaintext.is_empty() && payload_plaintext[0] != *this.response_auth
-                    {
+                    // mihomo: buf[0] != respV => error; buf[2] != 0 => dynamic
+                    // port unsupported.
+                    if payload_plaintext.len() < 4 {
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "VMess response header too short",
+                        )));
+                    }
+                    if payload_plaintext[0] != *this.response_auth {
                         return Poll::Ready(Err(io::Error::new(
                             io::ErrorKind::InvalidData,
                             "VMess response auth mismatch",
+                        )));
+                    }
+                    if payload_plaintext[2] != 0 {
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "VMess dynamic port is not supported",
                         )));
                     }
 

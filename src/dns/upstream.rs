@@ -273,57 +273,40 @@ pub async fn resolve(domain: &str, config: &DnsConfig) -> Result<(IpAddr, u32)> 
 /// Check whether the primary DNS result looks suspicious and fallback should
 /// be used.
 ///
-/// The response is considered suspicious if:
-/// - The IP is a private/reserved address for what appears to be a public domain.
-/// - The IP falls within the fake-ip CIDR range.
-/// - The fallback-filter config rules trigger (geoip, ipcidr, domain).
+/// Mirrors mihomo's `Resolver.shouldIPFallback` composed of the configured
+/// `fallback-filter` matchers (`dns/resolver.go:119-137`, `rules/common/geoip.go`
+/// `dnsFallbackFilter.MatchIp`):
+/// - LAN / private / reserved IPs never trigger fallback (`geoip.go:127-130`).
+/// - GeoIP filter triggers fallback when the IP's country does **not** match
+///   `geoip-code` (`geoip.go:144` `return !slices.Contains(codes, g.country)`),
+///   which includes the poisoned-foreign and unknown-country cases.
+/// - IP-CIDR filter triggers fallback when the IP falls inside a listed range.
+/// - Domain filter triggers fallback for matched domains (mihomo handles this as
+///   a "query only fallback" short-circuit; the resulting answer is the same).
 fn should_use_fallback(ip: &IpAddr, domain: &str, config: &DnsConfig) -> bool {
-    // Never fallback for local-looking domains
-    if domain.ends_with(".local")
-        || domain.ends_with(".lan")
-        || domain.ends_with(".internal")
-        || domain == "localhost"
-    {
-        return false;
-    }
-
-    // Check if the IP is in the fake-ip range
-    if let IpAddr::V4(v4) = ip {
-        let fake_range = &config.fake_ip_range;
-        if !fake_range.is_empty() {
-            if let Ok((base, prefix_len)) = parse_cidr_simple(fake_range) {
-                let mask = if prefix_len >= 32 {
-                    0xFFFF_FFFFu32
-                } else {
-                    !((1u32 << (32 - prefix_len)) - 1)
-                };
-                let ip_u32 = u32::from(*v4);
-                if ip_u32 & mask == base & mask {
-                    return true;
-                }
-            }
-        }
-    }
-
-    // Check if the IP is a private/reserved address
+    // mihomo compat: dnsFallbackFilter.MatchIp returns false for LAN IPs
+    // ("compatible with original behavior", geoip.go:127-130) — a private answer
+    // from the trusted main resolver is kept, never overridden by fallback.
     if is_private_ip(ip) {
-        return true;
+        return false;
     }
 
     // Check fallback-filter rules if present
     if let Some(ref filter) = config.fallback_filter {
-        // GeoIP filter: if the resolved IP's country matches geoip_code,
-        // the domain is likely being DNS-poisoned to a domestic IP.
-        // Use fallback to get the real (overseas) answer.
+        // GeoIP filter: fallback when the resolved IP's country does NOT match
+        // geoip_code. A domestic (matching-country) answer from the main
+        // nameserver is trusted; a foreign or unknown-country answer is treated
+        // as potentially GFW-poisoned and re-queried through the fallback tier.
         if filter.geoip && !filter.geoip_code.is_empty() {
-            if let Some(country) = DNS_GEOIP.lookup_country(ip) {
-                if country.eq_ignore_ascii_case(&filter.geoip_code) {
-                    debug!(
-                        "DNS fallback triggered: {} resolved to {} (country {}), matches geoip filter {}",
-                        domain, ip, country, filter.geoip_code
-                    );
-                    return true;
-                }
+            let matches_code = DNS_GEOIP
+                .lookup_country(ip)
+                .is_some_and(|country| country.eq_ignore_ascii_case(&filter.geoip_code));
+            if !matches_code {
+                debug!(
+                    "DNS fallback triggered: {} resolved to {} (country not {}), using fallback",
+                    domain, ip, filter.geoip_code
+                );
+                return true;
             }
         }
 
@@ -931,43 +914,61 @@ mod tests {
     }
 
     #[test]
-    fn should_use_fallback_local_domain() {
-        let config = DnsConfig::default();
-        let ip = IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4));
-        // Local-looking domains should never trigger fallback.
-        assert!(!should_use_fallback(&ip, "router.local", &config));
-        assert!(!should_use_fallback(&ip, "myhost.lan", &config));
-        assert!(!should_use_fallback(&ip, "localhost", &config));
-        assert!(!should_use_fallback(&ip, "internal.internal", &config));
-    }
-
-    #[test]
-    fn should_use_fallback_private_ip() {
-        let config = DnsConfig::default();
-        // A private IP for a public domain is suspicious.
-        let ip = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1));
-        assert!(should_use_fallback(&ip, "google.com", &config));
-    }
-
-    #[test]
-    fn should_use_fallback_fake_ip_range() {
+    fn should_use_fallback_private_ip_never() {
+        // mihomo compat: dnsFallbackFilter.MatchIp returns false for LAN IPs
+        // (geoip.go:127-130) even when a geoip filter is active — a private
+        // answer from the trusted main resolver is kept, never overridden.
         let config = DnsConfig {
-            fake_ip_range: "198.18.0.0/15".to_string(),
+            fallback_filter: Some(crate::config::dns::FallbackFilter {
+                geoip: true,
+                geoip_code: "CN".to_string(),
+                ..Default::default()
+            }),
             ..Default::default()
         };
-        // An IP inside the fake-ip range is suspicious.
-        let ip = IpAddr::V4(Ipv4Addr::new(198, 18, 1, 1));
+        let ip = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1));
+        assert!(!should_use_fallback(&ip, "google.com", &config));
+    }
+
+    #[test]
+    fn should_use_fallback_geoip_unknown_country() {
+        // With a geoip filter active, an IP whose country does not match the
+        // configured code (here: unknown, no mmdb loaded in tests) triggers
+        // fallback — mihomo geoip.go:144 `!slices.Contains(codes, g.country)`.
+        let config = DnsConfig {
+            fallback_filter: Some(crate::config::dns::FallbackFilter {
+                geoip: true,
+                geoip_code: "CN".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let ip = IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8));
         assert!(should_use_fallback(&ip, "google.com", &config));
+    }
+
+    #[test]
+    fn should_use_fallback_ipcidr_match() {
+        let config = DnsConfig {
+            fallback_filter: Some(crate::config::dns::FallbackFilter {
+                ipcidr: vec!["8.8.8.0/24".to_string()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let inside = IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8));
+        let outside = IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1));
+        assert!(should_use_fallback(&inside, "example.com", &config));
+        assert!(!should_use_fallback(&outside, "example.com", &config));
     }
 
     #[test]
     fn should_use_fallback_public_ip_no_filter() {
         let config = DnsConfig {
-            fake_ip_range: "198.18.0.0/15".to_string(),
             fallback_filter: None,
             ..Default::default()
         };
-        // A public, non-fake IP with no fallback filter should not trigger.
+        // A public IP with no fallback filter should not trigger.
         let ip = IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8));
         assert!(!should_use_fallback(&ip, "example.com", &config));
     }

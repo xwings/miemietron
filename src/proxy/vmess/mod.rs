@@ -193,7 +193,8 @@ impl OutboundHandler for VmessOutbound {
     }
 
     fn proto(&self) -> &str {
-        "vmess"
+        // mihomo compat: AdapterType.String() == "Vmess" (adapters.go:201).
+        "Vmess"
     }
 
     fn supports_udp(&self) -> bool {

@@ -318,13 +318,27 @@ fn domain_matches_list(domain: &str, list: &[String]) -> bool {
     false
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct ProfileConfig {
-    #[serde(default)]
+    // mihomo compat: `store-selected` defaults to true (config.go:568-570).
+    #[serde(default = "default_true")]
     pub store_selected: bool,
     #[serde(default)]
     pub store_fake_ip: bool,
+}
+
+impl Default for ProfileConfig {
+    fn default() -> Self {
+        Self {
+            store_selected: true,
+            store_fake_ip: false,
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -360,7 +374,17 @@ impl MiemieConfig {
 
     /// Parse a config from a YAML string.
     pub fn parse_str(yaml: &str) -> Result<Self> {
-        let config: Self = serde_yaml::from_str(yaml)
+        // mihomo compat: mihomo parses with gopkg.in/yaml.v3, which resolves
+        // merge keys (`<<: *anchor`) natively. serde_yaml does not unless we
+        // call `apply_merge` on the raw value first — without this, Chinese
+        // subscription/OpenClash templates that share group/provider defaults
+        // via `<<:` silently lose the merged fields.
+        let mut value: serde_yaml::Value = serde_yaml::from_str(yaml)
+            .map_err(|e| anyhow::anyhow!("failed to parse config: {e}"))?;
+        value
+            .apply_merge()
+            .map_err(|e| anyhow::anyhow!("failed to resolve YAML merge keys: {e}"))?;
+        let config: Self = serde_yaml::from_value(value)
             .map_err(|e| anyhow::anyhow!("failed to parse config: {e}"))?;
         config.validate_listeners()?;
         Ok(config)
@@ -636,5 +660,32 @@ listeners:
                 "wrong error for `{yaml}`: {msg}"
             );
         }
+    }
+
+    #[test]
+    fn yaml_merge_keys_resolved() {
+        // mihomo compat: `<<: *anchor` merge keys must be resolved (yaml.v3
+        // behavior). The merged `type`/`server`/`port` must appear on each proxy.
+        let yaml = r#"
+pd: &pd
+  type: ss
+  cipher: aes-128-gcm
+  password: pw
+proxies:
+  - <<: *pd
+    name: node-a
+    server: 1.1.1.1
+    port: 8388
+  - <<: *pd
+    name: node-b
+    server: 2.2.2.2
+    port: 8389
+"#;
+        let cfg = MiemieConfig::parse_str(yaml).expect("merge keys must resolve");
+        assert_eq!(cfg.proxies.len(), 2);
+        assert_eq!(cfg.proxies[0].proxy_type, "ss");
+        assert_eq!(cfg.proxies[0].name, "node-a");
+        assert_eq!(cfg.proxies[1].proxy_type, "ss");
+        assert_eq!(cfg.proxies[1].cipher.as_deref(), Some("aes-128-gcm"));
     }
 }
