@@ -184,7 +184,7 @@ impl AsyncWrite for GrpcStream {
         let data_len = buf.len();
         let mut frame = BytesMut::with_capacity(6 + 5 + data_len);
         frame.put_u8(0x00); // compressed = false
-        // Reserve the 4-byte grpc length; fill after we know varLen.
+                            // Reserve the 4-byte grpc length; fill after we know varLen.
         let grpc_len_pos = frame.len();
         frame.put_u32(0);
         frame.put_u8(0x0A); // protobuf field #1, wire type 2
@@ -350,7 +350,10 @@ mod tests {
     fn frame_matches_mihomo_layout() {
         // payload "hi" (len 2): 0x00 | 00000004 | 0x0A | 0x02 | "hi"
         let frame = encode_frame(b"hi");
-        assert_eq!(&frame[..], &[0x00, 0x00, 0x00, 0x00, 0x04, 0x0A, 0x02, b'h', b'i']);
+        assert_eq!(
+            &frame[..],
+            &[0x00, 0x00, 0x00, 0x00, 0x04, 0x0A, 0x02, b'h', b'i']
+        );
     }
 
     #[test]

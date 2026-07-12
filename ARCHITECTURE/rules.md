@@ -21,12 +21,16 @@ added to fix the fake-ip domestic-routing leak and is covered by five new tests.
 | `src/rules/domain.rs` | `DomainMatcher` — domain/suffix/keyword tree for providers |
 | `src/rules/ipcidr.rs` | Namespace placeholder; IP-CIDR handled inline by `PreParsedCidr` in `mod.rs` |
 | `src/rules/process.rs` | `lookup_process` — /proc socket→PID→name/path resolution |
-| `src/rules/provider.rs` | `RuleProvider` — remote ruleset fetch + auto-update |
+| `src/rules/provider.rs` | `RuleProvider` — remote ruleset fetch + auto-update (yaml/text/mrs) |
+| `src/rules/mrs.rs` | MRS (zstd) reader — decodes mihomo's succinct-trie `DomainSet` and enumerates its patterns at load time |
+| `src/rules/geodata.rs` | Geo database auto-download (missing Country.mmdb/GeoSite.dat fetched from geox-url at engine build) |
 
 ## Key Types and Entry Points
 - `src/rules/mod.rs:35` - `RuleMetadata` - per-connection match input (domain, dst_ip, src_ip, ports, process, in_port).
-- `src/rules/mod.rs:523` - `match_rules_detailed` - sequential first-match scan; returns `(Action, rule_type, payload)`, defaults to DIRECT/`MATCH`.
-- `src/rules/mod.rs:553` - `match_rules` - thin wrapper returning just the `Action`.
+- `src/rules/mod.rs` - `match_rules_detailed` - sequential first-match scan; returns `(Action, rule_type, payload)`, defaults to DIRECT/`MATCH`.
+- `src/rules/mod.rs` - `match_rules_detailed_filtered` - same scan with an optional adapter filter; the UDP path passes a closure so a matched rule whose adapter can't do UDP is skipped and evaluation continues (mihomo `tunnel.go match()` `!adapter.SupportUDP()` → continue).
+- `src/rules/mod.rs` - `match_rules` - thin wrapper returning just the `Action`.
+- `src/rules/mod.rs` - `provider_domain_match` / `ProviderDomainIndex` - per-provider domain lookup used by `rule-set:<name>` entries in `dns.fake-ip-filter` (see [dns.md](dns.md)).
 - `src/rules/mod.rs:571` - `needs_ip_resolution` - **new**: true when the scan reaches a dst-IP rule before any earlier match, signalling the caller to resolve a real IP (mihomo lazy `ResolveIP`).
 - `src/rules/mod.rs:597` - `match_single_rule` - per-rule-type dispatch (MATCH/NETWORK/SRC-PORT/PROCESS-*/GEOIP/IP-CIDR/...).
 - `src/rules/mod.rs:1183` - `target_to_action` - maps target string → `Action` (DIRECT/REJECT/REJECT-DROP/Proxy).
@@ -44,6 +48,9 @@ added to fix the fake-ip domestic-routing leak and is covered by five new tests.
 - Integration: `timeout 30 target/debug/miemietron -d <openclash-dir> -f <config.yaml>`, then `curl` a domestic (e.g. `GEOIP,CN,DIRECT`) and a foreign URL through `127.0.0.1:7890` and confirm via `GET /connections` that the rule + chain match expectations.
 
 ## Open Gaps / Roadmap
+- GeoIP databases: all three mmdb layouts are supported (GeoLite2 struct, sing-geoip string, Meta-geoip0 string/array — component/mmdb/reader.go), selected by the mmdb `database_type` metadata; Meta multi-code records match if ANY code equals the payload. Missing databases are auto-downloaded at engine construction when a GEOIP/GEOSITE/IP-ASN rule references them (`src/rules/geodata.rs`, mihomo component/geodata/init.go; download failure is a loud error, not a boot abort).
+- Parser is a strict port of base.go ParseRulePayload: comma-payload types (DOMAIN-REGEX/PROCESS-*-REGEX/logic/SUB-RULE) take the LAST item as target; SUB-RULE payload is the gating condition and target is the group name; logic sub-rules parse through the full parser (nested logic, params, case-insensitive process matching); invalid port/UID/DSCP/CIDR/IP-SUFFIX payloads fail the config load. IP-SUFFIX matches TRAILING bits (ipsuffix.go). `src` param flips IP rules to the source address and implies no-resolve. RULE-SET expands per reference with that reference's target and params. GEOSITE supports `@attribute` filtering and `!` negation. An unmatched connection reports an empty rule (nil rule in mihomo), shown as "doesn't match any rule" in the log.
 - Rule-provider runtime reload is out of scope: `PUT /providers/rules/:name` returns 503; providers are merged at construction and re-ingested only on SIGHUP/config reload.
-- MRS (zstd binary) rule-provider format is out of scope; YAML/text formats only.
+- MRS rule providers: `domain` behavior is implemented (`src/rules/mrs.rs` decodes the zstd stream, validates the `MRS\x01` magic + behavior byte, reads the succinct-trie `DomainSet`, and enumerates its `+.example.com`-style patterns into the normal domain-behavior ingestion — the matcher itself is not ported, so matching semantics stay in one place). `ipcidr` mrs errors at provider load. Verified against the real meta-rules-dat `cn.mrs` (223,996 rules, count matches the file header).
+- Provider load failure is a warn + skip, NOT a config-load failure like mihomo — a `rule-set:` fake-ip-filter entry referencing a never-loaded provider logs an error at wiring time and stays inert.
 - `GET /providers/rules` ruleCount/updatedAt are a load-time snapshot and don't change between reloads.

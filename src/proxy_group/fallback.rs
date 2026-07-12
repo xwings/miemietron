@@ -10,7 +10,6 @@ use crate::dns::DnsResolver;
 use crate::proxy::OutboundHandler;
 
 use super::proxy_state::ProxyStateStore;
-use super::url_test::measure_unified_delay;
 use super::{HealthCheckOpts, ProxyGroup};
 
 /// Fallback group: pick the first proxy that is alive.
@@ -24,6 +23,8 @@ pub struct FallbackGroup {
     proxy_names: Vec<String>,
     test_url: String,
     interval: Duration,
+    /// mihomo compat: expected-status ranges for the health check.
+    expected_status: Option<Vec<(u16, u16)>>,
     /// Centralized state store for delay/alive tracking.
     state_store: Arc<ProxyStateStore>,
     /// mihomo compat: force-pinned selection via API (Set/ForceSet).
@@ -55,6 +56,7 @@ impl FallbackGroup {
             proxy_names: proxies,
             test_url: hc.url,
             interval: Duration::from_secs(hc.interval_secs),
+            expected_status: hc.expected_status,
             state_store,
             force_selected: parking_lot::RwLock::new(None),
             failed_times: AtomicU32::new(0),
@@ -99,53 +101,43 @@ impl FallbackGroup {
         proxies: &HashMap<String, Arc<dyn OutboundHandler>>,
         dns: &Arc<DnsResolver>,
     ) {
-        // mihomo compat: errgroup.SetLimit(10)
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(10));
-        let mut handles = Vec::new();
-        let timeout = Duration::from_millis(self.test_timeout);
+        super::health::run_health_check(
+            "fallback",
+            &self.proxy_names,
+            &self.test_url,
+            self.test_timeout,
+            self.expected_status.clone(),
+            proxies,
+            dns,
+            &self.state_store,
+        )
+        .await;
+    }
 
+    /// mihomo compat: fallback.go findAliveProxy — walk the list in config
+    /// order. A pinned proxy is honored only while alive; when its entry is
+    /// found dead the pin is CLEARED and the remaining proxies are scanned
+    /// for the first alive one. Falls back to the first proxy.
+    fn find_alive_proxy(&self) -> Option<String> {
+        let mut selected = self.force_selected.write();
         for name in &self.proxy_names {
-            let handler = match proxies.get(name) {
-                Some(h) => h.clone(),
-                None => continue,
-            };
-            let name = name.clone();
-            let url = self.test_url.clone();
-            let dns = dns.clone();
-            let state_store = self.state_store.clone();
-            let sem = semaphore.clone();
-
-            let handle = tokio::spawn(async move {
-                let _permit = sem.acquire().await;
-                let result =
-                    tokio::time::timeout(timeout, measure_unified_delay(&handler, &url, &dns))
-                        .await;
-                match result {
-                    Ok(Ok(ms)) => {
-                        debug!("fallback {}: alive ({}ms)", name, ms);
-                        let delay = if ms > u16::MAX as u64 {
-                            u16::MAX
-                        } else {
-                            ms as u16
-                        };
-                        state_store.record_result(&name, &url, Some(delay));
-                    }
-                    Ok(Err(e)) => {
-                        warn!("fallback {}: {}", name, e);
-                        state_store.record_result(&name, &url, None);
-                    }
-                    Err(_) => {
-                        warn!("fallback {}: timeout", name);
-                        state_store.record_result(&name, &url, None);
+            match selected.as_deref() {
+                None => {
+                    if self.state_store.alive_for_url(name, &self.test_url) {
+                        return Some(name.clone());
                     }
                 }
-            });
-            handles.push(handle);
+                Some(sel) => {
+                    if name == sel {
+                        if self.state_store.alive_for_url(name, &self.test_url) {
+                            return Some(name.clone());
+                        }
+                        *selected = None;
+                    }
+                }
+            }
         }
-
-        for h in handles {
-            let _ = h.await;
-        }
+        self.proxy_names.first().cloned()
     }
 
     /// Get alive proxies with their delays (for API reporting).
@@ -183,23 +175,9 @@ impl ProxyGroup for FallbackGroup {
     }
 
     fn now(&self) -> String {
-        // mihomo compat: if force-pinned, return that proxy (if alive).
-        if let Some(ref selected) = *self.force_selected.read() {
-            if self.state_store.alive_for_url(selected, &self.test_url) {
-                return selected.clone();
-            }
-            // If no health check yet, alive_for_url returns true (assumed alive)
-            return selected.clone();
-        }
-
-        // Walk the list in config order, return the first alive proxy.
-        for name in &self.proxy_names {
-            if self.state_store.alive_for_url(name, &self.test_url) {
-                return name.clone();
-            }
-        }
-        // If nothing is alive, return the first proxy (optimistic).
-        self.proxy_names.first().cloned().unwrap_or_default()
+        // mihomo compat: fallback.go Now() — same findAliveProxy as routing,
+        // so a dead pin never lingers in `now`.
+        self.find_alive_proxy().unwrap_or_default()
     }
 
     fn all(&self) -> Vec<String> {
@@ -210,6 +188,14 @@ impl ProxyGroup for FallbackGroup {
         // mihomo compat: Fallback supports force-pinning via Set/ForceSet.
         if self.proxy_names.iter().any(|n| n == name) {
             *self.force_selected.write() = Some(name.to_string());
+            // TODO: mihomo fallback.go Set() (fallback.go:124-146) fires a
+            // one-shot URLTest with a 5s timeout against just the newly
+            // pinned proxy when it is not alive. select() has no access to
+            // the proxies map / DNS resolver here, so we trigger the group's
+            // health-check loop instead, which re-probes all members.
+            if !self.state_store.alive_for_url(name, &self.test_url) {
+                self.health_notify.notify_one();
+            }
             true
         } else {
             false
@@ -221,29 +207,23 @@ impl ProxyGroup for FallbackGroup {
         *self.force_selected.write() = None;
     }
 
+    fn fixed(&self) -> String {
+        // mihomo compat: fallback.go:90 — `fixed` is the pinned name.
+        self.force_selected.read().clone().unwrap_or_default()
+    }
+
     fn get_proxy(
         &self,
         proxies: &HashMap<String, Arc<dyn OutboundHandler>>,
     ) -> Option<Arc<dyn OutboundHandler>> {
-        // mihomo compat: if force-pinned, return that proxy (if alive).
-        if let Some(ref selected) = *self.force_selected.read() {
-            if self.state_store.alive_for_url(selected, &self.test_url) {
-                if let Some(handler) = proxies.get(selected) {
-                    return Some(handler.clone());
-                }
+        // mihomo compat: fallback.go findAliveProxy — shared with now().
+        if let Some(name) = self.find_alive_proxy() {
+            if let Some(handler) = proxies.get(&name) {
+                return Some(handler.clone());
             }
         }
 
-        // Walk the list in config order and return the first alive proxy.
-        for name in &self.proxy_names {
-            if self.state_store.alive_for_url(name, &self.test_url) {
-                if let Some(handler) = proxies.get(name) {
-                    return Some(handler.clone());
-                }
-            }
-        }
-
-        // Fallback: first in list.
+        // Fallback: first in list resolvable to a handler.
         for name in &self.proxy_names {
             if let Some(handler) = proxies.get(name) {
                 return Some(handler.clone());
@@ -322,6 +302,7 @@ mod tests {
             max_failed_times: None,
             test_timeout: None,
             lazy: false,
+            expected_status: None,
         }
     }
 
@@ -376,6 +357,33 @@ mod tests {
             make_store(),
         );
         assert_eq!(group.now(), "");
+    }
+
+    #[test]
+    fn dead_pin_is_cleared_and_first_alive_wins() {
+        // mihomo compat: fallback.go findAliveProxy — a dead pinned proxy
+        // clears `selected`; now() and routing then agree on first-alive.
+        let store = make_store();
+        let url = "http://test.example/204";
+        store.record_result("a", url, Some(100));
+        store.record_result("b", url, None);
+
+        let group = FallbackGroup::new(
+            "fb".to_string(),
+            vec!["a".to_string(), "b".to_string()],
+            make_hc(url, 300),
+            store.clone(),
+        );
+        assert!(group.select("b"));
+        assert_eq!(group.fixed(), "b");
+
+        // Pinned "b" is dead: falls back and the pin is cleared.
+        assert_eq!(group.now(), "a");
+        assert_eq!(group.fixed(), "");
+
+        // "b" comes back alive: pin stays cleared, first alive still wins.
+        store.record_result("b", url, Some(50));
+        assert_eq!(group.now(), "a");
     }
 
     #[test]

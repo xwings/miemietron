@@ -613,8 +613,7 @@ mod tests {
         assert_eq!(kdf(key, &[]).to_vec(), reference_kdf(key, &[]));
 
         // And directly: HMAC-SHA256("VMess AEAD KDF", key).
-        let mut mac =
-            <HmacSha256 as HmacMac>::new_from_slice(b"VMess AEAD KDF").unwrap();
+        let mut mac = <HmacSha256 as HmacMac>::new_from_slice(b"VMess AEAD KDF").unwrap();
         mac.update(key);
         assert_eq!(kdf(key, &[]).to_vec(), mac.finalize().into_bytes().to_vec());
     }

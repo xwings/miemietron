@@ -61,14 +61,38 @@ pub struct ApiState {
 }
 
 pub async fn start_server(addr: &str, secret: Option<String>, state: ApiState) -> Result<()> {
-    // mihomo compat: CORS matching chi cors.Options. allow_private_network
-    // required for Chrome Private Network Access (dashboard → router IP).
-    let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers(Any)
-        .allow_private_network(true)
-        .max_age(std::time::Duration::from_secs(300));
+    // mihomo compat: CORS matching chi cors.Options (server.go:80-88) —
+    // external-controller-cors.allow-origins restricts origins (default "*");
+    // allow_private_network required for Chrome Private Network Access
+    // (dashboard → router IP), default true (config.go:588-591).
+    let cors_cfg = state.app.config().external_controller_cors.clone();
+    let (allow_origins, allow_private) = match cors_cfg {
+        Some(c) => {
+            let private = c.allow_private_network;
+            let origins = c.allow_origins;
+            (origins, private)
+        }
+        None => (vec![], true),
+    };
+    let cors = if allow_origins.is_empty() || allow_origins.iter().any(|o| o == "*") {
+        CorsLayer::new()
+            .allow_origin(Any)
+            .allow_methods(Any)
+            .allow_headers(Any)
+            .allow_private_network(allow_private)
+            .max_age(std::time::Duration::from_secs(300))
+    } else {
+        let origins: Vec<axum::http::HeaderValue> = allow_origins
+            .iter()
+            .filter_map(|o| o.parse().ok())
+            .collect();
+        CorsLayer::new()
+            .allow_origin(origins)
+            .allow_methods(Any)
+            .allow_headers(Any)
+            .allow_private_network(allow_private)
+            .max_age(std::time::Duration::from_secs(300))
+    };
 
     // Auto-download UI if external-ui is configured but directory is empty/missing
     let config = state.app.config();

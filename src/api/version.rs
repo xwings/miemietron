@@ -16,10 +16,10 @@ pub async fn get_hello() -> Json<Value> {
 
 /// GET /version — returns version info.
 pub async fn get_version() -> Json<Value> {
+    // mihomo compat: server.go:564-566 — exactly {"meta": true, "version"}.
     Json(json!({
         "meta": true,
         "version": format!("v{}", env!("CARGO_PKG_VERSION")),
-        "premium": false,
     }))
 }
 

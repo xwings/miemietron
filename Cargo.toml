@@ -1,6 +1,6 @@
 [package]
 name = "miemietron"
-version = "0.2.8-dev"
+version = "0.2.9-dev"
 edition = "2021"
 description = "High-performance proxy kernel for low-powered routers"
 license = "MIT"
@@ -72,6 +72,9 @@ regex = "1"
 
 # GeoIP
 maxminddb = "0.24"
+
+# MRS rule providers (zstd decode, pure Rust — no C dep for musl builds)
+ruzstd = "0.8"
 
 # Logging
 tracing = "0.1"

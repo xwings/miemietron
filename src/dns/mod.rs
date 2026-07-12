@@ -28,6 +28,12 @@ pub struct DnsResolver {
     /// Callback to check if a domain matches a geosite code.
     /// Set after construction via `set_geosite_checker()`.
     geosite_checker: Option<GeositeCheckerFn>,
+    /// Rule-provider names from fake-ip-filter (e.g. "rule-set:oc-cn-domain"
+    /// → "oc-cn-domain"). mihomo config.go parseFakeIPRules.
+    fakeip_ruleset_names: Vec<String>,
+    /// Callback to check if a domain matches a rule provider's domain rules.
+    /// Set after construction via `set_ruleset_checker()`.
+    ruleset_checker: Option<GeositeCheckerFn>,
     /// Reverse IP→domain mapping for redir-host mode and traffic logging.
     /// Records every DNS resolution result (both FakeIP and real IPs).
     /// Matches mihomo's dns/enhancer.go mapping LRU.
@@ -87,6 +93,18 @@ impl DnsResolver {
             info!("FakeIP bypass geosite codes: {:?}", fakeip_geosite_codes);
         }
 
+        // Extract rule-set: entries from fake-ip-filter for bypass checking.
+        // mihomo compat: config.go parseFakeIPRules — "rule-set:oc-cn-domain"
+        // matches the domain rules of that rule provider.
+        let fakeip_ruleset_names: Vec<String> = config
+            .fake_ip_filter
+            .iter()
+            .filter_map(|f| f.strip_prefix("rule-set:").map(|s| s.to_string()))
+            .collect();
+        if !fakeip_ruleset_names.is_empty() {
+            info!("FakeIP bypass rule-sets: {:?}", fakeip_ruleset_names);
+        }
+
         Ok(Self {
             config: config.clone(),
             cache,
@@ -94,6 +112,8 @@ impl DnsResolver {
             hosts,
             fakeip_geosite_codes,
             geosite_checker: None,
+            fakeip_ruleset_names,
+            ruleset_checker: None,
             ip_to_host: DashMap::new(),
             proxy_dns_cache: DashMap::new(),
             proxy_dns_inflight: DashMap::new(),
@@ -109,27 +129,63 @@ impl DnsResolver {
         self.geosite_checker = Some(Arc::new(checker));
     }
 
+    /// Set a rule-set checker function for fake-ip-filter `rule-set:` bypass.
+    /// Called after construction once the RuleEngine (with its rule providers)
+    /// is built. The checker receives (domain, provider_name).
+    pub fn set_ruleset_checker<F>(&mut self, checker: F)
+    where
+        F: Fn(&str, &str) -> bool + Send + Sync + 'static,
+    {
+        self.ruleset_checker = Some(Arc::new(checker));
+    }
+
+    /// Rule-provider names referenced by `rule-set:` fake-ip-filter entries.
+    /// Used at wiring time to report references to providers that never loaded
+    /// (mihomo fails the config load in that case — config.go:1604).
+    pub fn fakeip_ruleset_names(&self) -> &[String] {
+        &self.fakeip_ruleset_names
+    }
+
     /// Check if a domain should bypass FakeIP (get real IP instead).
+    ///
+    /// mihomo compat: the filter-mode applies to the WHOLE matcher set —
+    /// pattern entries, `geosite:` and `rule-set:` alike (config.go
+    /// parseFakeIPRules builds one host matcher list; skipper.go inverts it
+    /// for whitelist mode). Blacklist: matched domains bypass; whitelist:
+    /// only matched domains get fake IPs, everything else bypasses.
     fn should_bypass_fakeip(&self, domain: &str) -> bool {
-        // Check the pool's pattern-based filter (*.lan, +.qq.com, etc.)
-        if let Some(ref pool) = self.fakeip {
-            if pool.should_bypass(domain) {
-                return true;
-            }
-        }
+        let Some(ref pool) = self.fakeip else {
+            return false;
+        };
 
-        // Check geosite-based filter (e.g. "geosite:cn")
-        if !self.fakeip_geosite_codes.is_empty() {
+        // Pattern-based filter (*.lan, +.qq.com, etc.)
+        let mut matched = pool.filter_matches(domain);
+
+        // geosite:-based filter entries (e.g. "geosite:cn")
+        if !matched && !self.fakeip_geosite_codes.is_empty() {
             if let Some(ref checker) = self.geosite_checker {
-                for code in &self.fakeip_geosite_codes {
-                    if checker(domain, code) {
-                        return true;
-                    }
-                }
+                matched = self
+                    .fakeip_geosite_codes
+                    .iter()
+                    .any(|code| checker(domain, code));
             }
         }
 
-        false
+        // rule-set:-based filter entries (e.g. "rule-set:oc-cn-domain")
+        if !matched && !self.fakeip_ruleset_names.is_empty() {
+            if let Some(ref checker) = self.ruleset_checker {
+                matched = self
+                    .fakeip_ruleset_names
+                    .iter()
+                    .any(|name| checker(domain, name));
+            }
+        }
+
+        if pool.is_whitelist() {
+            !matched
+        } else {
+            matched
+        }
     }
 
     /// Resolve a domain name. In fake-ip mode, returns a fake IP.
@@ -279,7 +335,103 @@ impl DnsResolver {
     /// Query upstream DNS servers for a real IP and TTL.
     /// Used internally for TTL-aware caching.
     async fn query_upstream_with_ttl(&self, domain: &str) -> Result<(IpAddr, u32)> {
+        // mihomo compat: resolver.go — nameserver-policy is consulted before
+        // the main/fallback tiers for every query; a hit is used directly.
+        if let Some(servers) = self.nameserver_policy_servers(domain) {
+            return upstream::resolve_via(domain, &servers, 1).await;
+        }
         upstream::resolve(domain, &self.config).await
+    }
+
+    /// Whether fake-ip mode is active.
+    pub fn fakeip_enabled(&self) -> bool {
+        self.fakeip.is_some()
+    }
+
+    /// Resolve a domain to an IPv6 address (AAAA), used by the embedded DNS
+    /// server when `ipv6: true`. Mirrors the A path minus fake-ip allocation
+    /// (no fake-ip-range6 pool — the server answers NODATA for non-bypassed
+    /// domains before calling this).
+    pub async fn resolve_v6(&self, domain: &str) -> Result<IpAddr> {
+        if let Some(ip) = self.hosts.get(&domain.to_lowercase()) {
+            if ip.is_ipv6() {
+                return Ok(*ip);
+            }
+        }
+        let cache_key = format!("AAAA:{domain}");
+        if let Some(ip) = self.cache.get(&cache_key) {
+            return Ok(ip);
+        }
+        let (ip, ttl) = if let Some(servers) = self.nameserver_policy_servers(domain) {
+            upstream::resolve_via(domain, &servers, 28).await?
+        } else {
+            upstream::resolve_qtype(domain, &self.config, 28).await?
+        };
+        self.cache.insert(cache_key, ip, ttl);
+        self.record_ip_mapping(ip, domain, ttl);
+        Ok(ip)
+    }
+
+    /// Forward a raw DNS query (non-A/AAAA types) to the first plain-UDP main
+    /// nameserver and return the raw response.
+    /// mihomo compat: middleware.go withResolver relays other query types to
+    /// the upstream unchanged.
+    pub async fn forward_raw_query(&self, query: &[u8]) -> Result<Vec<u8>> {
+        let server = upstream::plain_udp_server(&self.config)
+            .ok_or_else(|| anyhow::anyhow!("no plain-UDP nameserver for passthrough"))?;
+        let socket = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
+        socket.connect(&server).await?;
+        socket.send(query).await?;
+        let mut buf = vec![0u8; 4096];
+        let n = tokio::time::timeout(std::time::Duration::from_secs(5), socket.recv(&mut buf))
+            .await??;
+        buf.truncate(n);
+        Ok(buf)
+    }
+
+    /// Find the nameserver-policy servers for a domain, in config order.
+    /// mihomo compat: config.go parseNameServerPolicy — keys may be
+    /// comma-separated lists and support `geosite:`/`rule-set:` prefixes
+    /// (checked via the wired rule-engine checkers) plus domain patterns
+    /// (exact / `+.` / `*.`).
+    fn nameserver_policy_servers(&self, domain: &str) -> Option<Vec<String>> {
+        if self.config.nameserver_policy.is_empty() {
+            return None;
+        }
+        let domain_lower = domain.to_lowercase();
+        for (key, value) in &self.config.nameserver_policy {
+            let Some(pattern_raw) = key.as_str() else {
+                continue;
+            };
+            let matched = pattern_raw.split(',').any(|pattern| {
+                let pattern = pattern.trim().to_lowercase();
+                if let Some(code) = pattern.strip_prefix("geosite:") {
+                    self.geosite_checker
+                        .as_ref()
+                        .is_some_and(|c| c(&domain_lower, code))
+                } else if let Some(name) = pattern.strip_prefix("rule-set:") {
+                    self.ruleset_checker
+                        .as_ref()
+                        .is_some_and(|c| c(&domain_lower, name))
+                } else {
+                    upstream::domain_pattern_match(&pattern, &domain_lower)
+                }
+            });
+            if matched {
+                let servers: Vec<String> = match value {
+                    serde_yaml::Value::String(s) => vec![s.clone()],
+                    serde_yaml::Value::Sequence(seq) => seq
+                        .iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect(),
+                    _ => vec![],
+                };
+                if !servers.is_empty() {
+                    return Some(servers);
+                }
+            }
+        }
+        None
     }
 
     /// Resolve a proxy server hostname using only direct/bootstrap DNS.
@@ -376,10 +528,12 @@ impl DnsResolver {
         result
     }
 
-    /// Check if an IP is in the fake IP range.
+    /// Check if an IP is a fake IP.
+    /// mihomo compat: enhancer.go IsFakeIP — the gateway (the TUN device
+    /// address) and the broadcast address of the range are NOT fake IPs.
     pub fn is_fake_ip(&self, ip: &IpAddr) -> bool {
         if let Some(ref pool) = self.fakeip {
-            return pool.contains(ip);
+            return pool.is_fake_ip(ip);
         }
         false
     }
@@ -430,19 +584,64 @@ impl DnsResolver {
 /// Returns `None` if the query can't be parsed.
 pub async fn process_dns_query(data: &[u8], resolver: &DnsResolver) -> Option<Vec<u8>> {
     let (id, domain, qtype) = parse_dns_query(data)?;
-    match resolver.resolve(&domain).await {
-        Ok(ip) => {
-            let ttl = if resolver.is_fake_ip(&ip) {
-                FAKEIP_TTL
-            } else {
-                DNS_DEFAULT_TTL
-            };
-            Some(build_dns_response(id, &domain, ip, qtype, ttl))
+    const TYPE_A: u16 = 1;
+    const TYPE_AAAA: u16 = 28;
+    const TYPE_HTTPS: u16 = 65;
+
+    match qtype {
+        TYPE_A => match resolver.resolve(&domain).await {
+            Ok(ip) => {
+                let ttl = if resolver.is_fake_ip(&ip) {
+                    FAKEIP_TTL
+                } else {
+                    DNS_DEFAULT_TTL
+                };
+                Some(build_dns_response(id, &domain, ip, qtype, ttl))
+            }
+            Err(e) => {
+                debug!("DNS resolve failed for {}: {}", domain, e);
+                Some(build_dns_servfail(id, &domain, qtype))
+            }
+        },
+        // mihomo compat: middleware.go withResolver — with ipv6:false, AAAA
+        // gets an empty answer; with ipv6:true, a real AAAA resolution.
+        TYPE_AAAA => {
+            if !resolver.config.ipv6 {
+                return Some(build_dns_nodata(id, &domain, qtype));
+            }
+            match resolver.resolve_v6(&domain).await {
+                Ok(ip) => {
+                    let ttl = if resolver.is_fake_ip(&ip) {
+                        FAKEIP_TTL
+                    } else {
+                        DNS_DEFAULT_TTL
+                    };
+                    Some(build_dns_response(id, &domain, ip, qtype, ttl))
+                }
+                Err(e) => {
+                    debug!("DNS AAAA resolve failed for {}: {}", domain, e);
+                    Some(build_dns_servfail(id, &domain, qtype))
+                }
+            }
         }
-        Err(e) => {
-            debug!("DNS resolve failed for {}: {}", domain, e);
-            Some(build_dns_servfail(id))
+        // mihomo compat: middleware.go withFakeIP — SVCB/HTTPS queries get an
+        // empty answer under fake-ip so clients fall back to A/AAAA.
+        TYPE_HTTPS if resolver.fakeip_enabled() && !resolver.should_bypass_fakeip(&domain) => {
+            Some(build_dns_nodata(id, &domain, qtype))
         }
+        // mihomo compat: every other query type (TXT/SRV/MX/PTR/...) passes
+        // through to the upstream unchanged (middleware.go withResolver →
+        // raw exchange) instead of being answered with a bogus A record.
+        _ => match resolver.forward_raw_query(data).await {
+            Ok(resp) => Some(resp),
+            Err(e) => {
+                debug!(
+                    "DNS passthrough failed for {} (type {}): {}",
+                    domain, qtype, e
+                );
+                Some(build_dns_servfail(id, &domain, qtype))
+            }
+        },
     }
 }
 
@@ -477,25 +676,9 @@ pub async fn run_dns_server(listen: &str, resolver: Arc<DnsResolver>) -> Result<
         let udp_socket_clone = udp_socket.clone();
 
         tokio::spawn(async move {
-            match parse_dns_query(&data) {
-                Some((id, domain, qtype)) => {
-                    debug!("DNS query (UDP): {} (type {})", domain, qtype);
-                    match resolver.resolve(&domain).await {
-                        Ok(ip) => {
-                            let ttl = if resolver.is_fake_ip(&ip) {
-                                FAKEIP_TTL
-                            } else {
-                                DNS_DEFAULT_TTL
-                            };
-                            let response = build_dns_response(id, &domain, ip, qtype, ttl);
-                            let _ = udp_socket_clone.send_to(&response, src).await;
-                        }
-                        Err(e) => {
-                            debug!("DNS resolve failed for {}: {}", domain, e);
-                            let response = build_dns_servfail(id);
-                            let _ = udp_socket_clone.send_to(&response, src).await;
-                        }
-                    }
+            match process_dns_query(&data, &resolver).await {
+                Some(response) => {
+                    let _ = udp_socket_clone.send_to(&response, src).await;
                 }
                 None => {
                     debug!("Failed to parse DNS query (UDP)");
@@ -557,24 +740,8 @@ async fn handle_dns_tcp_connection(
         stream.read_exact(&mut msg_buf).await?;
 
         // Process the query
-        let response = match parse_dns_query(&msg_buf) {
-            Some((id, domain, qtype)) => {
-                debug!("DNS query (TCP): {} (type {})", domain, qtype);
-                match resolver.resolve(&domain).await {
-                    Ok(ip) => {
-                        let ttl = if resolver.is_fake_ip(&ip) {
-                            FAKEIP_TTL
-                        } else {
-                            DNS_DEFAULT_TTL
-                        };
-                        build_dns_response(id, &domain, ip, qtype, ttl)
-                    }
-                    Err(e) => {
-                        debug!("DNS resolve failed for {}: {}", domain, e);
-                        build_dns_servfail(id)
-                    }
-                }
-            }
+        let response = match process_dns_query(&msg_buf, resolver).await {
+            Some(response) => response,
             None => {
                 debug!("Failed to parse DNS query (TCP)");
                 continue;
@@ -690,15 +857,42 @@ fn build_dns_response(id: u16, domain: &str, ip: IpAddr, qtype: u16, ttl: u32) -
     response
 }
 
-/// Build a minimal DNS SERVFAIL response.
-fn build_dns_servfail(id: u16) -> Vec<u8> {
-    let mut response = Vec::with_capacity(12);
+/// Append the question section for `domain`/`qtype` (class IN).
+fn append_dns_question(response: &mut Vec<u8>, domain: &str, qtype: u16) {
+    for part in domain.split('.') {
+        response.push(part.len() as u8);
+        response.extend_from_slice(part.as_bytes());
+    }
+    response.push(0);
+    response.extend_from_slice(&qtype.to_be_bytes());
+    response.extend_from_slice(&[0x00, 0x01]); // Class IN
+}
+
+/// Build a DNS SERVFAIL response.
+/// mihomo compat: server.go — the reply echoes the question section (some
+/// stub resolvers discard question-less replies and retry until timeout).
+fn build_dns_servfail(id: u16, domain: &str, qtype: u16) -> Vec<u8> {
+    let mut response = Vec::with_capacity(32);
     response.extend_from_slice(&id.to_be_bytes());
     response.extend_from_slice(&[0x81, 0x82]); // Response + SERVFAIL
-    response.extend_from_slice(&[0x00, 0x00]); // 0 questions
+    response.extend_from_slice(&[0x00, 0x01]); // 1 question
     response.extend_from_slice(&[0x00, 0x00]); // 0 answers
     response.extend_from_slice(&[0x00, 0x00]);
     response.extend_from_slice(&[0x00, 0x00]);
+    append_dns_question(&mut response, domain, qtype);
+    response
+}
+
+/// Build an empty-answer (NODATA) response echoing the question.
+fn build_dns_nodata(id: u16, domain: &str, qtype: u16) -> Vec<u8> {
+    let mut response = Vec::with_capacity(32);
+    response.extend_from_slice(&id.to_be_bytes());
+    response.extend_from_slice(&[0x81, 0x80]); // Response, RD+RA, NOERROR
+    response.extend_from_slice(&[0x00, 0x01]); // 1 question
+    response.extend_from_slice(&[0x00, 0x00]); // 0 answers
+    response.extend_from_slice(&[0x00, 0x00]);
+    response.extend_from_slice(&[0x00, 0x00]);
+    append_dns_question(&mut response, domain, qtype);
     response
 }
 
@@ -716,6 +910,8 @@ mod tests {
             hosts: std::collections::HashMap::new(),
             fakeip_geosite_codes: Vec::new(),
             geosite_checker: None,
+            fakeip_ruleset_names: Vec::new(),
+            ruleset_checker: None,
             ip_to_host: DashMap::new(),
             proxy_dns_cache: DashMap::new(),
             proxy_dns_inflight: DashMap::new(),

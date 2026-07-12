@@ -65,6 +65,37 @@ impl ProxyStateStore {
         });
     }
 
+    /// Records a probe that succeeded but returned an HTTP status outside the
+    /// expected-status ranges.
+    ///
+    /// mihomo compat: adapter.go URLTest() defer (adapter.go:166-200) — when
+    /// the request succeeds but `satisfied` is false, the DEFAULT state stays
+    /// alive and records the real delay, while only the per-URL extra state
+    /// records delay=0 and alive=false.
+    pub fn record_unexpected_status(&self, proxy: &str, url: &str, delay: u16) {
+        let state = self
+            .default_state
+            .entry(proxy.to_string())
+            .or_insert_with(|| Arc::new(ProxyState::new()))
+            .clone();
+        state.set_alive(true);
+        state.history.put(DelayHistory {
+            time: Utc::now(),
+            delay,
+        });
+
+        let url_state = self
+            .extra_state
+            .entry((proxy.to_string(), url.to_string()))
+            .or_insert_with(|| Arc::new(ProxyState::new()))
+            .clone();
+        url_state.set_alive(false);
+        url_state.history.put(DelayHistory {
+            time: Utc::now(),
+            delay: 0,
+        });
+    }
+
     /// Check if a proxy is alive for a specific test URL.
     /// Checks per-URL state first, falls back to default.
     /// Returns true if no state recorded yet (matching mihomo).
@@ -82,9 +113,10 @@ impl ProxyStateStore {
     }
 
     /// Returns delay for a proxy+URL, or 0xFFFF if dead/unknown.
-    /// Matches mihomo's LastDelayForUrl() behavior.
+    /// mihomo compat: adapter.go:118-133 LastDelayForTestUrl reads ONLY the
+    /// per-URL extra state — it never falls back to the default-state history
+    /// (absent extra state means alive=false → 0xFFFF).
     pub fn last_delay_for_url(&self, proxy: &str, url: &str) -> u16 {
-        // Check per-URL state first
         if let Some(state) = self.extra_state.get(&(proxy.to_string(), url.to_string())) {
             if !state.is_alive() {
                 return 0xFFFF;
@@ -94,20 +126,7 @@ impl ProxyStateStore {
                     return last.delay;
                 }
             }
-            return 0xFFFF;
         }
-        // Fall back to default state
-        if let Some(state) = self.default_state.get(proxy) {
-            if !state.is_alive() {
-                return 0xFFFF;
-            }
-            if let Some(last) = state.history.last() {
-                if last.delay > 0 {
-                    return last.delay;
-                }
-            }
-        }
-        // No state recorded — unknown
         0xFFFF
     }
 
@@ -245,6 +264,43 @@ mod tests {
         assert_eq!(extras.len(), 2);
         assert!(extras.contains_key("http://url-a/204"));
         assert!(extras.contains_key("http://url-b/204"));
+    }
+
+    #[test]
+    fn test_record_unexpected_status() {
+        // mihomo compat: adapter.go URLTest — unexpected status keeps the
+        // default state alive with the real delay; the per-URL extra state
+        // goes dead with delay 0.
+        let store = ProxyStateStore::new();
+        store.record_unexpected_status("proxy1", "http://test/204", 150);
+
+        // Default state: alive, real delay recorded
+        let history = store.delay_history("proxy1");
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].delay, 150);
+
+        // Per-URL extra state: dead, delay 0
+        assert!(!store.alive_for_url("proxy1", "http://test/204"));
+        assert_eq!(
+            store.last_delay_for_url("proxy1", "http://test/204"),
+            0xFFFF
+        );
+        let extras = store.extra_delay_histories("proxy1");
+        let extra = &extras["http://test/204"];
+        assert_eq!(extra["alive"], serde_json::json!(false));
+        assert_eq!(extra["history"][0]["delay"], serde_json::json!(0));
+    }
+
+    #[test]
+    fn test_last_delay_no_default_fallback() {
+        // mihomo compat: LastDelayForTestUrl reads only per-URL extra state.
+        let store = ProxyStateStore::new();
+        store.record_result("proxy1", "http://url-a/204", Some(100));
+        // Different URL: no extra state → 0xFFFF even though default exists.
+        assert_eq!(
+            store.last_delay_for_url("proxy1", "http://url-b/204"),
+            0xFFFF
+        );
     }
 
     #[test]

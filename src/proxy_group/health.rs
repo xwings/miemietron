@@ -3,7 +3,8 @@
 //! Spawns a tokio task per group that periodically tests all proxies by
 //! connecting through each proxy and issuing HTTP HEAD requests to the
 //! configured test URL. The results are used by `UrlTestGroup` (auto-select
-//! fastest) and `FallbackGroup` (first alive).
+//! fastest), `FallbackGroup` (first alive), `LoadBalanceGroup` (skip dead
+//! nodes) and select groups with a configured interval.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -12,18 +13,105 @@ use std::time::Duration;
 
 use tokio::sync::Notify;
 use tokio::time;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use super::fallback::FallbackGroup;
-use super::url_test::UrlTestGroup;
-use super::ProxyGroup;
+use super::load_balance::LoadBalanceGroup;
+use super::proxy_state::ProxyStateStore;
+use super::selector::SelectorGroup;
+use super::url_test::{measure_unified_delay, UrlTestGroup};
+use super::{status_matches, ProxyGroup};
 use crate::dns::DnsResolver;
 use crate::proxy::OutboundHandler;
+
+/// Run one health-check pass: probe every proxy in `names` through its own
+/// connection against `url`, recording results in `store`.
+///
+/// mihomo compat: healthcheck.go check()/execute() — errgroup.SetLimit(10)
+/// bounds concurrency (spawning ALL proxies at once accumulates hundreds of
+/// hanging TCP connections on ARM routers); each probe is proxy.URLTest()
+/// with the per-check timeout. On an unexpected HTTP status (expected-status
+/// mismatch) adapter.go URLTest() keeps the DEFAULT state alive with the
+/// real delay and marks only the per-URL extra state dead.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_health_check(
+    kind: &str,
+    names: &[String],
+    url: &str,
+    timeout_ms: u64,
+    expected_status: Option<Vec<(u16, u16)>>,
+    proxies: &HashMap<String, Arc<dyn OutboundHandler>>,
+    dns: &Arc<DnsResolver>,
+    store: &Arc<ProxyStateStore>,
+) {
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(10));
+    let expected = Arc::new(expected_status);
+    let mut handles = Vec::new();
+    let timeout = Duration::from_millis(timeout_ms);
+
+    for name in names {
+        let handler = match proxies.get(name) {
+            Some(h) => h.clone(),
+            None => continue,
+        };
+        let name = name.clone();
+        let kind = kind.to_string();
+        let url = url.to_string();
+        let dns = dns.clone();
+        let store = store.clone();
+        let sem = semaphore.clone();
+        let expected = expected.clone();
+
+        handles.push(tokio::spawn(async move {
+            // Acquire semaphore permit (max 10 concurrent checks)
+            let _permit = sem.acquire().await;
+            // mihomo compat: per-proxy timeout from hc.timeout (default 5000ms)
+            let result =
+                tokio::time::timeout(timeout, measure_unified_delay(&handler, &url, &dns)).await;
+            match result {
+                Ok(Ok((ms, status))) => {
+                    let delay = if ms > u16::MAX as u64 {
+                        u16::MAX
+                    } else {
+                        ms as u16
+                    };
+                    let satisfied = expected
+                        .as_deref()
+                        .map_or(true, |r| status_matches(status, r));
+                    if satisfied {
+                        debug!("{} {}: {}ms", kind, name, ms);
+                        store.record_result(&name, &url, Some(delay));
+                    } else {
+                        // mihomo compat: adapter.go URLTest — unexpected status
+                        // keeps the default state alive with the real delay;
+                        // only the per-URL extra state goes dead.
+                        warn!("{} {}: unexpected status {}", kind, name, status);
+                        store.record_unexpected_status(&name, &url, delay);
+                    }
+                }
+                Ok(Err(e)) => {
+                    warn!("{} {}: {}", kind, name, e);
+                    store.record_result(&name, &url, None);
+                }
+                Err(_) => {
+                    warn!("{} {}: timeout", kind, name);
+                    store.record_result(&name, &url, None);
+                }
+            }
+        }));
+    }
+
+    for h in handles {
+        let _ = h.await;
+    }
+}
 
 /// A type-erased handle to a group that supports health checking.
 enum HealthCheckable {
     UrlTest(Arc<UrlTestGroup>),
     Fallback(Arc<FallbackGroup>),
+    LoadBalance(Arc<LoadBalanceGroup>),
+    Selector(Arc<SelectorGroup>),
 }
 
 impl HealthCheckable {
@@ -32,6 +120,8 @@ impl HealthCheckable {
         match self {
             HealthCheckable::UrlTest(g) => g.name(),
             HealthCheckable::Fallback(g) => g.name(),
+            HealthCheckable::LoadBalance(g) => g.name(),
+            HealthCheckable::Selector(g) => g.name(),
         }
     }
 
@@ -39,6 +129,8 @@ impl HealthCheckable {
         match self {
             HealthCheckable::UrlTest(g) => g.interval(),
             HealthCheckable::Fallback(g) => g.interval(),
+            HealthCheckable::LoadBalance(g) => g.interval(),
+            HealthCheckable::Selector(g) => g.health().map(|h| h.interval).unwrap_or_default(),
         }
     }
 
@@ -47,6 +139,8 @@ impl HealthCheckable {
         match self {
             HealthCheckable::UrlTest(g) => g.lazy,
             HealthCheckable::Fallback(g) => g.lazy,
+            HealthCheckable::LoadBalance(g) => g.lazy,
+            HealthCheckable::Selector(g) => g.health().map(|h| h.lazy).unwrap_or(true),
         }
     }
 
@@ -55,6 +149,11 @@ impl HealthCheckable {
         match self {
             HealthCheckable::UrlTest(g) => g.last_touch.load(Ordering::Relaxed),
             HealthCheckable::Fallback(g) => g.last_touch.load(Ordering::Relaxed),
+            HealthCheckable::LoadBalance(g) => g.last_touch.load(Ordering::Relaxed),
+            HealthCheckable::Selector(g) => g
+                .health()
+                .map(|h| h.last_touch.load(Ordering::Relaxed))
+                .unwrap_or(0),
         }
     }
 
@@ -66,6 +165,8 @@ impl HealthCheckable {
         match self {
             HealthCheckable::UrlTest(g) => g.health_check(proxies, dns).await,
             HealthCheckable::Fallback(g) => g.health_check(proxies, dns).await,
+            HealthCheckable::LoadBalance(g) => g.health_check(proxies, dns).await,
+            HealthCheckable::Selector(g) => g.health_check(proxies, dns).await,
         }
     }
 
@@ -74,7 +175,7 @@ impl HealthCheckable {
     fn after_health_check(&self) {
         match self {
             HealthCheckable::UrlTest(g) => g.reset_fast_single(),
-            HealthCheckable::Fallback(_) => {}
+            _ => {}
         }
     }
 
@@ -85,20 +186,29 @@ impl HealthCheckable {
         match self {
             HealthCheckable::UrlTest(g) => g.health_notify.clone(),
             HealthCheckable::Fallback(g) => g.health_notify.clone(),
+            HealthCheckable::LoadBalance(g) => g.health_notify.clone(),
+            HealthCheckable::Selector(g) => g
+                .health()
+                .map(|h| h.health_notify.clone())
+                .unwrap_or_else(|| Arc::new(Notify::new())),
         }
     }
 
     /// Toggle the `failedTesting` flag while a triggered check runs.
     /// mihomo compat: groupbase.go healthCheck() sets/clears failedTesting.
+    /// Selector has no onDial hooks in mihomo, so it is a no-op there.
     fn set_health_testing(&self, running: bool) {
         match self {
             HealthCheckable::UrlTest(g) => g.set_health_testing(running),
             HealthCheckable::Fallback(g) => g.set_health_testing(running),
+            HealthCheckable::LoadBalance(g) => g.set_health_testing(running),
+            HealthCheckable::Selector(_) => {}
         }
     }
 }
 
-/// Spawn background health-check tasks for all url-test and fallback groups.
+/// Spawn background health-check tasks for all url-test, fallback and
+/// load-balance groups, plus select groups with a configured interval.
 ///
 /// All health checks use through-proxy latency measurement: connecting through
 /// each proxy via `connect_stream()` and sending an HTTP HEAD request. This
@@ -224,6 +334,27 @@ fn try_into_checkable(group: &Arc<dyn ProxyGroup>) -> Option<HealthCheckable> {
             let raw = Arc::into_raw(cloned) as *const FallbackGroup;
             let arc = unsafe { Arc::from_raw(raw) };
             Some(HealthCheckable::Fallback(arc))
+        }
+        "LoadBalance" => {
+            // mihomo compat: parser.go:166-171 — load-balance is a non-select
+            // type, so it always gets a periodic health check (interval
+            // defaults to 300s).
+            let cloned = group.clone();
+            let raw = Arc::into_raw(cloned) as *const LoadBalanceGroup;
+            let arc = unsafe { Arc::from_raw(raw) };
+            Some(HealthCheckable::LoadBalance(arc))
+        }
+        "Selector" => {
+            // mihomo compat: healthcheck.go auto() — select groups run
+            // periodic checks only when the user configured an interval.
+            let cloned = group.clone();
+            let raw = Arc::into_raw(cloned) as *const SelectorGroup;
+            let arc = unsafe { Arc::from_raw(raw) };
+            if arc.health().is_some() {
+                Some(HealthCheckable::Selector(arc))
+            } else {
+                None
+            }
         }
         _ => None,
     }

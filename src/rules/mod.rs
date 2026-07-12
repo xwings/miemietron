@@ -1,7 +1,9 @@
 pub mod domain;
+pub mod geodata;
 pub mod geoip;
 pub mod geosite;
 pub mod ipcidr;
+pub mod mrs;
 pub mod process;
 pub mod provider;
 
@@ -50,12 +52,24 @@ pub struct RuleMetadata {
 }
 
 /// Parsed rule entry.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ParsedRule {
     pub rule_type: String,
     pub payload: String,
     pub target: String,
     pub params: Vec<String>,
+    /// Parsed sub-rules for logic types. AND/OR: the condition list; NOT: one
+    /// condition; SUB-RULE: the one gating condition (the group name is in
+    /// `target`, mihomo logic.go NewSubRule). Empty for plain rules.
+    pub sub_rules: Vec<ParsedRule>,
+}
+
+/// mihomo compat: `rules/common/base.go` ParseParams — `src` flips matching to
+/// the source IP and implies no-resolve.
+fn parse_params(params: &[String]) -> (bool, bool) {
+    let is_src = params.iter().any(|p| p == "src");
+    let no_resolve = is_src || params.iter().any(|p| p == "no-resolve");
+    (is_src, no_resolve)
 }
 
 /// Pre-parsed CIDR for O(1) bitwise matching (avoids string parsing per match).
@@ -124,14 +138,87 @@ pub struct RuleEngine {
     parsed_cidrs: HashMap<usize, PreParsedCidr>,
     /// Pre-parsed port ranges for DST-PORT/SRC-PORT/IN-PORT rules.
     parsed_ports: HashMap<usize, Vec<(u16, u16)>>,
-    /// Pre-parsed u32 values for IP-ASN/SRC-IP-ASN/UID rules.
+    /// Pre-parsed u32 values for IP-ASN/SRC-IP-ASN rules.
     parsed_u32s: HashMap<usize, u32>,
-    /// Pre-parsed u8 values for DSCP rules.
-    parsed_u8s: HashMap<usize, u8>,
+    /// Pre-parsed range lists for UID/DSCP rules (mihomo IntRanges).
+    parsed_ranges: HashMap<usize, Vec<(u32, u32)>>,
     /// Per-provider load-time metadata, surfaced by the
     /// `/providers/rules` REST API. Captured at engine construction —
     /// runtime `PUT` reload is not supported (see api/rules_api.rs).
     provider_info: HashMap<String, RuleProviderInfo>,
+    /// Per-provider domain lookup indexes for `rule-set:<name>` entries in
+    /// `dns.fake-ip-filter` (mihomo config.go parseFakeIPRules). Built from
+    /// the same parsed provider rules that RULE-SET expansion uses.
+    provider_domain_indexes: HashMap<String, ProviderDomainIndex>,
+}
+
+/// Domain-only lookup index over one rule provider's payload, used by the
+/// fake-ip-filter `rule-set:` bypass. Mirrors how the engine interprets
+/// domain-behavior payloads (DOMAIN / DOMAIN-SUFFIX / DOMAIN-SUFFIX-STRICT)
+/// plus the domain rule types of classical providers. Non-domain rules in a
+/// classical provider are ignored, matching mihomo's "only matching domain
+/// rules in fake-ip-filter" warning.
+#[derive(Default)]
+struct ProviderDomainIndex {
+    exact: std::collections::HashSet<String>,
+    /// "+.example.com" — matches example.com and any subdomain.
+    suffix: std::collections::HashSet<String>,
+    /// ".example.com" — matches subdomains only.
+    strict_suffix: std::collections::HashSet<String>,
+    /// "*.example.com" — matches exactly one extra label.
+    star: std::collections::HashSet<String>,
+    /// classical DOMAIN-KEYWORD payloads.
+    keywords: Vec<String>,
+}
+
+impl ProviderDomainIndex {
+    fn insert_rule(&mut self, rule: &ParsedRule) {
+        let payload = rule.payload.to_lowercase();
+        match rule.rule_type.as_str() {
+            "DOMAIN" => {
+                self.exact.insert(payload);
+            }
+            "DOMAIN-SUFFIX" => {
+                self.suffix.insert(payload);
+            }
+            "DOMAIN-SUFFIX-STRICT" => {
+                self.strict_suffix.insert(payload);
+            }
+            "DOMAIN-STAR" => {
+                self.star.insert(payload);
+            }
+            "DOMAIN-KEYWORD" => {
+                self.keywords.push(payload);
+            }
+            _ => {}
+        }
+    }
+
+    fn matches(&self, domain: &str) -> bool {
+        let domain = domain.to_lowercase();
+        if self.exact.contains(&domain) {
+            return true;
+        }
+        if self.suffix.contains(&domain) {
+            return true;
+        }
+        // Walk parent suffixes: for "a.b.example.com" check "b.example.com",
+        // "example.com", "com" against the suffix sets.
+        let mut first = true;
+        let mut rest = domain.as_str();
+        while let Some(idx) = rest.find('.') {
+            rest = &rest[idx + 1..];
+            if self.suffix.contains(rest) || self.strict_suffix.contains(rest) {
+                return true;
+            }
+            // "*.x" matches exactly one extra label — only the first parent.
+            if first && self.star.contains(rest) {
+                return true;
+            }
+            first = false;
+        }
+        self.keywords.iter().any(|k| domain.contains(k.as_str()))
+    }
 }
 
 /// Metadata for a rule provider as loaded into the engine.
@@ -171,26 +258,42 @@ impl RuleEngine {
         providers: &HashMap<String, RuleProviderConfig>,
         home_dir: &Path,
     ) -> Result<Self> {
+        Self::with_home_dir_geox(rule_strings, providers, home_dir, None).await
+    }
+
+    /// Like [`with_home_dir`], with the config's `geox-url` map for the
+    /// geo-database auto-download (mihomo component/geodata/init.go — a rule
+    /// referencing GEOIP/GEOSITE with no database on disk triggers a download
+    /// before the engine is built).
+    pub async fn with_home_dir_geox(
+        rule_strings: &[RuleString],
+        providers: &HashMap<String, RuleProviderConfig>,
+        home_dir: &Path,
+        geox_url: Option<&HashMap<String, String>>,
+    ) -> Result<Self> {
         let mut rules = Vec::new();
+
+        let referenced: String = rule_strings
+            .iter()
+            .map(|r| r.to_uppercase())
+            .collect::<Vec<_>>()
+            .join("\n");
+        if referenced.contains("GEOIP") || referenced.contains("IP-ASN") {
+            geodata::ensure_geoip(home_dir, geox_url).await;
+        }
+        if referenced.contains("GEOSITE") {
+            geodata::ensure_geosite(home_dir, geox_url).await;
+        }
 
         let geoip_matcher = geoip::GeoIpMatcher::new(home_dir);
         let geosite_matcher = geosite::GeoSiteMatcher::new(home_dir);
 
-        // Collect the target associated with each RULE-SET reference so we can
-        // assign provider rules to the correct proxy target.
-        let mut ruleset_targets: HashMap<String, String> = HashMap::new();
+        // Provider payloads are ingested target-neutral; the target and the
+        // no-resolve/src params come from each RULE-SET reference at expansion
+        // time (mihomo compat: every RULE-SET is its own rule with its own
+        // adapter and params, rules/provider/rule_set.go).
         let mut provider_rules: HashMap<String, Vec<ParsedRule>> = HashMap::new();
         let mut provider_info: HashMap<String, RuleProviderInfo> = HashMap::new();
-        for rule_str in rule_strings {
-            let trimmed = rule_str.trim();
-            if trimmed.starts_with("RULE-SET,") {
-                let parts: Vec<&str> = trimmed.splitn(3, ',').collect();
-                if parts.len() >= 3 {
-                    ruleset_targets
-                        .insert(parts[1].trim().to_string(), parts[2].trim().to_string());
-                }
-            }
-        }
 
         // Load rule providers and merge their rules into our indexes.
         for (name, prov_config) in providers {
@@ -203,6 +306,7 @@ impl RuleEngine {
                 }
             });
 
+            let behavior = prov_config.behavior.as_deref().unwrap_or("domain");
             let rp = provider::RuleProvider::new(
                 name.clone(),
                 &prov_config.provider_type,
@@ -210,6 +314,7 @@ impl RuleEngine {
                 path,
                 prov_config.interval.unwrap_or(86400),
                 prov_config.format.as_deref(),
+                behavior,
             );
 
             if let Err(e) = rp.load().await {
@@ -218,18 +323,12 @@ impl RuleEngine {
             }
 
             let loaded_rules = rp.rules().await;
-            let behavior = prov_config.behavior.as_deref().unwrap_or("domain");
-            let target = ruleset_targets
-                .get(name)
-                .cloned()
-                .unwrap_or_else(|| "DIRECT".to_string());
 
             tracing::info!(
-                "Merging rule provider '{}' ({} behavior, {} rules) -> target '{}'",
+                "Loaded rule provider '{}' ({} behavior, {} rules)",
                 name,
                 behavior,
-                loaded_rules.len(),
-                target
+                loaded_rules.len()
             );
 
             // Capture metadata for the /providers/rules REST API. ruleCount
@@ -282,8 +381,9 @@ impl RuleEngine {
                                     .push(ParsedRule {
                                         rule_type: "DOMAIN-SUFFIX".to_string(),
                                         payload: suffix,
-                                        target: target.clone(),
+                                        target: String::new(),
                                         params: vec![],
+                                        sub_rules: vec![],
                                     });
                             }
                         } else if let Some(stripped) = cleaned.strip_prefix('.') {
@@ -298,8 +398,28 @@ impl RuleEngine {
                                     .push(ParsedRule {
                                         rule_type: "DOMAIN-SUFFIX-STRICT".to_string(),
                                         payload: suffix,
-                                        target: target.clone(),
+                                        target: String::new(),
                                         params: vec![],
+                                        sub_rules: vec![],
+                                    });
+                            }
+                        } else if let Some(stripped) = cleaned.strip_prefix("*.") {
+                            // mihomo compat: trie/domain.go — '*' matches
+                            // exactly ONE label ("*.example.com" matches
+                            // a.example.com but not a.b.example.com or
+                            // example.com itself). Synthetic type handled in
+                            // matching.
+                            let suffix = stripped.to_lowercase();
+                            if !suffix.is_empty() {
+                                provider_rules
+                                    .entry(name.clone())
+                                    .or_default()
+                                    .push(ParsedRule {
+                                        rule_type: "DOMAIN-STAR".to_string(),
+                                        payload: suffix,
+                                        target: String::new(),
+                                        params: vec![],
+                                        sub_rules: vec![],
                                     });
                             }
                         } else {
@@ -311,8 +431,9 @@ impl RuleEngine {
                                     .push(ParsedRule {
                                         rule_type: "DOMAIN".to_string(),
                                         payload: domain_val,
-                                        target: target.clone(),
+                                        target: String::new(),
                                         params: vec![],
+                                        sub_rules: vec![],
                                     });
                             }
                         }
@@ -324,16 +445,16 @@ impl RuleEngine {
                             .push(ParsedRule {
                                 rule_type: "IP-CIDR".to_string(),
                                 payload: payload.to_string(),
-                                target: target.clone(),
+                                target: String::new(),
                                 params: vec![],
+                                sub_rules: vec![],
                             });
                     }
                     "classical" => {
                         // mihomo compat: provider rules have no target — the target
                         // comes from the RULE-SET definition. Options like "no-resolve"
                         // go into params. ParseRulePayload(rule, needTarget=false).
-                        if let Ok(mut parsed) = parse_provider_rule(payload) {
-                            parsed.target = target.clone();
+                        if let Ok(parsed) = parse_provider_rule(payload) {
                             provider_rules.entry(name.clone()).or_default().push(parsed);
                         }
                     }
@@ -342,6 +463,18 @@ impl RuleEngine {
                     }
                 }
             }
+        }
+
+        // Build per-provider domain indexes for the `rule-set:<name>` entries
+        // of dns.fake-ip-filter (wired to the DNS resolver via
+        // set_ruleset_checker, like the geosite checker).
+        let mut provider_domain_indexes: HashMap<String, ProviderDomainIndex> = HashMap::new();
+        for (name, parsed_rules) in &provider_rules {
+            let mut index = ProviderDomainIndex::default();
+            for r in parsed_rules {
+                index.insert_rule(r);
+            }
+            provider_domain_indexes.insert(name.clone(), index);
         }
 
         for rule_str in rule_strings {
@@ -393,10 +526,39 @@ impl RuleEngine {
                 tracing::warn!("Unknown rule type: {}", parsed.rule_type);
             }
 
-            // For RULE-SET: expand provider rules inline at this position
+            // For RULE-SET: expand provider rules inline at this position.
+            // mihomo compat: each RULE-SET reference is its own rule — the
+            // same provider referenced twice with different targets expands
+            // twice, and the reference's no-resolve/src params apply to every
+            // expanded rule (rules/provider/rule_set.go NewRuleSet).
             if parsed.rule_type == "RULE-SET" {
-                if let Some(expanded) = provider_rules.get(&parsed.payload).cloned() {
-                    rules.extend(expanded);
+                match provider_rules.get(&parsed.payload) {
+                    Some(expanded) => {
+                        for mut r in expanded.iter().cloned() {
+                            r.target = parsed.target.clone();
+                            for p in &parsed.params {
+                                if !r.params.contains(p) {
+                                    r.params.push(p.clone());
+                                }
+                            }
+                            rules.push(r);
+                        }
+                    }
+                    None => {
+                        if providers.contains_key(&parsed.payload) {
+                            // Provider configured but failed to load — the
+                            // provider-fetch policy is warn+skip, so the rule
+                            // is dropped loudly rather than failing the boot.
+                            tracing::error!(
+                                "RULE-SET '{}' references provider that did not load; rule dropped",
+                                parsed.payload
+                            );
+                        } else {
+                            // mihomo compat: unknown rule-set name fails the
+                            // config load (rules/provider/rule_set.go).
+                            return Err(anyhow::anyhow!("not found rule-set: {}", parsed.payload));
+                        }
+                    }
                 }
                 // Don't push the RULE-SET rule itself — it's been expanded
             } else {
@@ -432,29 +594,35 @@ impl RuleEngine {
         // mihomo compat: domain_regex.go and process.go both use regexp2 with
         // the IgnoreCase flag. Rust regex equivalent: (?i) prefix.
         let mut compiled_regexes = HashMap::new();
-        for rule in &rules {
+        fn compile_rule_regexes(rule: &ParsedRule, out: &mut HashMap<String, Regex>) {
             let needs_regex = matches!(
                 rule.rule_type.as_str(),
                 "DOMAIN-REGEX" | "PROCESS-NAME-REGEX" | "PROCESS-PATH-REGEX"
             );
-            if needs_regex && !compiled_regexes.contains_key(&rule.payload) {
+            if needs_regex && !out.contains_key(&rule.payload) {
                 let pattern = if rule.payload.starts_with("(?i)") {
                     rule.payload.clone()
                 } else {
                     format!("(?i){}", &rule.payload)
                 };
                 if let Ok(re) = Regex::new(&pattern) {
-                    compiled_regexes.insert(rule.payload.clone(), re);
+                    out.insert(rule.payload.clone(), re);
                 }
             }
+            for sub in &rule.sub_rules {
+                compile_rule_regexes(sub, out);
+            }
+        }
+        for rule in &rules {
+            compile_rule_regexes(rule, &mut compiled_regexes);
         }
 
         // Pre-parse CIDR and port rules for O(1) matching instead of
         // per-connection string parsing. With 20k rules this is massive.
         let mut parsed_cidrs = HashMap::new();
         let mut parsed_ports = HashMap::new();
-        let mut parsed_u32s = HashMap::new(); // IP-ASN, SRC-IP-ASN, UID
-        let mut parsed_u8s = HashMap::new(); // DSCP
+        let mut parsed_u32s = HashMap::new(); // IP-ASN, SRC-IP-ASN
+        let mut parsed_ranges = HashMap::new(); // UID, DSCP
         for (i, rule) in rules.iter().enumerate() {
             match rule.rule_type.as_str() {
                 "IP-CIDR" | "IP-CIDR6" | "SRC-IP-CIDR" => {
@@ -463,19 +631,20 @@ impl RuleEngine {
                     }
                 }
                 "DST-PORT" | "SRC-PORT" | "IN-PORT" => {
-                    let ranges = parse_port_spec(&rule.payload);
-                    if !ranges.is_empty() {
-                        parsed_ports.insert(i, ranges);
+                    if let Ok(ranges) = parse_port_ranges(&rule.payload) {
+                        if !ranges.is_empty() {
+                            parsed_ports.insert(i, ranges);
+                        }
                     }
                 }
-                "IP-ASN" | "SRC-IP-ASN" | "UID" => {
+                "IP-ASN" | "SRC-IP-ASN" => {
                     if let Ok(v) = rule.payload.parse::<u32>() {
                         parsed_u32s.insert(i, v);
                     }
                 }
-                "DSCP" => {
-                    if let Ok(v) = rule.payload.parse::<u8>() {
-                        parsed_u8s.insert(i, v);
+                "UID" | "DSCP" => {
+                    if let Ok(ranges) = parse_u32_ranges(&rule.payload) {
+                        parsed_ranges.insert(i, ranges);
                     }
                 }
                 _ => {}
@@ -492,8 +661,9 @@ impl RuleEngine {
             parsed_cidrs,
             parsed_ports,
             parsed_u32s,
-            parsed_u8s,
+            parsed_ranges,
             provider_info,
+            provider_domain_indexes,
         })
     }
 
@@ -501,6 +671,21 @@ impl RuleEngine {
     /// Used by the `/providers/rules` REST API.
     pub fn provider_info(&self) -> &HashMap<String, RuleProviderInfo> {
         &self.provider_info
+    }
+
+    /// Check `domain` against the domain rules of the named rule provider.
+    /// Used by `rule-set:<name>` entries in dns.fake-ip-filter. Returns false
+    /// for unknown providers (mihomo fails config load in that case —
+    /// miemietron logs at wiring time and keeps the entry inert).
+    pub fn provider_domain_match(&self, provider: &str, domain: &str) -> bool {
+        self.provider_domain_indexes
+            .get(provider)
+            .is_some_and(|idx| idx.matches(domain))
+    }
+
+    /// Whether a rule provider with this name was loaded into the engine.
+    pub fn has_provider(&self, provider: &str) -> bool {
+        self.provider_info.contains_key(provider)
     }
 
     /// Set sub-rules from config. Called after construction.
@@ -521,6 +706,22 @@ impl RuleEngine {
     /// This is used by the connection manager to populate the `rule` and
     /// `rulePayload` fields in the connections API.
     pub fn match_rules_detailed(&self, metadata: &RuleMetadata) -> (Action, String, String) {
+        self.match_rules_detailed_filtered(metadata, None)
+    }
+
+    /// Like [`match_rules_detailed`], with an optional adapter filter.
+    ///
+    /// mihomo compat: tunnel.go `match()` skips a matched rule when the
+    /// resolved adapter can't serve the connection (`metadata.NetWork == UDP
+    /// && !adapter.SupportUDP()`) and keeps evaluating later rules, so UDP
+    /// traffic falls through to e.g. `GEOIP,CN,DIRECT` or `MATCH` instead of
+    /// being dropped. The UDP path passes a closure returning whether the
+    /// matched action's adapter supports UDP.
+    pub fn match_rules_detailed_filtered(
+        &self,
+        metadata: &RuleMetadata,
+        adapter_ok: Option<&dyn Fn(&Action) -> bool>,
+    ) -> (Action, String, String) {
         // Pre-lowercase domain once for all domain-based rules.
         // Previously each domain rule arm called to_lowercase() individually,
         // resulting in 5+ allocations per connection through the rule chain.
@@ -538,6 +739,11 @@ impl RuleEngine {
 
             if let Some(action) = self.match_single_rule(i, rule, metadata, domain_lower.as_deref())
             {
+                if let Some(check) = adapter_ok {
+                    if !check(&action) {
+                        continue;
+                    }
+                }
                 if let Some(stats) = self.rule_stats.get(i) {
                     stats.hit_count.fetch_add(1, Ordering::Relaxed);
                 }
@@ -545,8 +751,11 @@ impl RuleEngine {
             }
         }
 
-        // Default: DIRECT
-        (Action::Direct, "MATCH".to_string(), String::new())
+        // mihomo compat: no rule matched → DIRECT with a nil rule
+        // (tunnel.go:685). The empty rule type distinguishes this from an
+        // explicit MATCH rule in /connections and the info log
+        // ("doesn't match any rule using ...").
+        (Action::Direct, String::new(), String::new())
     }
 
     /// Match a connection against the rule engine and return the action.
@@ -580,7 +789,7 @@ impl RuleEngine {
                 continue;
             }
             // First destination-IP rule reached before any match → resolve once.
-            if rule_resolves_dst_ip(rule) {
+            if self.rule_wants_dst_resolution(rule, 0) {
                 return true;
             }
             // An earlier rule matches without needing the dst IP → no resolution.
@@ -645,7 +854,15 @@ impl RuleEngine {
             }
 
             "GEOIP" => {
-                if let Some(ref ip) = metadata.dst_ip {
+                // mihomo compat: `src` param flips matching to the source IP
+                // (base.go ParseParams; parser.go NewGEOIP(isSrc)).
+                let (geoip_src, _) = parse_params(&rule.params);
+                let ip_opt = if geoip_src {
+                    metadata.src_ip.as_ref()
+                } else {
+                    metadata.dst_ip.as_ref()
+                };
+                if let Some(ip) = ip_opt {
                     // mihomo compat: the "lan" pseudo-country matches private/
                     // reserved IPs without an mmdb lookup (geoip.go:105-107,154-162).
                     if rule.payload.eq_ignore_ascii_case("lan") {
@@ -654,12 +871,15 @@ impl RuleEngine {
                         }
                         return None;
                     }
-                    if let Some(country) = self.geoip_matcher.lookup_country(ip) {
-                        let no_resolve = rule.params.iter().any(|p| p == "no-resolve");
-                        let _ = no_resolve; // no-resolve only affects DNS, not matching
-                        if country.eq_ignore_ascii_case(&rule.payload) {
-                            return Some(target_to_action(&rule.target));
-                        }
+                    // mihomo compat: Meta-geoip0 records can carry multiple
+                    // codes; match if ANY equals the payload (geoip.go:87-93).
+                    if self
+                        .geoip_matcher
+                        .lookup_codes(ip)
+                        .iter()
+                        .any(|c| c.eq_ignore_ascii_case(&rule.payload))
+                    {
+                        return Some(target_to_action(&rule.target));
                     }
                 }
                 None
@@ -673,10 +893,13 @@ impl RuleEngine {
                         }
                         return None;
                     }
-                    if let Some(country) = self.geoip_matcher.lookup_country(ip) {
-                        if country.eq_ignore_ascii_case(&rule.payload) {
-                            return Some(target_to_action(&rule.target));
-                        }
+                    if self
+                        .geoip_matcher
+                        .lookup_codes(ip)
+                        .iter()
+                        .any(|c| c.eq_ignore_ascii_case(&rule.payload))
+                    {
+                        return Some(target_to_action(&rule.target));
                     }
                 }
                 None
@@ -721,11 +944,15 @@ impl RuleEngine {
                 None
             }
 
+            // mihomo compat: logic.go Match — sub-rules were parsed through the
+            // full rule parser at load, so every rule type (including nested
+            // logic) evaluates with the real matcher. AND over zero rules is
+            // vacuously true; OR over zero rules is false.
             "AND" => {
-                // Syntax: AND,((RULE1),(RULE2),...),target
-                // The payload contains the nested conditions like
-                // "((DOMAIN-SUFFIX,google.com),(NETWORK,udp))"
-                if match_logical_and(&rule.payload, metadata, self, domain_lower) {
+                if rule.sub_rules.iter().all(|r| {
+                    self.match_single_rule(usize::MAX, r, metadata, domain_lower)
+                        .is_some()
+                }) {
                     Some(target_to_action(&rule.target))
                 } else {
                     None
@@ -733,7 +960,10 @@ impl RuleEngine {
             }
 
             "OR" => {
-                if match_logical_or(&rule.payload, metadata, self, domain_lower) {
+                if rule.sub_rules.iter().any(|r| {
+                    self.match_single_rule(usize::MAX, r, metadata, domain_lower)
+                        .is_some()
+                }) {
                     Some(target_to_action(&rule.target))
                 } else {
                     None
@@ -741,8 +971,11 @@ impl RuleEngine {
             }
 
             "NOT" => {
-                // NOT,((RULE)),target -- true if the inner rule does NOT match
-                if match_logical_not(&rule.payload, metadata, self, domain_lower) {
+                let inner = rule.sub_rules.first()?;
+                if self
+                    .match_single_rule(usize::MAX, inner, metadata, domain_lower)
+                    .is_none()
+                {
                     Some(target_to_action(&rule.target))
                 } else {
                     None
@@ -787,6 +1020,22 @@ impl RuleEngine {
                 None
             }
 
+            // mihomo compat: "*.example.com" in domain-behavior providers —
+            // exactly one extra label (trie/domain.go wildcard node).
+            "DOMAIN-STAR" => {
+                if let Some(d) = domain_lower {
+                    let s = &rule.payload;
+                    if d.len() > s.len() + 1
+                        && d.ends_with(s.as_str())
+                        && d.as_bytes()[d.len() - s.len() - 1] == b'.'
+                        && !d[..d.len() - s.len() - 1].contains('.')
+                    {
+                        return Some(target_to_action(&rule.target));
+                    }
+                }
+                None
+            }
+
             "DOMAIN-KEYWORD" => {
                 if let Some(d) = domain_lower {
                     if d.contains(&rule.payload[..]) {
@@ -806,7 +1055,13 @@ impl RuleEngine {
             }
 
             "IP-ASN" => {
-                if let Some(ref ip) = metadata.dst_ip {
+                let (asn_src, _) = parse_params(&rule.params);
+                let ip_opt = if asn_src {
+                    metadata.src_ip.as_ref()
+                } else {
+                    metadata.dst_ip.as_ref()
+                };
+                if let Some(ip) = ip_opt {
                     if let Some(asn) = self.geoip_matcher.lookup_asn(ip) {
                         let rule_asn = self
                             .parsed_u32s
@@ -838,7 +1093,13 @@ impl RuleEngine {
             }
 
             "IP-SUFFIX" => {
-                if let Some(ref ip) = metadata.dst_ip {
+                let (suffix_src, _) = parse_params(&rule.params);
+                let ip_opt = if suffix_src {
+                    metadata.src_ip.as_ref()
+                } else {
+                    metadata.dst_ip.as_ref()
+                };
+                if let Some(ip) = ip_opt {
                     if check_ip_suffix(ip, &rule.payload) {
                         return Some(target_to_action(&rule.target));
                     }
@@ -899,7 +1160,13 @@ impl RuleEngine {
             }
 
             "IP-CIDR" | "IP-CIDR6" => {
-                if let Some(ref ip) = metadata.dst_ip {
+                let (cidr_src, _) = parse_params(&rule.params);
+                let ip_opt = if cidr_src {
+                    metadata.src_ip.as_ref()
+                } else {
+                    metadata.dst_ip.as_ref()
+                };
+                if let Some(ip) = ip_opt {
                     // Use pre-parsed CIDR for O(1) bitwise match
                     let matched = if let Some(cidr) = self.parsed_cidrs.get(&rule_idx) {
                         cidr.matches(ip)
@@ -959,8 +1226,9 @@ impl RuleEngine {
             }
 
             "IN-USER" => {
+                // mihomo compat: in_user.go — payload is a '/'-separated list.
                 if let Some(ref in_user) = metadata.in_user {
-                    if in_user == &rule.payload {
+                    if rule.payload.split('/').any(|u| u.trim() == in_user) {
                         return Some(target_to_action(&rule.target));
                     }
                 }
@@ -968,8 +1236,9 @@ impl RuleEngine {
             }
 
             "IN-NAME" => {
+                // mihomo compat: in_name.go — payload is a '/'-separated list.
                 if let Some(ref in_name) = metadata.in_name {
-                    if in_name == &rule.payload {
+                    if rule.payload.split('/').any(|n| n.trim() == in_name) {
                         return Some(target_to_action(&rule.target));
                     }
                 }
@@ -977,13 +1246,17 @@ impl RuleEngine {
             }
 
             "UID" => {
+                // mihomo compat: uid.go — payload is a range list
+                // ("1000-1100/2000"); IntRanges.Check(empty) is true.
                 if let Some(uid) = metadata.uid {
-                    let rule_uid = self
-                        .parsed_u32s
-                        .get(&rule_idx)
-                        .copied()
-                        .or_else(|| rule.payload.parse().ok());
-                    if rule_uid == Some(uid) {
+                    let matched = if let Some(ranges) = self.parsed_ranges.get(&rule_idx) {
+                        u32_ranges_check(uid, ranges)
+                    } else {
+                        parse_u32_ranges(&rule.payload)
+                            .map(|r| u32_ranges_check(uid, &r))
+                            .unwrap_or(false)
+                    };
+                    if matched {
                         return Some(target_to_action(&rule.target));
                     }
                 }
@@ -991,13 +1264,17 @@ impl RuleEngine {
             }
 
             "DSCP" => {
+                // mihomo compat: dscp.go — payload is a range list; "*" (empty
+                // ranges) matches everything (IntRanges.Check).
                 if let Some(dscp) = metadata.dscp {
-                    let rule_dscp = self
-                        .parsed_u8s
-                        .get(&rule_idx)
-                        .copied()
-                        .or_else(|| rule.payload.parse().ok());
-                    if rule_dscp == Some(dscp) {
+                    let matched = if let Some(ranges) = self.parsed_ranges.get(&rule_idx) {
+                        u32_ranges_check(dscp as u32, ranges)
+                    } else {
+                        parse_u32_ranges(&rule.payload)
+                            .map(|r| u32_ranges_check(dscp as u32, &r))
+                            .unwrap_or(false)
+                    };
+                    if matched {
                         return Some(target_to_action(&rule.target));
                     }
                 }
@@ -1005,22 +1282,87 @@ impl RuleEngine {
             }
 
             "SUB-RULE" => {
-                // SUB-RULE,sub-rule-group-name,target
-                // Evaluate the named sub-rule group. If any sub-rule matches,
-                // return its action. Otherwise fall through.
-                if let Some(sub_rules) = self.sub_rules.get(&rule.payload) {
-                    for sub_rule in sub_rules {
-                        if let Some(action) =
-                            self.match_single_rule(usize::MAX, sub_rule, metadata, domain_lower)
-                        {
-                            return Some(action);
-                        }
-                    }
-                }
-                None
+                // mihomo compat: logic.go — the payload is ONE gating
+                // condition and the target is the sub-rule group name. Only
+                // when the condition matches is the named group evaluated.
+                let cond = rule.sub_rules.first()?;
+                self.match_single_rule(usize::MAX, cond, metadata, domain_lower)?;
+                self.match_sub_rules_group(&rule.target, metadata, domain_lower, 0)
             }
 
             _ => None,
+        }
+    }
+
+    /// mihomo compat: logic.go `matchSubRules` — walk the named sub-rule
+    /// group; nested SUB-RULE entries recurse (depth-capped so a cyclic group
+    /// definition can't overflow the stack under panic=abort); a matched
+    /// "PASS-RULE" target skips to the next rule in the group.
+    fn match_sub_rules_group(
+        &self,
+        name: &str,
+        metadata: &RuleMetadata,
+        domain_lower: Option<&str>,
+        depth: usize,
+    ) -> Option<Action> {
+        if depth > 16 {
+            return None;
+        }
+        let rules = self.sub_rules.get(name)?;
+        for sub in rules {
+            let action = if sub.rule_type == "SUB-RULE" {
+                let Some(cond) = sub.sub_rules.first() else {
+                    continue;
+                };
+                if self
+                    .match_single_rule(usize::MAX, cond, metadata, domain_lower)
+                    .is_some()
+                {
+                    self.match_sub_rules_group(&sub.target, metadata, domain_lower, depth + 1)
+                } else {
+                    None
+                }
+            } else {
+                self.match_single_rule(usize::MAX, sub, metadata, domain_lower)
+            };
+            if let Some(action) = action {
+                if matches!(&action, Action::Proxy(n) if n == "PASS-RULE") {
+                    continue;
+                }
+                return Some(action);
+            }
+        }
+        None
+    }
+
+    /// mihomo compat: `C.Rule.ShouldResolveIP()` — destination-IP rules
+    /// resolve the host on demand unless tagged `no-resolve` (or `src`, which
+    /// implies it). Logic rules resolve if any nested rule would (mihomo
+    /// resolves lazily inside the nested Match via the helper); SUB-RULE
+    /// considers both its condition and the referenced group.
+    fn rule_wants_dst_resolution(&self, rule: &ParsedRule, depth: usize) -> bool {
+        if depth > 16 {
+            return false;
+        }
+        match rule.rule_type.as_str() {
+            "GEOIP" | "IP-CIDR" | "IP-CIDR6" | "IP-SUFFIX" | "IP-ASN" => {
+                let (is_src, no_resolve) = parse_params(&rule.params);
+                !is_src && !no_resolve
+            }
+            "AND" | "OR" | "NOT" => rule
+                .sub_rules
+                .iter()
+                .any(|r| self.rule_wants_dst_resolution(r, depth + 1)),
+            "SUB-RULE" => {
+                rule.sub_rules
+                    .iter()
+                    .any(|r| self.rule_wants_dst_resolution(r, depth + 1))
+                    || self.sub_rules.get(&rule.target).is_some_and(|rs| {
+                        rs.iter()
+                            .any(|r| self.rule_wants_dst_resolution(r, depth + 1))
+                    })
+            }
+            _ => false,
         }
     }
 
@@ -1085,122 +1427,213 @@ fn parse_provider_rule(rule_str: &str) -> Result<ParsedRule> {
     parse_rule_payload(rule_str, false)
 }
 
-/// Core rule parser matching mihomo's ParseRulePayload(ruleRaw, needTarget).
+/// Core rule parser matching mihomo's ParseRulePayload(ruleRaw, needTarget)
+/// (`rules/common/base.go:46-79`) plus the per-type validation mihomo does in
+/// the rule constructors (`rules/parser.go` ParseRule) — invalid payloads fail
+/// the config load instead of becoming silently inert rules.
 fn parse_rule_payload(rule_str: &str, need_target: bool) -> Result<ParsedRule> {
     let trimmed = rule_str.trim();
 
-    // Handle logical rules specially because their payloads contain commas
-    if trimmed.starts_with("AND,") || trimmed.starts_with("OR,") || trimmed.starts_with("NOT,") {
-        return parse_logical_rule(trimmed);
-    }
-
     let items: Vec<&str> = trimmed.split(',').map(|s| s.trim()).collect();
-    if items.is_empty() {
-        return Err(anyhow::anyhow!("empty rule"));
-    }
-
     let rule_type = items[0].to_uppercase();
 
     if items.len() == 1 {
         return Err(anyhow::anyhow!("invalid rule format: {rule_str}"));
     }
 
-    // MATCH rule: "MATCH,target"
+    // MATCH rule: "MATCH,target" — no payload, no params.
     if rule_type == "MATCH" {
         return Ok(ParsedRule {
             rule_type,
-            payload: String::new(),
             target: items[1].to_string(),
-            params: vec![],
+            ..Default::default()
         });
     }
 
-    let mut payload = items[1].to_string();
-
-    // Pre-lowercase domain payloads (NOT regex — regex uses case-insensitive flag)
-    match rule_type.as_str() {
-        "DOMAIN" | "DOMAIN-SUFFIX" | "DOMAIN-KEYWORD" => {
-            payload = payload.to_lowercase();
+    let mut rule = match rule_type.as_str() {
+        // mihomo compat (base.go:54-61): these payloads contain commas and
+        // take no params — the target is the LAST comma item, the payload is
+        // the rejoined middle. `DOMAIN-REGEX,^a{1,3}\.com$,Proxy` works.
+        "NOT" | "OR" | "AND" | "SUB-RULE" | "DOMAIN-REGEX" | "PROCESS-NAME-REGEX"
+        | "PROCESS-PATH-REGEX" => {
+            let (payload_items, target) = if need_target {
+                (&items[1..items.len() - 1], items[items.len() - 1])
+            } else {
+                (&items[1..], "")
+            };
+            ParsedRule {
+                rule_type: rule_type.clone(),
+                payload: payload_items.join(","),
+                target: target.to_string(),
+                ..Default::default()
+            }
         }
+        _ => {
+            let payload = items[1].to_string();
+            let (target, params) = if items.len() > 2 {
+                if need_target {
+                    // Main config: item[2] = target, item[3..] = params
+                    (
+                        items[2].to_string(),
+                        items[3..].iter().map(|s| s.to_string()).collect(),
+                    )
+                } else {
+                    // Provider rule: no target, item[2..] = params (e.g. "no-resolve")
+                    (
+                        String::new(),
+                        items[2..].iter().map(|s| s.to_string()).collect(),
+                    )
+                }
+            } else {
+                (String::new(), vec![])
+            };
+            ParsedRule {
+                rule_type: rule_type.clone(),
+                payload,
+                target,
+                params,
+                sub_rules: vec![],
+            }
+        }
+    };
+
+    // Per-type construction/validation, mirroring mihomo's rule constructors.
+    match rule.rule_type.as_str() {
+        // Pre-lowercase domain payloads (NOT regex — regex uses (?i) flag).
+        // mihomo compat: domain_wildcard.go:35 lowercases the pattern too.
+        "DOMAIN" | "DOMAIN-SUFFIX" | "DOMAIN-KEYWORD" | "DOMAIN-WILDCARD" => {
+            rule.payload = rule.payload.to_lowercase();
+        }
+
+        // mihomo compat: logic.go NewAND/NewOR/NewNOT parse each top-level
+        // parenthesized sub-payload through the full rule parser.
+        "AND" | "OR" => {
+            rule.sub_rules = parse_logic_sub_rules(&rule.payload)?;
+        }
+        "NOT" => {
+            rule.sub_rules = parse_logic_sub_rules(&rule.payload)?;
+            if rule.sub_rules.len() != 1 {
+                return Err(anyhow::anyhow!("not rule must contain one rule"));
+            }
+        }
+        // mihomo compat: SUB-RULE payload is ONE gating condition; the target
+        // is the sub-rule group name (logic.go NewSubRule wraps in parens).
+        "SUB-RULE" => {
+            rule.sub_rules = parse_logic_sub_rules(&format!("({})", rule.payload))?;
+            if rule.sub_rules.len() != 1 {
+                return Err(anyhow::anyhow!("Sub-Rule rule must contain one rule"));
+            }
+        }
+
+        // mihomo compat: port.go NewPort errors on invalid/empty specs.
+        "SRC-PORT" | "DST-PORT" | "IN-PORT" => {
+            let ranges = parse_port_ranges(&rule.payload)
+                .map_err(|e| anyhow::anyhow!("payloadRule error: {e}"))?;
+            if ranges.is_empty() {
+                return Err(anyhow::anyhow!("payloadRule error: empty port ranges"));
+            }
+        }
+
+        // mihomo compat: uid.go errors on invalid/empty ranges.
+        "UID" => {
+            let ranges = parse_u32_ranges(&rule.payload)
+                .map_err(|e| anyhow::anyhow!("payloadRule error: {e}"))?;
+            if ranges.is_empty() {
+                return Err(anyhow::anyhow!("payloadRule error: empty uid ranges"));
+            }
+        }
+
+        // mihomo compat: dscp.go — "*" is allowed (matches all), values > 63 error.
+        "DSCP" => {
+            let ranges = parse_u32_ranges(&rule.payload)
+                .map_err(|e| anyhow::anyhow!("parse DSCP rule fail: {e}"))?;
+            if ranges.iter().any(|&(_, end)| end > 63) {
+                return Err(anyhow::anyhow!("DSCP couldn't be negative or exceed 63"));
+            }
+        }
+
+        // mihomo compat: in_user.go / in_name.go — empty list entries error.
+        "IN-USER" | "IN-NAME" => {
+            if rule.payload.split('/').any(|s| s.trim().is_empty()) {
+                return Err(anyhow::anyhow!("in user couldn't be empty"));
+            }
+        }
+
+        // mihomo compat: ipcidr.go / ipsuffix.go — netip.ParsePrefix errors
+        // fail the config load.
+        "IP-CIDR" | "IP-CIDR6" | "SRC-IP-CIDR" => {
+            if PreParsedCidr::parse(&rule.payload).is_none() {
+                return Err(anyhow::anyhow!("payloadRule error: {}", rule.payload));
+            }
+        }
+        "IP-SUFFIX" | "SRC-IP-SUFFIX" => {
+            if parse_ip_suffix(&rule.payload).is_none() {
+                return Err(anyhow::anyhow!("payloadRule error: {}", rule.payload));
+            }
+        }
+
         _ => {}
     }
 
-    let (target, params) = if items.len() > 2 {
-        if need_target {
-            // Main config: item[2] = target, item[3..] = params
-            let target = items[2].to_string();
-            let params: Vec<String> = items[3..].iter().map(|s| s.to_string()).collect();
-            (target, params)
-        } else {
-            // Provider rule: no target, item[2..] = params (e.g. "no-resolve")
-            let params: Vec<String> = items[2..].iter().map(|s| s.to_string()).collect();
-            (String::new(), params)
-        }
-    } else {
-        (String::new(), vec![])
-    };
-
-    Ok(ParsedRule {
-        rule_type,
-        payload,
-        target,
-        params,
-    })
+    Ok(rule)
 }
 
-/// Parse logical rules: AND,((RULE1),(RULE2)),target
-/// OR,((RULE1),(RULE2)),target
-/// NOT,((RULE)),target
-fn parse_logical_rule(rule_str: &str) -> Result<ParsedRule> {
-    // Find the rule type
-    let first_comma = rule_str
-        .find(',')
-        .ok_or_else(|| anyhow::anyhow!("invalid logical rule: {rule_str}"))?;
-    let rule_type = rule_str[..first_comma].trim().to_string();
-    let rest = &rule_str[first_comma + 1..];
-
-    // The payload is everything inside the outermost ((...)) and the target is
-    // after the closing parentheses. We need to find the matching closing '))'
-    // by tracking nesting depth.
-    let rest = rest.trim();
-    if !rest.starts_with('(') {
-        return Err(anyhow::anyhow!(
-            "logical rule payload must start with '(': {rule_str}"
-        ));
+/// mihomo compat: logic.go `parsePayload`/`format`/`findSubRuleRange` — the
+/// payload must be `(...)`-wrapped; collect every balanced range, skip the one
+/// covering the whole payload, and keep the outermost of the rest. Each kept
+/// sub-payload goes through the full rule parser with needTarget=false. MATCH
+/// and SUB-RULE are rejected inside logic rules (logic.go payloadToRule).
+fn parse_logic_sub_rules(payload: &str) -> Result<Vec<ParsedRule>> {
+    if !payload.starts_with('(') || !payload.ends_with(')') {
+        return Err(anyhow::anyhow!("payload format error"));
     }
 
-    let mut depth = 0i32;
-    let mut end_idx = 0;
-    for (i, ch) in rest.char_indices() {
+    // format(): all balanced ranges, byte offsets, sorted by start.
+    let mut stack: Vec<usize> = Vec::new();
+    let mut all_ranges: Vec<(usize, usize)> = Vec::new();
+    for (i, ch) in payload.char_indices() {
         match ch {
-            '(' => depth += 1,
+            '(' => stack.push(i),
             ')' => {
-                depth -= 1;
-                if depth == 0 {
-                    end_idx = i;
-                    break;
-                }
+                let start = stack.pop().ok_or_else(|| anyhow::anyhow!("missing '('"))?;
+                all_ranges.push((start, i));
             }
             _ => {}
         }
     }
+    if !stack.is_empty() {
+        return Err(anyhow::anyhow!("format error is missing )"));
+    }
+    all_ranges.sort_by_key(|&(s, _)| s);
 
-    if depth != 0 {
-        return Err(anyhow::anyhow!(
-            "unbalanced parentheses in logical rule: {rule_str}"
-        ));
+    // findSubRuleRange(): skip the whole-payload range; keep ranges not
+    // strictly contained in an already-kept range (parents come first).
+    let whole = (0usize, payload.len() - 1);
+    let mut kept: Vec<(usize, usize)> = Vec::new();
+    for &(s, e) in &all_ranges {
+        if (s, e) == whole {
+            continue;
+        }
+        if kept.iter().any(|&(ks, ke)| ks < s && ke > e) {
+            continue;
+        }
+        kept.push((s, e));
     }
 
-    let payload = rest[..=end_idx].to_string();
-    let after = rest[end_idx + 1..].trim_start_matches(',').trim();
-    let target = after.to_string();
-
-    Ok(ParsedRule {
-        rule_type,
-        payload,
-        target,
-        params: vec![],
-    })
+    let mut subs = Vec::with_capacity(kept.len());
+    for (s, e) in kept {
+        let sub_payload = &payload[s + 1..e];
+        let sub = parse_rule_payload(sub_payload, false)
+            .map_err(|_| anyhow::anyhow!("[{sub_payload}] format is error"))?;
+        if sub.rule_type == "MATCH" || sub.rule_type == "SUB-RULE" {
+            return Err(anyhow::anyhow!(
+                "unsupported rule type [{}] on logic rule",
+                sub.rule_type
+            ));
+        }
+        subs.push(sub);
+    }
+    Ok(subs)
 }
 
 #[inline]
@@ -1283,50 +1716,84 @@ fn ip_is_lan(ip: &IpAddr) -> bool {
     }
 }
 
-/// mihomo compat: `C.Rule.ShouldResolveIP()` — destination-IP rules resolve the
-/// host on demand unless tagged `no-resolve`. `SRC-*` rules match the (already
-/// known) source address and never trigger destination resolution.
-#[inline]
-fn rule_resolves_dst_ip(rule: &ParsedRule) -> bool {
-    let is_ip_dst_rule = matches!(
-        rule.rule_type.as_str(),
-        "GEOIP" | "IP-CIDR" | "IP-CIDR6" | "IP-SUFFIX" | "IP-ASN"
-    );
-    is_ip_dst_rule && !rule.params.iter().any(|p| p == "no-resolve")
-}
-
-/// Parse mihomo-style port specification: "80", "80/443", "1000-2000", "80-90/443/8080-9090"
-/// Also supports comma as separator (mihomo normalizes "," to "/").
-fn parse_port_spec(spec: &str) -> Vec<(u16, u16)> {
-    let mut ranges = Vec::new();
-    // mihomo compat: commas are treated as slashes
+/// mihomo compat: unsigned range-list parser (`common/utils/ranges.go`
+/// newIntRanges + `range.go` newIntRange). "" and "*" yield an empty list
+/// (`IntRanges.Check` treats empty as match-all); ',' is normalized to '/';
+/// at most 28 ranges; "a-b" with inverted bounds is swapped (NewRange); Go's
+/// `T(val)` conversion truncates, so out-of-range values wrap like mihomo.
+fn parse_unsigned_ranges(spec: &str, bits: u32) -> Result<Vec<(u64, u64)>> {
+    let spec = spec.trim();
+    if spec.is_empty() || spec == "*" {
+        return Ok(vec![]);
+    }
     let normalized = spec.replace(',', "/");
-    for part in normalized.split('/') {
+    let parts: Vec<&str> = normalized.split('/').collect();
+    if parts.len() > 28 {
+        return Err(anyhow::anyhow!(
+            "intRanges error, too many ranges to use, maximum support 28 ranges"
+        ));
+    }
+    let mask: u64 = if bits >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << bits) - 1
+    };
+    let parse_one = |s: &str| -> Result<u64> {
+        s.trim_matches(|c| c == '[' || c == ']' || c == ' ')
+            .parse::<u64>()
+            .map(|v| v & mask)
+            .map_err(|_| anyhow::anyhow!("invalid range: {s}"))
+    };
+    let mut ranges = Vec::new();
+    for part in parts {
         let part = part.trim();
         if part.is_empty() {
             continue;
         }
-        if let Some((start, end)) = part.split_once('-') {
-            if let (Ok(s), Ok(e)) = (start.trim().parse::<u16>(), end.trim().parse::<u16>()) {
-                ranges.push((s, e));
+        let seg: Vec<&str> = part.split('-').collect();
+        match seg.len() {
+            1 => {
+                let v = parse_one(seg[0])?;
+                ranges.push((v, v));
             }
-        } else if let Ok(p) = part.parse::<u16>() {
-            ranges.push((p, p));
+            2 => {
+                let a = parse_one(seg[0])?;
+                let b = parse_one(seg[1])?;
+                ranges.push(if a > b { (b, a) } else { (a, b) });
+            }
+            _ => return Err(anyhow::anyhow!("invalid range: {part}")),
         }
     }
-    ranges
+    Ok(ranges)
 }
 
-/// Check if a port matches a mihomo-style port spec (single, multi, range, or combined).
+/// Parse a port spec ("80", "80/443", "1000-2000", combined) into ranges.
+/// mihomo compat: port.go NewPort errors on invalid or empty specs.
+fn parse_port_ranges(spec: &str) -> Result<Vec<(u16, u16)>> {
+    Ok(parse_unsigned_ranges(spec, 16)?
+        .into_iter()
+        .map(|(a, b)| (a as u16, b as u16))
+        .collect())
+}
+
+/// Parse a u32 range spec (UID / DSCP rules).
+fn parse_u32_ranges(spec: &str) -> Result<Vec<(u32, u32)>> {
+    Ok(parse_unsigned_ranges(spec, 32)?
+        .into_iter()
+        .map(|(a, b)| (a as u32, b as u32))
+        .collect())
+}
+
+/// Check if a port matches a mihomo-style port spec. Used for rules without a
+/// pre-parsed index (logic sub-rules). mihomo compat: `IntRanges.Check` —
+/// empty ranges match everything; an unparseable spec never matches (the main
+/// config path rejects it at load).
 fn port_matches(port: u16, spec: &str) -> bool {
-    let ranges = parse_port_spec(spec);
-    if ranges.is_empty() {
-        // mihomo compat: empty ranges match everything
-        return true;
+    match parse_port_ranges(spec) {
+        Ok(ranges) if ranges.is_empty() => true,
+        Ok(ranges) => port_matches_pre(port, &ranges),
+        Err(_) => false,
     }
-    ranges
-        .iter()
-        .any(|&(start, end)| port >= start && port <= end)
 }
 
 /// Fast port matching against pre-parsed ranges (avoids re-parsing per match).
@@ -1335,6 +1802,15 @@ fn port_matches_pre(port: u16, ranges: &[(u16, u16)]) -> bool {
     ranges
         .iter()
         .any(|&(start, end)| port >= start && port <= end)
+}
+
+/// mihomo compat: `IntRanges.Check` — empty ranges match everything.
+#[inline]
+fn u32_ranges_check(value: u32, ranges: &[(u32, u32)]) -> bool {
+    ranges.is_empty()
+        || ranges
+            .iter()
+            .any(|&(start, end)| value >= start && value <= end)
 }
 
 /// Match a domain against a regex pattern using the `regex` crate.
@@ -1353,204 +1829,7 @@ fn match_domain_regex(pattern: &str, domain: &str) -> bool {
     }
 }
 
-/// Parse the inner conditions from a logical rule payload.
-/// Input like `((DOMAIN-SUFFIX,google.com),(NETWORK,udp))` returns
-/// vec!["DOMAIN-SUFFIX,google.com", "NETWORK,udp"].
-fn parse_logical_conditions(payload: &str) -> Vec<String> {
-    let mut conditions = Vec::new();
-    let trimmed = payload.trim();
-
-    // Strip the outer parentheses
-    let inner = if trimmed.starts_with('(') && trimmed.ends_with(')') {
-        &trimmed[1..trimmed.len() - 1]
-    } else {
-        trimmed
-    };
-
-    // Now parse comma-separated conditions, each wrapped in ()
-    let mut depth = 0i32;
-    let mut start = 0;
-    for (i, ch) in inner.char_indices() {
-        match ch {
-            '(' => {
-                if depth == 0 {
-                    start = i + 1; // content starts after '('
-                }
-                depth += 1;
-            }
-            ')' => {
-                depth -= 1;
-                if depth == 0 {
-                    let cond = inner[start..i].trim().to_string();
-                    if !cond.is_empty() {
-                        conditions.push(cond);
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-
-    conditions
-}
-
-/// Evaluate a single condition string (e.g. "DOMAIN-SUFFIX,google.com") against metadata.
-fn eval_condition(
-    condition: &str,
-    metadata: &RuleMetadata,
-    engine: &RuleEngine,
-    domain_lower: Option<&str>,
-) -> bool {
-    let parts: Vec<&str> = condition.splitn(2, ',').collect();
-    if parts.len() < 2 {
-        return false;
-    }
-    let rule_type = parts[0].trim();
-    let payload = parts[1].trim();
-
-    match rule_type {
-        "DOMAIN" => {
-            if let Some(d) = domain_lower {
-                d == payload.to_lowercase()
-            } else {
-                false
-            }
-        }
-        "DOMAIN-SUFFIX" => {
-            if let Some(d) = domain_lower {
-                let p = payload.to_lowercase();
-                (d.len() > p.len()
-                    && d.ends_with(p.as_str())
-                    && d.as_bytes()[d.len() - p.len() - 1] == b'.')
-                    || d == p.as_str()
-            } else {
-                false
-            }
-        }
-        "DOMAIN-SUFFIX-STRICT" => {
-            if let Some(d) = domain_lower {
-                let p = payload.to_lowercase();
-                d.len() > p.len()
-                    && d.ends_with(p.as_str())
-                    && d.as_bytes()[d.len() - p.len() - 1] == b'.'
-            } else {
-                false
-            }
-        }
-        "DOMAIN-KEYWORD" => {
-            if let Some(d) = domain_lower {
-                d.contains(&payload.to_lowercase()[..])
-            } else {
-                false
-            }
-        }
-        "DOMAIN-REGEX" => {
-            if let Some(d) = domain_lower {
-                // Use pre-compiled regex from engine cache when available
-                if let Some(re) = engine.compiled_regexes.get(payload) {
-                    re.is_match(d)
-                } else {
-                    match_domain_regex(payload, d)
-                }
-            } else {
-                false
-            }
-        }
-        "IP-CIDR" | "IP-CIDR6" => {
-            if let Some(ref ip) = metadata.dst_ip {
-                // Quick CIDR check
-                check_ip_in_cidr(ip, payload)
-            } else {
-                false
-            }
-        }
-        "SRC-IP-CIDR" => {
-            if let Some(ref ip) = metadata.src_ip {
-                check_ip_in_cidr(ip, payload)
-            } else {
-                false
-            }
-        }
-        "GEOIP" => {
-            if let Some(ref ip) = metadata.dst_ip {
-                engine
-                    .geoip_matcher
-                    .lookup_country(ip)
-                    .map(|c| c.eq_ignore_ascii_case(payload))
-                    .unwrap_or(false)
-            } else {
-                false
-            }
-        }
-        "GEOSITE" => {
-            if let Some(ref domain) = metadata.domain {
-                engine.geosite_matcher.lookup(domain, payload)
-            } else {
-                false
-            }
-        }
-        "NETWORK" => metadata.network.eq_ignore_ascii_case(payload),
-        "DST-PORT" => port_matches(metadata.dst_port, payload),
-        "SRC-PORT" => port_matches(metadata.src_port, payload),
-        "PROCESS-NAME" => metadata
-            .process_name
-            .as_ref()
-            .map(|n| n == payload)
-            .unwrap_or(false),
-        "PROCESS-PATH" => metadata
-            .process_path
-            .as_ref()
-            .map(|p| p == payload)
-            .unwrap_or(false),
-        _ => false,
-    }
-}
-
-fn match_logical_and(
-    payload: &str,
-    metadata: &RuleMetadata,
-    engine: &RuleEngine,
-    domain_lower: Option<&str>,
-) -> bool {
-    let conditions = parse_logical_conditions(payload);
-    if conditions.is_empty() {
-        return false;
-    }
-    conditions
-        .iter()
-        .all(|c| eval_condition(c, metadata, engine, domain_lower))
-}
-
-fn match_logical_or(
-    payload: &str,
-    metadata: &RuleMetadata,
-    engine: &RuleEngine,
-    domain_lower: Option<&str>,
-) -> bool {
-    let conditions = parse_logical_conditions(payload);
-    if conditions.is_empty() {
-        return false;
-    }
-    conditions
-        .iter()
-        .any(|c| eval_condition(c, metadata, engine, domain_lower))
-}
-
-fn match_logical_not(
-    payload: &str,
-    metadata: &RuleMetadata,
-    engine: &RuleEngine,
-    domain_lower: Option<&str>,
-) -> bool {
-    let conditions = parse_logical_conditions(payload);
-    if conditions.is_empty() {
-        return false;
-    }
-    // NOT applies to the first (and typically only) condition
-    !eval_condition(&conditions[0], metadata, engine, domain_lower)
-}
-
-/// Fallback CIDR check for eval_condition and unparseable rules.
+/// Fallback CIDR check for rules without a pre-parsed index (logic sub-rules).
 /// Uses split_once to avoid Vec allocation from split().collect().
 fn check_ip_in_cidr(ip: &IpAddr, cidr: &str) -> bool {
     let (addr_str, prefix_str) = match cidr.split_once('/') {
@@ -1629,14 +1908,52 @@ fn wildcard_match(pattern: &str, text: &str) -> bool {
     pi == plen
 }
 
-fn check_ip_suffix(ip: &IpAddr, suffix: &str) -> bool {
-    // IP-SUFFIX format: "1.2.3.0/24" means the last 24 bits match
-    // Or just a plain IP suffix string
-    if suffix.contains('/') {
-        return check_ip_in_cidr(ip, suffix);
+/// Parse an IP-SUFFIX payload "addr/bits" into (address bytes, suffix bits).
+/// mihomo compat: ipsuffix.go NewIPSuffix — netip.ParsePrefix rejects anything
+/// else at config load.
+fn parse_ip_suffix(payload: &str) -> Option<(Vec<u8>, u32)> {
+    let (addr_str, bits_str) = payload.split_once('/')?;
+    let addr: IpAddr = addr_str.trim().parse().ok()?;
+    let bits: u32 = bits_str.trim().parse().ok()?;
+    let bytes = match addr {
+        IpAddr::V4(v4) => v4.octets().to_vec(),
+        IpAddr::V6(v6) => v6.octets().to_vec(),
+    };
+    if bits as usize > bytes.len() * 8 {
+        return None;
     }
-    // Fallback: string suffix match (allocates, but IP-SUFFIX is rare)
-    ip.to_string().ends_with(suffix)
+    Some((bytes, bits))
+}
+
+/// mihomo compat: ipsuffix.go Match — compares the TRAILING `bits` bits of the
+/// address against the payload address ("IP-SUFFIX,8.8.8.8/24" matches any
+/// x.8.8.8), full bytes from the end plus a low-bit partial-byte check.
+fn check_ip_suffix(ip: &IpAddr, suffix: &str) -> bool {
+    let Some((pref_bytes, bits)) = parse_ip_suffix(suffix) else {
+        return false;
+    };
+    let ip_bytes = match ip {
+        IpAddr::V4(v4) => v4.octets().to_vec(),
+        IpAddr::V6(v6) => v6.octets().to_vec(),
+    };
+    if ip_bytes.len() != pref_bytes.len() {
+        return false;
+    }
+    let size = ip_bytes.len();
+    let full = (bits / 8) as usize;
+    for i in 1..=full {
+        if pref_bytes[size - i] != ip_bytes[size - i] {
+            return false;
+        }
+    }
+    let rem = bits % 8;
+    if rem != 0 {
+        let idx = size - full - 1;
+        if pref_bytes[idx] << (8 - rem) != ip_bytes[idx] << (8 - rem) {
+            return false;
+        }
+    }
+    true
 }
 
 fn default_home_dir() -> PathBuf {
@@ -1780,10 +2097,8 @@ mod tests {
     async fn rule_engine_geoip_lan() {
         use std::net::Ipv4Addr;
         // mihomo compat: GEOIP,lan matches private/reserved IPs with no mmdb.
-        let rules: Vec<RuleString> = vec![
-            "GEOIP,lan,DIRECT".to_string(),
-            "MATCH,Proxy".to_string(),
-        ];
+        let rules: Vec<RuleString> =
+            vec!["GEOIP,lan,DIRECT".to_string(), "MATCH,Proxy".to_string()];
         let providers = HashMap::new();
         let engine = RuleEngine::new(&rules, &providers).await.unwrap();
 
@@ -2005,11 +2320,56 @@ mod tests {
     }
 
     #[test]
-    fn parse_logical_conditions_test() {
-        let conditions = parse_logical_conditions("((DOMAIN-SUFFIX,google.com),(NETWORK,udp))");
-        assert_eq!(conditions.len(), 2);
-        assert_eq!(conditions[0], "DOMAIN-SUFFIX,google.com");
-        assert_eq!(conditions[1], "NETWORK,udp");
+    fn parse_logic_sub_rules_test() {
+        // mihomo compat: logic.go format/findSubRuleRange — second-level
+        // ranges of the wrapped payload become the sub-rules.
+        let subs = parse_logic_sub_rules("((DOMAIN-SUFFIX,google.com),(NETWORK,udp))").unwrap();
+        assert_eq!(subs.len(), 2);
+        assert_eq!(subs[0].rule_type, "DOMAIN-SUFFIX");
+        assert_eq!(subs[0].payload, "google.com");
+        assert_eq!(subs[1].rule_type, "NETWORK");
+        assert_eq!(subs[1].payload, "udp");
+    }
+
+    #[test]
+    fn parse_logic_nested() {
+        // Nested logic parses recursively through the full parser.
+        let rule =
+            parse_rule("AND,((OR,((DOMAIN,a.com),(DOMAIN,b.com))),(NETWORK,tcp)),Proxy").unwrap();
+        assert_eq!(rule.rule_type, "AND");
+        assert_eq!(rule.target, "Proxy");
+        assert_eq!(rule.sub_rules.len(), 2);
+        assert_eq!(rule.sub_rules[0].rule_type, "OR");
+        assert_eq!(rule.sub_rules[0].sub_rules.len(), 2);
+        assert_eq!(rule.sub_rules[1].rule_type, "NETWORK");
+    }
+
+    #[test]
+    fn parse_logic_sub_rule_params() {
+        // (IP-CIDR,1.2.3.0/24,no-resolve) inside logic keeps its params.
+        let rule = parse_rule("AND,((IP-CIDR,1.2.3.0/24,no-resolve),(NETWORK,tcp)),Proxy").unwrap();
+        assert_eq!(rule.sub_rules[0].payload, "1.2.3.0/24");
+        assert_eq!(rule.sub_rules[0].params, vec!["no-resolve"]);
+    }
+
+    #[test]
+    fn parse_domain_regex_with_commas() {
+        // mihomo compat: base.go:55-61 — target is the LAST item; the payload
+        // is the rejoined middle.
+        let rule = parse_rule(r"DOMAIN-REGEX,^a{1,3}\.com$,Proxy").unwrap();
+        assert_eq!(rule.payload, r"^a{1,3}\.com$");
+        assert_eq!(rule.target, "Proxy");
+    }
+
+    #[test]
+    fn parse_sub_rule_condition_and_group() {
+        // mihomo compat: payload = gating condition, target = group name.
+        let rule = parse_rule("SUB-RULE,(DOMAIN,example.com),my-group").unwrap();
+        assert_eq!(rule.rule_type, "SUB-RULE");
+        assert_eq!(rule.target, "my-group");
+        assert_eq!(rule.sub_rules.len(), 1);
+        assert_eq!(rule.sub_rules[0].rule_type, "DOMAIN");
+        assert_eq!(rule.sub_rules[0].payload, "example.com");
     }
 
     // -----------------------------------------------------------------------
@@ -2070,11 +2430,39 @@ mod tests {
     }
 
     #[test]
-    fn parse_port_spec_ignores_invalid_parts() {
-        let ranges = parse_port_spec("80/abc/443");
-        assert_eq!(ranges.len(), 2);
-        assert_eq!(ranges[0], (80, 80));
-        assert_eq!(ranges[1], (443, 443));
+    fn parse_port_ranges_rejects_invalid_parts() {
+        // mihomo compat: port.go NewPort errors on unparseable specs (config
+        // load failure), no silent skipping.
+        assert!(parse_port_ranges("80/abc/443").is_err());
+        assert!(parse_rule("DST-PORT,abc,Proxy").is_err());
+        assert!(parse_rule("DST-PORT,*,Proxy").is_err());
+        // Inverted ranges are swapped (range.go NewRange).
+        assert_eq!(parse_port_ranges("2000-1000").unwrap(), vec![(1000, 2000)]);
+    }
+
+    #[test]
+    fn ip_suffix_matches_trailing_bits() {
+        // mihomo compat: ipsuffix.go — IP-SUFFIX,8.8.8.8/24 matches x.8.8.8.
+        let ip: IpAddr = "1.8.8.8".parse().unwrap();
+        assert!(check_ip_suffix(&ip, "8.8.8.8/24"));
+        let ip: IpAddr = "8.8.8.1".parse().unwrap();
+        assert!(!check_ip_suffix(&ip, "8.8.8.8/24"));
+        // Partial byte: trailing 17 bits — low bit of the boundary byte counts.
+        let ip: IpAddr = "1.0.8.8".parse().unwrap();
+        assert!(check_ip_suffix(&ip, "8.8.8.8/17"));
+        // Family mismatch never matches.
+        let ip: IpAddr = "::1".parse().unwrap();
+        assert!(!check_ip_suffix(&ip, "8.8.8.8/24"));
+    }
+
+    #[test]
+    fn uid_ranges_and_lists() {
+        assert_eq!(
+            parse_u32_ranges("1000-1100/2000").unwrap(),
+            vec![(1000, 1100), (2000, 2000)]
+        );
+        assert!(parse_rule("UID,abc,Proxy").is_err());
+        assert!(parse_rule("DSCP,100,Proxy").is_err()); // > 63
     }
 
     // -----------------------------------------------------------------------

@@ -6,7 +6,7 @@ Same CLI, same config, same REST API — for the OpenClash runtime surface.
 Anything outside that surface is explicitly carved out below; swap the binary
 for the in-scope set.
 
-**Single static musl binary, ~30k lines of Rust, 436 tests.**
+**Single static musl binary, ~30k lines of Rust, 490 tests.**
 
 This file is the control center: mission, scope, boot/connection flow, the
 OpenClash contract, and an Index of the per-subsystem docs under
@@ -31,8 +31,8 @@ Anything outside the lists below fails the config load with mihomo's verbatim
 | Outbounds | `direct` / `reject` (built-in + user-defined), `ss`, `ssr`, `socks5`, `http`, `vmess`, `vless`, `trojan`, `snell`, `anytls` |
 | Inbounds | http, socks5, mixed, redir, tproxy, tun (system + gvisor). Configured via top-level `port` / `socks-port` / `mixed-port` / `redir-port` / `tproxy-port` / `tun:` only — the mihomo `listeners:` block is out of scope (rejected at load time). |
 | Transports | TCP, TLS, WS, gRPC, H2, Reality, XTLS-Vision |
-| DNS | UDP, TCP, DoT (`tls://`), DoH (`https://`), system, fakeip, nameserver-policy, fallback with GeoIP anti-poison |
-| Rule providers | yaml + text formats (classical / domain / ipcidr) |
+| DNS | UDP, TCP, DoT (`tls://`), DoH (`https://`), system, fakeip, nameserver-policy, fallback with GeoIP anti-poison. `fake-ip-filter` supports plain patterns, `geosite:` and `rule-set:` entries. |
+| Rule providers | yaml + text formats (classical / domain / ipcidr); mrs format for `domain` behavior (OpenClash's meta-rules-dat lists) |
 | REST API | the routes implemented under `src/api/`: `/configs`, `/proxies`, `/group{,s}`, `/rules`, `/connections`, `/providers/proxies`, `/providers/rules`, `/dns/query`, `/logs`, `/traffic`, `/version`, `/memory`, UI. `/providers/rules` is partial-but-honest — see [ARCHITECTURE/api.md](ARCHITECTURE/api.md). |
 | CLI | `-d`, `-f`, `-f -`, `--config <base64>`, `--ext-ctl`, `--ext-ctl-unix`, `--secret`, `--ext-ui`, `-m`, `-t`, `-v` |
 
@@ -43,7 +43,7 @@ Anything outside the lists below fails the config load with mihomo's verbatim
 | Outbounds: `hysteria` v1, `hysteria2`, `tuic`, `wireguard`, `ssh`, `dns` (config-defined), `mieru`, `sudoku`, `masque`, `trusttunnel`, `smux` wrapper | QUIC stack / userspace WG / SSH client / niche / experimental |
 | `listeners:` config block (any non-empty value, all listener types) | OpenClash uses redir/tproxy/TUN driven by top-level port flags — the richer `listeners:` block is rejected at load time so an operator never thinks a custom listener is running when it isn't |
 | DNS: `quic://`, `h3://`, `dhcp://`, `rcode://`, DoH server, full EDNS subnet | QUIC stack / DHCP client deps; niche |
-| MRS rule provider (zstd binary) | YAML/text formats cover the same use case |
+| MRS rule provider with `ipcidr` behavior | Only `domain`-behavior mrs is implemented (what OpenClash ships for its CN lists); ipcidr mrs errors at provider load, never a silent text fallback |
 | REST: `/cache/*`, `/doh`, real `/restart`, real `/upgrade/*` | Niche operator endpoints; `/upgrade` is dangerous on appliances anyway |
 | Rule provider runtime reload (`PUT /providers/rules/:name`) | Providers are merged into the engine at construction; `PUT` returns 503. Edit config and reload to re-ingest. |
 | QUIC sniffer | Tied to QUIC stack |
@@ -95,8 +95,10 @@ Process start through "ready" lives in the three top-level files —
    bypass debugging; apply `--ext-ctl{,-unix}` / `--secret` overrides; then
    `Engine::new(...).run()`.
 3. **`Engine::run()`** (`src/main.rs:498`): build the DNS resolver (load the
-   FakeIP cache when `store-fake-ip`), then the rule engine (wired back into the
-   resolver as the geosite checker for `fake-ip-filter`), then the proxy manager
+   FakeIP cache when `store-fake-ip`), then the rule engine (auto-downloading
+   missing geo databases referenced by rules — `src/rules/geodata.rs`; wired
+   back into the resolver as the geosite + rule-set checkers for
+   `fake-ip-filter` and `nameserver-policy`), then the proxy manager
    (restore selections via `store::load_selected` when `store-selected`),
    assemble shared `AppState` and the `ConnectionManager`.
 4. **Ready**: spawn one task each for the API server, TUN, the embedded DNS

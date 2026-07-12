@@ -44,6 +44,135 @@ fn proxy_extra(state: &ApiState, name: &str) -> Value {
     Value::Object(extras.into_iter().collect())
 }
 
+/// mihomo compat: constant/adapters.go DefaultTestURL
+const DEFAULT_TEST_URL: &str = "https://www.gstatic.com/generate_204";
+
+/// Group config fields needed by `group_json`.
+struct GroupConfigFields {
+    /// Raw `url:` from config (per-type blanking/defaulting happens in
+    /// `group_json`).
+    url: Option<String>,
+    hidden: bool,
+    icon: String,
+    disable_udp: bool,
+    /// mihomo compat: parser.go:123-127 — expected-status is trimmed and
+    /// normalized to "*" when unset/empty.
+    expected_status: String,
+    /// mihomo compat: parser.go:74-76 — empty-fallback defaults to COMPATIBLE.
+    empty_fallback: String,
+}
+
+fn group_config_fields(state: &ApiState, name: &str) -> GroupConfigFields {
+    let config = state.app.config();
+    if let Some(g) = config.proxy_groups.iter().find(|g| g.name == name) {
+        let expected_status = g
+            .expected_status
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("*")
+            .to_string();
+        let empty_fallback = g
+            .extra
+            .get("empty-fallback")
+            .and_then(|v| v.as_str())
+            .unwrap_or("COMPATIBLE")
+            .to_string();
+        GroupConfigFields {
+            url: g.url.clone(),
+            hidden: g.hidden.unwrap_or(false),
+            icon: g.icon.clone().unwrap_or_default(),
+            disable_udp: g.disable_udp.unwrap_or(false),
+            expected_status,
+            empty_fallback,
+        }
+    } else {
+        GroupConfigFields {
+            url: None,
+            hidden: false,
+            icon: String::new(),
+            disable_udp: false,
+            expected_status: "*".to_string(),
+            empty_fallback: "COMPATIBLE".to_string(),
+        }
+    }
+}
+
+/// Build the full JSON object for a proxy group, matching the fields mihomo's
+/// group MarshalJSON + adapter.Proxy wrapper emit that dashboards read.
+///
+/// mihomo compat, per group type:
+/// - Selector (selector.go:52-73): `now` + `testUrl` blanked when it equals
+///   DefaultTestURL (so the dashboard follows its own settings); NO
+///   `expectedStatus` / `fixed` keys.
+/// - URLTest (urltest.go:169-185) / Fallback (fallback.go:79-95): `now`,
+///   `testUrl` as configured (not blanked), `expectedStatus` and `fixed`
+///   (the force-pinned name).
+/// - LoadBalance (loadbalance.go:225-239): NO `now` key, `testUrl`,
+///   `expectedStatus`.
+fn group_json(state: &ApiState, name: &str, group: &dyn crate::proxy_group::ProxyGroup) -> Value {
+    let cfg = group_config_fields(state, name);
+    let gtype = group.group_type();
+
+    // mihomo compat: SupportUDP — selector.go:38-44 / urltest.go:156-161 /
+    // fallback.go:64-71 resolve the active member's SupportUDP (recursively
+    // through nested groups); loadbalance.go:123-125 is just !disableUDP.
+    let udp = if cfg.disable_udp {
+        false
+    } else if gtype == "LoadBalance" {
+        true
+    } else {
+        state
+            .app
+            .proxy_manager()
+            .resolve(name)
+            .map(|h| h.supports_udp())
+            .unwrap_or(false)
+    };
+
+    let mut obj = serde_json::Map::new();
+    obj.insert("name".to_string(), json!(name));
+    obj.insert("type".to_string(), json!(gtype));
+    obj.insert("udp".to_string(), json!(udp));
+    obj.insert("history".to_string(), json!(proxy_history(state, name)));
+    obj.insert("extra".to_string(), proxy_extra(state, name));
+    obj.insert("all".to_string(), json!(group.all()));
+    obj.insert("alive".to_string(), json!(proxy_alive(state, name)));
+    obj.insert("hidden".to_string(), json!(cfg.hidden));
+    obj.insert("icon".to_string(), json!(cfg.icon));
+    obj.insert("emptyFallback".to_string(), json!(cfg.empty_fallback));
+
+    match gtype {
+        "LoadBalance" => {
+            obj.insert(
+                "testUrl".to_string(),
+                json!(cfg.url.as_deref().unwrap_or(DEFAULT_TEST_URL)),
+            );
+            obj.insert("expectedStatus".to_string(), json!(cfg.expected_status));
+        }
+        "URLTest" | "Fallback" => {
+            obj.insert("now".to_string(), json!(group.now()));
+            obj.insert(
+                "testUrl".to_string(),
+                json!(cfg.url.as_deref().unwrap_or(DEFAULT_TEST_URL)),
+            );
+            obj.insert("expectedStatus".to_string(), json!(cfg.expected_status));
+            obj.insert("fixed".to_string(), json!(group.fixed()));
+        }
+        // Selector (and unknown types treated as selector)
+        _ => {
+            obj.insert("now".to_string(), json!(group.now()));
+            let url = match cfg.url.as_deref() {
+                None | Some(DEFAULT_TEST_URL) => "",
+                Some(u) => u,
+            };
+            obj.insert("testUrl".to_string(), json!(url));
+        }
+    }
+
+    Value::Object(obj)
+}
+
 /// Build the full JSON object for a single (non-group) proxy, matching mihomo's
 /// `adapter.Proxy.MarshalJSON` fields that dashboards read.
 fn proxy_json(state: &ApiState, name: &str, proxy_type: &str, udp: bool) -> Value {
@@ -79,15 +208,7 @@ pub async fn get_proxies(State(state): State<ApiState>) -> Json<Value> {
     if let Some(global) = live_groups.get("GLOBAL") {
         proxies.insert(
             "GLOBAL".to_string(),
-            json!({
-                "name": "GLOBAL",
-                "type": global.group_type(),
-                "udp": true,
-                "history": proxy_history(&state, "GLOBAL"),
-                "all": global.all(),
-                "now": global.now(),
-                "alive": proxy_alive(&state, "GLOBAL"),
-            }),
+            group_json(&state, "GLOBAL", global.as_ref()),
         );
     }
 
@@ -97,18 +218,7 @@ pub async fn get_proxies(State(state): State<ApiState>) -> Json<Value> {
             continue;
         }
         if let Some(group) = live_groups.get(name) {
-            proxies.insert(
-                name.clone(),
-                json!({
-                    "name": name,
-                    "type": group.group_type(),
-                    "udp": true,
-                    "history": proxy_history(&state, name),
-                    "all": group.all(),
-                    "now": group.now(),
-                    "alive": proxy_alive(&state, name),
-                }),
-            );
+            proxies.insert(name.clone(), group_json(&state, name, group.as_ref()));
         }
     }
 
@@ -160,15 +270,7 @@ pub async fn get_proxy(
 ) -> Result<Json<Value>, StatusCode> {
     // Check live groups first (groups are also exposed under /proxies/{name})
     if let Some(group) = state.app.proxy_manager().get_group(&name) {
-        return Ok(Json(json!({
-            "name": group.name(),
-            "type": group.group_type(),
-            "udp": true,
-            "history": proxy_history(&state, &name),
-            "all": group.all(),
-            "now": group.now(),
-            "alive": proxy_alive(&state, &name),
-        })));
+        return Ok(Json(group_json(&state, &name, group.as_ref())));
     }
 
     if let Some(handler) = state.app.proxy_manager().get(&name) {
@@ -190,49 +292,25 @@ pub async fn get_proxy(
 #[derive(Deserialize)]
 pub struct DelayQuery {
     url: Option<String>,
-    timeout: Option<u64>,
+    timeout: Option<String>,
     expected: Option<String>,
 }
 
-/// mihomo compat: parse expected status ranges (ranges.go).
-fn parse_expected_status(s: &str) -> Option<Vec<(u16, u16)>> {
-    if s.is_empty() || s == "*" {
-        return None;
-    }
-    let mut ranges = Vec::new();
-    // mihomo compat: `strings.ReplaceAll(expected, ",", "/")` (ranges.go:25)
-    let normalized = s.replace(',', "/");
-    for part in normalized.split('/') {
-        let part = part.trim();
-        if let Some((a, b)) = part.split_once('-') {
-            if let (Ok(lo), Ok(hi)) = (a.trim().parse::<u16>(), b.trim().parse::<u16>()) {
-                ranges.push((lo, hi));
-            }
-        } else if let Ok(v) = part.parse::<u16>() {
-            ranges.push((v, v));
-        }
-    }
-    if ranges.is_empty() {
-        None
-    } else {
-        Some(ranges)
-    }
-}
-
-fn status_matches(code: u16, ranges: &[(u16, u16)]) -> bool {
-    ranges.iter().any(|&(lo, hi)| code >= lo && code <= hi)
-}
+// mihomo compat: expected-status parsing/matching lives with the groups
+// (utils.NewUnsignedRanges / IntRanges.Check ports).
+use crate::proxy_group::{parse_expected_status, status_matches};
 
 /// Perform a delay test through a proxy, matching mihomo's adapter.go URLTest().
 ///
 /// mihomo uses Go's http.Client with DialContext overridden to route through the
-/// proxy connection. It sends HTTP HEAD, reads the full HTTP response (handling
-/// TLS for HTTPS URLs), and checks the status code against `expected`.
+/// proxy connection. It sends HTTP HEAD and reads the full HTTP response
+/// (handling TLS for HTTPS URLs). Returns (delay_ms, status_code); the caller
+/// applies expected-status "satisfied" semantics — an unexpected status is NOT
+/// an error (adapter.go:166-200).
 async fn do_delay_test(
     handler: &std::sync::Arc<dyn crate::proxy::OutboundHandler>,
     dns: &std::sync::Arc<crate::dns::DnsResolver>,
     url_str: &str,
-    expected_status: Option<&[(u16, u16)]>,
 ) -> Result<(u16, u16), anyhow::Error> {
     let parsed: url::Url = url_str.parse()?;
     let host = parsed.host_str().unwrap_or("www.gstatic.com").to_string();
@@ -293,25 +371,6 @@ async fn do_delay_test(
 
     let status_code = status_code.ok_or_else(|| anyhow::anyhow!("invalid HTTP response"))?;
 
-    // mihomo compat: check expected status (satisfied flag)
-    if let Some(ranges) = expected_status {
-        if !status_matches(status_code, ranges) {
-            return Err(anyhow::anyhow!(
-                "expected status {}, got {}",
-                ranges
-                    .iter()
-                    .map(|(a, b)| if a == b {
-                        format!("{a}")
-                    } else {
-                        format!("{a}-{b}")
-                    })
-                    .collect::<Vec<_>>()
-                    .join("/"),
-                status_code
-            ));
-        }
-    }
-
     Ok((delay, status_code))
 }
 
@@ -335,8 +394,27 @@ pub async fn get_proxy_delay(
         .url
         .as_deref()
         .unwrap_or("http://www.gstatic.com/generate_204");
-    let timeout_ms = query.timeout.unwrap_or(5000);
-    let expected_status = query.expected.as_deref().and_then(parse_expected_status);
+    // mihomo compat: proxies.go:108-114 — `timeout` is required and parsed
+    // with bitSize 16; missing/invalid returns 400 "Body invalid".
+    let timeout_ms = match query.timeout.as_deref().unwrap_or("").parse::<i16>() {
+        Ok(t) => t.max(0) as u64,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"message": "Body invalid"})),
+            )
+        }
+    };
+    // mihomo compat: proxies.go:116-121 — invalid `expected` returns 400.
+    let expected_status = match parse_expected_status(query.expected.as_deref().unwrap_or("")) {
+        Ok(v) => v,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"message": "Body invalid"})),
+            )
+        }
+    };
 
     let pm = state.app.proxy_manager();
     let handler = pm.get(&name).or_else(|| pm.resolve(&name));
@@ -345,7 +423,7 @@ pub async fn get_proxy_delay(
         None => {
             return (
                 StatusCode::NOT_FOUND,
-                Json(json!({"message": "proxy not found"})),
+                Json(json!({"message": "Resource not found"})),
             )
         }
     };
@@ -353,30 +431,49 @@ pub async fn get_proxy_delay(
     let dns = state.app.dns_resolver();
     let timeout = std::time::Duration::from_millis(timeout_ms);
 
-    let result = tokio::time::timeout(
-        timeout,
-        do_delay_test(&handler, &dns, url_str, expected_status.as_deref()),
-    )
-    .await;
+    let result = tokio::time::timeout(timeout, do_delay_test(&handler, &dns, url_str)).await;
 
     let store = state.app.proxy_state_store();
     match result {
-        Ok(Ok((delay, _status))) => {
-            store.record_result(&name, url_str, Some(delay));
-            (StatusCode::OK, Json(json!({ "delay": delay })))
+        Ok(Ok((delay, status))) => {
+            let satisfied = expected_status
+                .as_deref()
+                .map_or(true, |r| status_matches(status, r));
+            if satisfied {
+                store.record_result(&name, url_str, Some(delay));
+            } else {
+                // mihomo compat: adapter.go URLTest — an unexpected status is
+                // not an error: the default state stays alive with the real
+                // delay; only the per-URL extra state goes dead. The API
+                // still returns 200 with the delay (proxies.go:135-147).
+                store.record_unexpected_status(&name, url_str, delay);
+            }
+            if delay == 0 {
+                // mihomo compat: proxies.go:135 — delay == 0 is a failure.
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({"message": "An error occurred in the delay test"})),
+                )
+            } else {
+                (StatusCode::OK, Json(json!({ "delay": delay })))
+            }
         }
-        Ok(Err(e)) => {
+        Ok(Err(_)) => {
             store.record_result(&name, url_str, None);
+            // mihomo compat: proxies.go:135-143 — on error delay is always 0,
+            // so the body is the fixed delay-test error message.
             (
                 StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({"message": e.to_string()})),
+                Json(json!({"message": "An error occurred in the delay test"})),
             )
         }
         Err(_) => {
             store.record_result(&name, url_str, None);
+            // mihomo compat: proxies.go:129-133 — context deadline exceeded
+            // returns 504 "Timeout" (ErrRequestTimeout).
             (
                 StatusCode::GATEWAY_TIMEOUT,
-                Json(json!({"message": "An error occurred in the delay test"})),
+                Json(json!({"message": "Timeout"})),
             )
         }
     }
@@ -393,13 +490,50 @@ pub async fn put_proxy(
     State(state): State<ApiState>,
     Path(group_name): Path<String>,
     body: axum::body::Bytes,
-) -> StatusCode {
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
     let body: SelectBody = match serde_json::from_slice(&body) {
         Ok(b) => b,
-        Err(_) => return StatusCode::BAD_REQUEST,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"message": "Body invalid"})),
+            )
+                .into_response()
+        }
     };
     let proxy_manager = state.app.proxy_manager();
-    if proxy_manager.select_proxy(&group_name, &body.name) {
+    let group = match proxy_manager.get_group(&group_name) {
+        Some(g) => g,
+        None => {
+            // mihomo compat: proxies.go:85-90 — a plain proxy (any adapter
+            // that is not SelectAble) gets 400 "Must be a Selector"; an
+            // unknown name gets 404 from findProxyByName.
+            return if proxy_manager.get(&group_name).is_some() {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"message": "Must be a Selector"})),
+                )
+                    .into_response()
+            } else {
+                (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({"message": "Resource not found"})),
+                )
+                    .into_response()
+            };
+        }
+    };
+    // mihomo compat: LoadBalance has no Set()/ForceSet() — not SelectAble.
+    if group.group_type() == "LoadBalance" {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"message": "Must be a Selector"})),
+        )
+            .into_response();
+    }
+
+    if group.select(&body.name) {
         tracing::info!("Selected proxy '{}' in group '{}'", body.name, group_name);
 
         // Persist selection if store-selected is enabled
@@ -418,50 +552,79 @@ pub async fn put_proxy(
             }
         }
 
-        StatusCode::NO_CONTENT
+        StatusCode::NO_CONTENT.into_response()
     } else {
         tracing::warn!(
-            "Failed to select proxy '{}' in group '{}' (group not found or proxy not in group)",
+            "Failed to select proxy '{}' in group '{}' (proxy not in group)",
             body.name,
             group_name
         );
-        StatusCode::NOT_FOUND
+        // mihomo compat: proxies.go:92-95 — Set() error is 400 with the
+        // selector.go "proxy not exist" wording.
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"message": "Selector update error: proxy not exist"})),
+        )
+            .into_response()
     }
 }
 
-pub async fn delete_proxy(State(state): State<ApiState>, Path(name): Path<String>) -> StatusCode {
+pub async fn delete_proxy(
+    State(state): State<ApiState>,
+    Path(name): Path<String>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
     let proxy_manager = state.app.proxy_manager();
 
-    // mihomo compat: DELETE /proxies/{name} clears force-pinned selection
-    // on non-Selector groups (URLTest, Fallback). Returns 400 for Selector groups.
-    if let Some(group) = proxy_manager.get_group(&name) {
-        if group.group_type() == "Selector" {
-            return StatusCode::BAD_REQUEST;
+    // mihomo compat: proxies.go:150-160 — DELETE /proxies/{name} unfixes only
+    // SelectAble non-Selector groups (URLTest, Fallback); Selector,
+    // LoadBalance and plain proxies get 400 "Body invalid"; unknown names 404.
+    let group = match proxy_manager.get_group(&name) {
+        Some(g) => g,
+        None => {
+            return if proxy_manager.get(&name).is_some() {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"message": "Body invalid"})),
+                )
+                    .into_response()
+            } else {
+                (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({"message": "Resource not found"})),
+                )
+                    .into_response()
+            };
         }
-
-        group.clear_selection();
-        tracing::info!("Cleared forced selection for group '{}'", name);
-
-        // Persist the reset selection if store-selected is enabled
-        let store_selected = state
-            .app
-            .config()
-            .profile
-            .as_ref()
-            .map(|p| p.store_selected)
-            .unwrap_or(false);
-        if store_selected {
-            let selections = proxy_manager.get_all_selections();
-            let home_dir = &state.app.home_dir;
-            if let Err(e) = crate::store::save_selected(home_dir, &selections) {
-                tracing::warn!("Failed to persist proxy selection reset: {}", e);
-            }
-        }
-
-        StatusCode::NO_CONTENT
-    } else {
-        StatusCode::NOT_FOUND
+    };
+    if group.group_type() != "URLTest" && group.group_type() != "Fallback" {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"message": "Body invalid"})),
+        )
+            .into_response();
     }
+
+    group.clear_selection();
+    tracing::info!("Cleared forced selection for group '{}'", name);
+
+    // Persist the reset selection if store-selected is enabled
+    let store_selected = state
+        .app
+        .config()
+        .profile
+        .as_ref()
+        .map(|p| p.store_selected)
+        .unwrap_or(false);
+    if store_selected {
+        let selections = proxy_manager.get_all_selections();
+        let home_dir = &state.app.home_dir;
+        if let Err(e) = crate::store::save_selected(home_dir, &selections) {
+            tracing::warn!("Failed to persist proxy selection reset: {}", e);
+        }
+    }
+
+    StatusCode::NO_CONTENT.into_response()
 }
 
 pub async fn get_groups(State(state): State<ApiState>) -> Json<Value> {
@@ -473,8 +636,7 @@ pub async fn get_groups(State(state): State<ApiState>) -> Json<Value> {
     let config = state.app.config();
 
     // Config order for groups, then any live groups not in config.
-    let mut group_names: Vec<String> =
-        config.proxy_groups.iter().map(|g| g.name.clone()).collect();
+    let mut group_names: Vec<String> = config.proxy_groups.iter().map(|g| g.name.clone()).collect();
     for (name, _) in live_groups.iter() {
         if !group_names.contains(name) {
             group_names.push(name.clone());
@@ -484,15 +646,7 @@ pub async fn get_groups(State(state): State<ApiState>) -> Json<Value> {
     let mut groups: Vec<Value> = Vec::with_capacity(group_names.len());
     for name in &group_names {
         if let Some(group) = live_groups.get(name) {
-            groups.push(json!({
-                "name": name,
-                "type": group.group_type(),
-                "udp": true,
-                "history": proxy_history(&state, name),
-                "all": group.all(),
-                "now": group.now(),
-                "alive": proxy_alive(&state, name),
-            }));
+            groups.push(group_json(&state, name, group.as_ref()));
         }
     }
 
@@ -504,15 +658,7 @@ pub async fn get_group(
     Path(name): Path<String>,
 ) -> Result<Json<Value>, StatusCode> {
     if let Some(group) = state.app.proxy_manager().get_group(&name) {
-        Ok(Json(json!({
-            "name": group.name(),
-            "type": group.group_type(),
-            "udp": true,
-            "history": proxy_history(&state, &name),
-            "all": group.all(),
-            "now": group.now(),
-            "alive": proxy_alive(&state, &name),
-        })))
+        Ok(Json(group_json(&state, &name, group.as_ref())))
     } else {
         Err(StatusCode::NOT_FOUND)
     }
@@ -525,16 +671,8 @@ pub async fn get_group_delay(
 ) -> (StatusCode, Json<Value>) {
     let pm = state.app.proxy_manager();
 
-    // mihomo compat: clear force-pinned selection on non-Selector groups
-    // before running group delay test.
-    if let Some(group) = pm.get_group(&name) {
-        if group.group_type() != "Selector" {
-            group.clear_selection();
-        }
-    }
-
-    let proxy_names = match pm.group_proxy_names(&name) {
-        Some(names) => names,
+    let group = match pm.get_group(&name) {
+        Some(g) => g,
         None => {
             return (
                 StatusCode::NOT_FOUND,
@@ -543,36 +681,75 @@ pub async fn get_group_delay(
         }
     };
 
-    let url_str = query
-        .url
-        .as_deref()
-        .unwrap_or("http://www.gstatic.com/generate_204");
-    let timeout_ms = query.timeout.unwrap_or(5000);
+    // mihomo compat: clear force-pinned selection on non-Selector groups
+    // before running group delay test (groups.go:62-65).
+    if group.group_type() != "Selector" {
+        group.clear_selection();
+    }
+    let proxy_names = group.all();
+
+    // mihomo compat: groups.go:68-81 — `timeout` is required and parsed with
+    // bitSize 32; missing/invalid returns 400 "Body invalid"; so does an
+    // invalid `expected`.
+    let timeout_ms = match query.timeout.as_deref().unwrap_or("").parse::<i32>() {
+        Ok(t) => t.max(0) as u64,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"message": "Body invalid"})),
+            )
+        }
+    };
+    let expected_status = match parse_expected_status(query.expected.as_deref().unwrap_or("")) {
+        Ok(v) => v,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"message": "Body invalid"})),
+            )
+        }
+    };
     let timeout = std::time::Duration::from_millis(timeout_ms);
-    let expected_status = query.expected.as_deref().and_then(parse_expected_status);
+
+    // mihomo compat: urltest.go:195-197 — URLTest.URLTest ignores the passed
+    // url and always tests the group's own testUrl, so the results refresh
+    // the auto-selection state. Other group types use the query url.
+    let url_str = if group.group_type() == "URLTest" {
+        state
+            .app
+            .config()
+            .proxy_groups
+            .iter()
+            .find(|g| g.name == name)
+            .and_then(|g| g.url.clone())
+            .unwrap_or_else(|| DEFAULT_TEST_URL.to_string())
+    } else {
+        query
+            .url
+            .clone()
+            .unwrap_or_else(|| "http://www.gstatic.com/generate_204".to_string())
+    };
 
     let dns = state.app.dns_resolver();
 
     // mihomo compat: test all proxies concurrently (groupbase.go URLTest)
     let mut handles = Vec::new();
     for proxy_name in proxy_names {
-        let handler = match pm.get(&proxy_name) {
+        // mihomo compat: group members can themselves be groups (Proxy.URLTest
+        // on a group dials through its current selection). Resolve nested
+        // groups to their underlying handler but record under the member name.
+        let handler = match pm.get(&proxy_name).or_else(|| pm.resolve(&proxy_name)) {
             Some(h) => h,
             None => continue,
         };
         let dns = dns.clone();
         let pname = proxy_name.clone();
-        let url = url_str.to_string();
-        let expected = expected_status.clone();
+        let url = url_str.clone();
         handles.push(tokio::spawn(async move {
-            let result = tokio::time::timeout(
-                timeout,
-                do_delay_test(&handler, &dns, &url, expected.as_deref()),
-            )
-            .await;
+            let result = tokio::time::timeout(timeout, do_delay_test(&handler, &dns, &url)).await;
 
             match result {
-                Ok(Ok((delay, _))) => (pname, Some(delay)),
+                Ok(Ok((delay, status))) => (pname, Some((delay, status))),
                 _ => (pname, None),
             }
         }));
@@ -581,15 +758,26 @@ pub async fn get_group_delay(
     let store = state.app.proxy_state_store();
     let mut result = serde_json::Map::new();
     for h in handles {
-        if let Ok((pname, delay_opt)) = h.await {
-            match delay_opt {
-                Some(delay) => {
-                    store.record_result(&pname, url_str, Some(delay));
-                    // mihomo compat: only successful proxies appear in the map
+        if let Ok((pname, outcome)) = h.await {
+            match outcome {
+                Some((delay, status)) => {
+                    let satisfied = expected_status
+                        .as_deref()
+                        .map_or(true, |r| status_matches(status, r));
+                    if satisfied {
+                        store.record_result(&pname, &url_str, Some(delay));
+                    } else {
+                        // mihomo compat: adapter.go URLTest — unexpected status
+                        // keeps the default state alive with the real delay.
+                        store.record_unexpected_status(&pname, &url_str, delay);
+                    }
+                    // mihomo compat: groupbase.go URLTest — every proxy whose
+                    // probe returned without error is included in the map,
+                    // even with an unexpected status.
                     result.insert(pname, json!(delay));
                 }
                 None => {
-                    store.record_result(&pname, url_str, None);
+                    store.record_result(&pname, &url_str, None);
                     // mihomo compat: failed proxies are NOT included in the response
                 }
             }
@@ -637,10 +825,7 @@ pub async fn get_providers(State(state): State<ApiState>) -> Json<Value> {
     );
 
     for (name, config) in state.app.proxy_manager().list_provider_configs().iter() {
-        providers.insert(
-            name.clone(),
-            provider_json(&state, name, config),
-        );
+        providers.insert(name.clone(), provider_json(&state, name, config));
     }
     Json(json!({ "providers": Value::Object(providers) }))
 }

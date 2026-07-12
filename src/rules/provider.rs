@@ -8,11 +8,15 @@ use tokio::sync::RwLock;
 /// Supports formats:
 /// - "text": One rule payload per line (e.g. domain suffixes, CIDRs)
 /// - "yaml": A YAML file with a `payload` list
-/// - "mrs": Placeholder for mihomo binary rule-set format (not yet implemented)
+/// - "mrs": mihomo's zstd-compressed binary rule-set (domain behavior only —
+///   see `rules::mrs`)
 pub struct RuleProvider {
     name: String,
     provider_type: ProviderType,
     format: RuleFormat,
+    /// Provider behavior ("domain" / "ipcidr" / "classical") — needed by the
+    /// MRS reader, which validates the file's behavior byte like mihomo.
+    behavior: String,
     url: Option<String>,
     path: Option<PathBuf>,
     #[allow(dead_code)]
@@ -42,6 +46,7 @@ impl RuleProvider {
         path: Option<PathBuf>,
         interval: u64,
         format: Option<&str>,
+        behavior: &str,
     ) -> Self {
         let provider_type = match provider_type {
             "http" => ProviderType::Http,
@@ -59,6 +64,7 @@ impl RuleProvider {
             name,
             provider_type,
             format,
+            behavior: behavior.to_string(),
             url,
             path,
             interval,
@@ -68,19 +74,20 @@ impl RuleProvider {
 
     /// Load rules from the configured source (file or cached HTTP response).
     pub async fn load(&self) -> Result<()> {
+        // Read raw bytes: MRS providers are binary (zstd), not UTF-8 text.
         let content = match self.provider_type {
             ProviderType::File => {
                 let path = self
                     .path
                     .as_ref()
                     .ok_or_else(|| anyhow::anyhow!("file provider {} has no path", self.name))?;
-                tokio::fs::read_to_string(path).await?
+                tokio::fs::read(path).await?
             }
             ProviderType::Http => {
                 // Try local cache first
                 if let Some(ref path) = self.path {
                     if path.exists() {
-                        tokio::fs::read_to_string(path).await?
+                        tokio::fs::read(path).await?
                     } else {
                         // Fetch from URL
                         self.fetch_remote().await?
@@ -168,7 +175,7 @@ impl RuleProvider {
         self.interval
     }
 
-    async fn fetch_remote(&self) -> Result<String> {
+    async fn fetch_remote(&self) -> Result<Vec<u8>> {
         let url = self
             .url
             .as_ref()
@@ -182,57 +189,45 @@ impl RuleProvider {
                 self.name
             ));
         }
-        Ok(resp.text().await?)
+        Ok(resp.bytes().await?.to_vec())
     }
 
-    fn parse_content(&self, content: &str) -> Result<Vec<String>> {
+    fn parse_content(&self, content: &[u8]) -> Result<Vec<String>> {
         match self.format {
-            RuleFormat::Text => Ok(parse_text_format(content)),
+            RuleFormat::Text => Ok(parse_text_format(as_utf8(content, &self.name)?)),
             RuleFormat::Yaml => {
+                let text = as_utf8(content, &self.name)?;
                 // Try YAML first; fall back to text if YAML parsing fails
-                match parse_yaml_format(content) {
+                match parse_yaml_format(text) {
                     Ok(rules) if !rules.is_empty() => Ok(rules),
-                    _ => Ok(parse_text_format(content)),
+                    _ => Ok(parse_text_format(text)),
                 }
             }
             RuleFormat::Mrs => {
-                // mihomo's MRS format is zstd-compressed (mrs_reader.go:17).
-                // Inside the zstd stream is the magic `MRS\1`, behavior byte,
-                // counts, and strategy-specific binary content. miemietron
-                // does not yet implement the full reader (out of scope —
-                // see ARCHITECTURE.md "Scope: in vs not-in").
-                //
-                // If the file starts with the zstd frame magic, we MUST NOT
-                // silently fall back to text parsing — that produces garbage
-                // rules. Fail loudly so the operator picks a `yaml` or `text`
-                // provider instead.
-                let bytes = content.as_bytes();
-                let is_zstd = bytes.len() >= 4
-                    && bytes[0] == 0x28
-                    && bytes[1] == 0xB5
-                    && bytes[2] == 0x2F
-                    && bytes[3] == 0xFD;
-                if is_zstd {
-                    return Err(anyhow::anyhow!(
-                        "rule provider '{}': MRS (zstd) format not yet implemented; use behavior/format yaml or text",
-                        self.name
-                    ));
-                }
-
-                // Legacy plain-text-with-magic encoding — keep best-effort.
-                match parse_mrs_format(bytes) {
-                    Ok(rules) if !rules.is_empty() => Ok(rules),
-                    _ => {
-                        tracing::debug!(
-                            "MRS plain-magic parse failed for '{}', trying text fallback",
-                            self.name
-                        );
-                        Ok(parse_text_format(content))
+                // mihomo compat: mrs_reader.go — zstd stream wrapping the
+                // behavior strategy's binary body. Only domain behavior is
+                // implemented; anything else errors (never a silent text
+                // fallback that would produce garbage rules).
+                let expected = match self.behavior.as_str() {
+                    "domain" => super::mrs::BEHAVIOR_DOMAIN,
+                    other => {
+                        return Err(anyhow::anyhow!(
+                            "rule provider '{}': MRS {} behavior not supported (only domain)",
+                            self.name,
+                            other
+                        ))
                     }
-                }
+                };
+                super::mrs::parse_mrs_domains(content, expected)
+                    .map_err(|e| anyhow::anyhow!("rule provider '{}': {}", self.name, e))
             }
         }
     }
+}
+
+fn as_utf8<'a>(content: &'a [u8], name: &str) -> Result<&'a str> {
+    std::str::from_utf8(content)
+        .map_err(|_| anyhow::anyhow!("rule provider '{}' content is not valid UTF-8", name))
 }
 
 /// Parse text format: one rule payload per line, ignoring comments and blank lines.
@@ -267,65 +262,6 @@ fn parse_yaml_format(content: &str) -> Result<Vec<String>> {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect())
-}
-
-/// Parse MRS binary format (mihomo's compact rule encoding).
-///
-/// MRS files have a simple structure:
-/// - 3-byte magic: "MRS"
-/// - 1-byte version
-/// - 1-byte behavior type (0=domain, 1=ipcidr, 2=classical)
-/// - 4-byte count (big-endian)
-/// - Remaining: newline-separated rules (possibly zstd compressed)
-///
-/// If the data doesn't match the MRS magic, returns an error.
-fn parse_mrs_format(data: &[u8]) -> Result<Vec<String>> {
-    // Check for MRS magic header
-    if data.len() < 9 || &data[0..3] != b"MRS" {
-        return Err(anyhow::anyhow!("not an MRS file"));
-    }
-
-    let _version = data[3];
-    let _behavior = data[4];
-    let count = u32::from_be_bytes([data[5], data[6], data[7], data[8]]) as usize;
-
-    let payload = &data[9..];
-
-    // The payload may be the raw rules separated by newlines
-    // Try to parse as UTF-8 text first
-    if let Ok(text) = std::str::from_utf8(payload) {
-        let rules: Vec<String> = text
-            .lines()
-            .map(|l| l.trim())
-            .filter(|l| !l.is_empty())
-            .map(|l| l.to_string())
-            .collect();
-        if !rules.is_empty() {
-            return Ok(rules);
-        }
-    }
-
-    // If not valid UTF-8, try domain binary encoding:
-    // Each entry is: 1-byte length + domain bytes
-    let mut rules = Vec::with_capacity(count);
-    let mut pos = 0;
-    while pos < payload.len() && rules.len() < count {
-        let len = payload[pos] as usize;
-        pos += 1;
-        if pos + len > payload.len() {
-            break;
-        }
-        if let Ok(domain) = std::str::from_utf8(&payload[pos..pos + len]) {
-            rules.push(domain.to_string());
-        }
-        pos += len;
-    }
-
-    if rules.is_empty() {
-        Err(anyhow::anyhow!("failed to parse MRS binary content"))
-    } else {
-        Ok(rules)
-    }
 }
 
 #[cfg(test)]
@@ -440,10 +376,7 @@ payload:
   - "plain.com"
 "#;
         let rules = parse_yaml_format(content).unwrap();
-        assert_eq!(
-            rules,
-            vec!["+.example.com", "+.google.com", "plain.com"]
-        );
+        assert_eq!(rules, vec!["+.example.com", "+.google.com", "plain.com"]);
     }
 
     #[test]
@@ -506,6 +439,7 @@ payload:
             Some(PathBuf::from("/tmp/rules.txt")),
             3600,
             Some("text"),
+            "domain",
         );
         assert_eq!(provider.name(), "test");
         assert_eq!(provider.interval(), 3600);
@@ -520,6 +454,7 @@ payload:
             Some(PathBuf::from("/etc/rules.txt")),
             0,
             Some("yaml"),
+            "domain",
         );
         assert_eq!(provider.name(), "local");
         assert_eq!(provider.interval(), 0);
@@ -527,32 +462,46 @@ payload:
 
     #[test]
     fn rule_provider_default_format_is_text() {
-        let provider = RuleProvider::new("def".to_string(), "file", None, None, 0, None);
+        let provider = RuleProvider::new("def".to_string(), "file", None, None, 0, None, "domain");
         // We can indirectly verify by parsing through the provider's parse_content
-        let result = provider.parse_content("example.com\ngoogle.com").unwrap();
+        let result = provider.parse_content(b"example.com\ngoogle.com").unwrap();
         assert_eq!(result, vec!["example.com", "google.com"]);
     }
 
     #[test]
-    fn mrs_zstd_input_errors_not_silent_garbage() {
-        // Real mihomo MRS files start with the zstd frame magic
-        // (0x28 0xB5 0x2F 0xFD). Until we have a full zstd-MRS reader, this
-        // MUST surface as an explicit error instead of producing junk text
-        // "rules". `parse_content` reads via `.as_bytes()` so we feed the
-        // raw bytes through `from_utf8_unchecked` solely to satisfy the
-        // `&str` argument type — the parser only inspects the byte view.
-        // Build the bytes at runtime so the compiler doesn't constant-fold
-        // and trip the `invalid_from_utf8_unchecked` lint.
-        let mut bytes = Vec::with_capacity(8);
-        for b in [0x28u8, 0xB5, 0x2F, 0xFD, 0x00, 0x01, 0x02, 0x03] {
-            bytes.push(b);
-        }
-        let provider = RuleProvider::new("mrs".to_string(), "file", None, None, 0, Some("mrs"));
-        let s: &str = unsafe { std::str::from_utf8_unchecked(&bytes) };
+    fn mrs_garbage_input_errors_not_silent_garbage() {
+        // Invalid zstd input MUST surface as an explicit error instead of
+        // producing junk text "rules".
+        let provider = RuleProvider::new(
+            "mrs".to_string(),
+            "file",
+            None,
+            None,
+            0,
+            Some("mrs"),
+            "domain",
+        );
         let err = provider
-            .parse_content(s)
-            .expect_err("must error on zstd MRS");
+            .parse_content(&[0x28, 0xB5, 0x2F, 0xFD, 0x00, 0x01, 0x02, 0x03])
+            .expect_err("must error on invalid zstd MRS");
         let msg = format!("{err}");
-        assert!(msg.contains("MRS"), "wrong error: {msg}");
+        assert!(msg.contains("mrs"), "wrong error: {msg}");
+    }
+
+    #[test]
+    fn mrs_ipcidr_behavior_rejected() {
+        let provider = RuleProvider::new(
+            "cnip".to_string(),
+            "file",
+            None,
+            None,
+            0,
+            Some("mrs"),
+            "ipcidr",
+        );
+        let err = provider
+            .parse_content(&[0u8; 16])
+            .expect_err("ipcidr mrs must be rejected");
+        assert!(format!("{err}").contains("only domain"));
     }
 }

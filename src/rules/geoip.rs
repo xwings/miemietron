@@ -1,9 +1,21 @@
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
-/// GeoIP matcher using MaxMindDB (Country.mmdb) files.
+/// mihomo compat: `component/mmdb/mmdb.go` — the record layout depends on the
+/// mmdb metadata `database_type`: "sing-geoip" stores a plain string,
+/// "Meta-geoip0" (the default `geoip.metadb` OpenClash ships) stores a string
+/// OR an array of codes, anything else is the GeoLite2 country struct.
+#[derive(Clone, Copy, PartialEq)]
+enum GeoIpDbType {
+    Maxmind,
+    Sing,
+    MetaV0,
+}
+
+/// GeoIP matcher using MaxMindDB (Country.mmdb / geoip.metadb) files.
 pub struct GeoIpMatcher {
     reader: Option<maxminddb::Reader<Vec<u8>>>,
+    db_type: GeoIpDbType,
     asn_reader: Option<maxminddb::Reader<Vec<u8>>>,
 }
 
@@ -16,6 +28,14 @@ struct CountryRecord {
 #[derive(Debug, serde::Deserialize)]
 struct CountryInfo {
     iso_code: Option<String>,
+}
+
+/// Meta-geoip0 record: a single code or a list of codes.
+#[derive(Debug, serde::Deserialize)]
+#[serde(untagged)]
+enum MetaV0Record {
+    One(String),
+    Many(Vec<String>),
 }
 
 /// Minimal struct to deserialize ASN number from GeoLite2-ASN.mmdb.
@@ -33,11 +53,22 @@ impl GeoIpMatcher {
             vec![home_dir.join("Country.mmdb"), home_dir.join("geoip.metadb")];
 
         let mut reader = None;
+        let mut db_type = GeoIpDbType::Maxmind;
         for path in &candidates {
             if path.exists() {
                 match maxminddb::Reader::open_readfile(path) {
                     Ok(r) => {
-                        tracing::info!("Loaded GeoIP database from {}", path.display());
+                        // mihomo compat: mmdb.go LoadFromBytes database_type switch.
+                        db_type = match r.metadata.database_type.as_str() {
+                            "sing-geoip" => GeoIpDbType::Sing,
+                            "Meta-geoip0" => GeoIpDbType::MetaV0,
+                            _ => GeoIpDbType::Maxmind,
+                        };
+                        tracing::info!(
+                            "Loaded GeoIP database from {} (type: {})",
+                            path.display(),
+                            r.metadata.database_type
+                        );
                         reader = Some(r);
                         break;
                     }
@@ -73,17 +104,53 @@ impl GeoIpMatcher {
             }
         }
 
-        Self { reader, asn_reader }
+        Self {
+            reader,
+            db_type,
+            asn_reader,
+        }
     }
 
-    /// Look up the ISO country code (e.g. "US", "CN") for the given IP address.
+    /// Look up all country/region codes for the given IP address, uppercased.
+    ///
+    /// mihomo compat: `component/mmdb/reader.go` LookupCode — Meta-geoip0
+    /// records can carry multiple codes and `GEOIP` matches if ANY equals the
+    /// rule payload (`rules/common/geoip.go` `slices.Contains`).
+    pub fn lookup_codes(&self, ip: &IpAddr) -> Vec<String> {
+        let Some(reader) = self.reader.as_ref() else {
+            return Vec::new();
+        };
+        match self.db_type {
+            GeoIpDbType::Maxmind => {
+                let record: Option<CountryRecord> = reader.lookup(*ip).ok();
+                record
+                    .and_then(|r| r.country)
+                    .and_then(|c| c.iso_code)
+                    .map(|code| vec![code.to_uppercase()])
+                    .unwrap_or_default()
+            }
+            GeoIpDbType::Sing => {
+                let record: Option<String> = reader.lookup(*ip).ok();
+                record
+                    .map(|code| vec![code.to_uppercase()])
+                    .unwrap_or_default()
+            }
+            GeoIpDbType::MetaV0 => {
+                let record: Option<MetaV0Record> = reader.lookup(*ip).ok();
+                match record {
+                    Some(MetaV0Record::One(code)) => vec![code.to_uppercase()],
+                    Some(MetaV0Record::Many(codes)) => {
+                        codes.into_iter().map(|c| c.to_uppercase()).collect()
+                    }
+                    None => Vec::new(),
+                }
+            }
+        }
+    }
+
+    /// Look up the primary ISO country code (e.g. "US", "CN") for the given IP.
     pub fn lookup_country(&self, ip: &IpAddr) -> Option<String> {
-        let reader = self.reader.as_ref()?;
-        let record: CountryRecord = reader.lookup(*ip).ok()?;
-        record
-            .country
-            .and_then(|c| c.iso_code)
-            .map(|code| code.to_uppercase())
+        self.lookup_codes(ip).into_iter().next()
     }
 
     /// Look up the Autonomous System Number for the given IP address.

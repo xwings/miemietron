@@ -1,11 +1,33 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use parking_lot::RwLock;
+use tokio::sync::Notify;
 
+use crate::dns::DnsResolver;
 use crate::proxy::OutboundHandler;
 
-use super::ProxyGroup;
+use super::proxy_state::ProxyStateStore;
+use super::{HealthCheckOpts, ProxyGroup};
+
+/// Optional health-check state for a select group.
+///
+/// mihomo compat: parser.go:166-171 leaves `interval` at 0 for select groups
+/// (only non-select types get the 300s default), and healthcheck.go auto()
+/// runs the periodic check only when interval != 0 — so a select group is
+/// health-checked only when the user configures an interval.
+pub(crate) struct SelectorHealthCheck {
+    pub(crate) test_url: String,
+    pub(crate) interval: Duration,
+    pub(crate) lazy: bool,
+    pub(crate) test_timeout: u64,
+    pub(crate) expected_status: Option<Vec<(u16, u16)>>,
+    pub(crate) state_store: Arc<ProxyStateStore>,
+    pub(crate) last_touch: Arc<AtomicU64>,
+    pub(crate) health_notify: Arc<Notify>,
+}
 
 /// Manual proxy selection group.
 ///
@@ -17,6 +39,7 @@ pub struct SelectorGroup {
     proxy_names: Vec<String>,
     proxy_name_set: HashSet<String>,
     current: RwLock<String>,
+    health: Option<SelectorHealthCheck>,
 }
 
 impl SelectorGroup {
@@ -28,7 +51,56 @@ impl SelectorGroup {
             proxy_names: proxies,
             proxy_name_set,
             current: RwLock::new(initial),
+            health: None,
         }
+    }
+
+    /// Construct a select group with a periodic health check (mihomo compat:
+    /// user configured a non-zero `interval` — see SelectorHealthCheck docs).
+    pub fn with_health_check(
+        name: String,
+        proxies: Vec<String>,
+        hc: HealthCheckOpts,
+        state_store: Arc<ProxyStateStore>,
+    ) -> Self {
+        let mut group = Self::new(name, proxies);
+        group.health = Some(SelectorHealthCheck {
+            test_url: hc.url,
+            interval: Duration::from_secs(hc.interval_secs),
+            lazy: hc.lazy,
+            test_timeout: hc.test_timeout.unwrap_or(5000),
+            expected_status: hc.expected_status,
+            state_store,
+            last_touch: Arc::new(AtomicU64::new(0)),
+            health_notify: Arc::new(Notify::new()),
+        });
+        group
+    }
+
+    /// The health-check state, if this select group has one configured.
+    pub(crate) fn health(&self) -> Option<&SelectorHealthCheck> {
+        self.health.as_ref()
+    }
+
+    /// Run a health check against all proxies concurrently through their
+    /// actual proxy connections. No-op when no health check is configured.
+    pub async fn health_check(
+        &self,
+        proxies: &HashMap<String, Arc<dyn OutboundHandler>>,
+        dns: &Arc<DnsResolver>,
+    ) {
+        let Some(hc) = &self.health else { return };
+        super::health::run_health_check(
+            "select",
+            &self.proxy_names,
+            &hc.test_url,
+            hc.test_timeout,
+            hc.expected_status.clone(),
+            proxies,
+            dns,
+            &hc.state_store,
+        )
+        .await;
     }
 }
 
@@ -64,6 +136,17 @@ impl ProxyGroup for SelectorGroup {
     ) -> Option<Arc<dyn OutboundHandler>> {
         let selected = self.current.read().clone();
         proxies.get(&selected).cloned()
+    }
+
+    /// mihomo compat: provider Touch() drives the lazy health check.
+    fn touch(&self) {
+        if let Some(hc) = &self.health {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            hc.last_touch.store(now, Ordering::Relaxed);
+        }
     }
 }
 

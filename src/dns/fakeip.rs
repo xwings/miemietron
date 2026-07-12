@@ -47,10 +47,11 @@ impl FakeIpPool {
         let total = 1u32.checked_shl(32 - prefix_len).unwrap_or(0);
 
         // mihomo compat: first allocatable IP is base+4 (skip .0 network,
-        // .1 gateway, .2 and .3 reserved). Last is the broadcast address
-        // (exclusive — not allocated).
+        // .1 gateway, .2 and .3 reserved); the broadcast address (last IP of
+        // the prefix) is never allocated (pool.go: offset cycles before
+        // reaching `last`).
         let first = base + 4;
-        let last = base + total; // one past the last IP in the prefix
+        let last = base + total - 1; // broadcast — excluded from allocation
         if first >= last {
             return Err(anyhow::anyhow!(
                 "fake-ip-range {cidr} is too small (need at least /29, got /{prefix_len})"
@@ -95,7 +96,11 @@ impl FakeIpPool {
     }
 
     /// Allocate a fake IP for a domain. Returns existing if already allocated.
+    /// mihomo compat: pool.go lowercases the host (RFC 4343) so DNS 0x20 case
+    /// randomization can't allocate distinct fake IPs per casing.
     pub fn allocate(&self, domain: &str) -> IpAddr {
+        let domain = domain.to_lowercase();
+        let domain = domain.as_str();
         // Check if domain already has a fake IP
         if let Some(ip) = self.domain_to_ip.get(domain) {
             return *ip;
@@ -147,20 +152,34 @@ impl FakeIpPool {
         }
     }
 
-    /// Check if a domain should bypass fake IP (i.e., is filtered).
-    pub fn should_bypass(&self, domain: &str) -> bool {
-        // O(1) exact match check first, then O(n) suffix scan.
-        let matches_filter = self.compiled_filter.exact.contains(domain)
+    /// mihomo compat: enhancer.go IsFakeIP — inside the range but NOT the
+    /// gateway (base+1, the TUN device address) or the broadcast address.
+    pub fn is_fake_ip(&self, ip: &IpAddr) -> bool {
+        match ip {
+            IpAddr::V4(v4) => {
+                let ip_u32 = u32::from(*v4);
+                self.contains(ip)
+                    && ip_u32 != self.cidr_base + 1
+                    && ip_u32 != self.cidr_base + self.cidr_size - 1
+            }
+            _ => false,
+        }
+    }
+
+    /// Raw filter-pattern match (no filter-mode applied). The resolver ORs
+    /// this with the geosite/rule-set checkers before applying the mode.
+    pub fn filter_matches(&self, domain: &str) -> bool {
+        self.compiled_filter.exact.contains(domain)
             || self
                 .compiled_filter
                 .suffixes
                 .iter()
-                .any(|s| domain.ends_with(s.as_str()));
+                .any(|s| domain.ends_with(s.as_str()))
+    }
 
-        match self.filter_mode {
-            FilterMode::Blacklist => matches_filter,
-            FilterMode::Whitelist => !matches_filter,
-        }
+    /// Whether fake-ip-filter-mode is whitelist.
+    pub fn is_whitelist(&self) -> bool {
+        self.filter_mode == FilterMode::Whitelist
     }
 
     /// Clear all mappings.
@@ -261,6 +280,19 @@ fn parse_cidr(cidr: &str) -> Result<(u32, u32)> {
 mod tests {
     use super::*;
 
+    /// Mirror of `DnsResolver::should_bypass_fakeip`'s mode application for
+    /// the pattern-only case — the production path lives in `dns/mod.rs` and
+    /// additionally ORs in the geosite/rule-set checkers before applying the
+    /// filter mode.
+    fn should_bypass(pool: &FakeIpPool, domain: &str) -> bool {
+        let matched = pool.filter_matches(domain);
+        if pool.is_whitelist() {
+            !matched
+        } else {
+            matched
+        }
+    }
+
     fn make_pool() -> FakeIpPool {
         // mihomo compat: /24 gives 252 usable addresses (256 - 4 reserved)
         // First allocatable: 198.18.0.4, last: 198.18.0.255
@@ -299,20 +331,20 @@ mod tests {
 
     #[test]
     fn ring_buffer_wraps_around() {
-        // mihomo compat: /29 gives 4 usable addresses (.4, .5, .6, .7)
+        // mihomo compat: /29 gives 3 usable addresses (.4, .5, .6) — .7 is
+        // the broadcast address, which pool.go never allocates.
         let pool = FakeIpPool::new("10.0.0.0/29", &[], "blacklist").unwrap();
         let ip1 = pool.allocate("a.com");
         let ip2 = pool.allocate("b.com");
         let ip3 = pool.allocate("c.com");
+        assert_ne!(ip3, IpAddr::V4(Ipv4Addr::new(10, 0, 0, 7)));
+        // Fourth allocation wraps around and evicts the first
         let ip4 = pool.allocate("d.com");
-        // Fifth allocation wraps around and evicts the first
-        let ip5 = pool.allocate("e.com");
-        assert_eq!(ip5, ip1);
-        assert_eq!(pool.lookup_domain(&ip1), Some("e.com".to_string()));
+        assert_eq!(ip4, ip1);
+        assert_eq!(pool.lookup_domain(&ip1), Some("d.com".to_string()));
         // Others should still be there
         assert_eq!(pool.lookup_domain(&ip2), Some("b.com".to_string()));
         assert_eq!(pool.lookup_domain(&ip3), Some("c.com".to_string()));
-        assert_eq!(pool.lookup_domain(&ip4), Some("d.com".to_string()));
     }
 
     #[test]
@@ -321,7 +353,7 @@ mod tests {
         assert!(FakeIpPool::new("10.0.0.0/30", &[], "blacklist").is_err());
         assert!(FakeIpPool::new("10.0.0.0/31", &[], "blacklist").is_err());
         assert!(FakeIpPool::new("10.0.0.0/32", &[], "blacklist").is_err());
-        // /29 (8 IPs) is the minimum — 4 usable (.4-.7)
+        // /29 (8 IPs) is the minimum — 3 usable (.4-.6; .7 is broadcast)
         assert!(FakeIpPool::new("10.0.0.0/29", &[], "blacklist").is_ok());
     }
 
@@ -345,9 +377,9 @@ mod tests {
     fn blacklist_filter() {
         let filter = vec!["*.local".to_string(), "localhost".to_string()];
         let pool = FakeIpPool::new("198.18.0.0/24", &filter, "blacklist").unwrap();
-        assert!(pool.should_bypass("foo.local"));
-        assert!(pool.should_bypass("localhost"));
-        assert!(!pool.should_bypass("example.com"));
+        assert!(should_bypass(&pool, "foo.local"));
+        assert!(should_bypass(&pool, "localhost"));
+        assert!(!should_bypass(&pool, "example.com"));
     }
 
     #[test]
@@ -355,9 +387,9 @@ mod tests {
         let filter = vec!["*.example.com".to_string()];
         let pool = FakeIpPool::new("198.18.0.0/24", &filter, "whitelist").unwrap();
         // Matches filter -> should NOT bypass (whitelist mode: only matched get fake IP)
-        assert!(!pool.should_bypass("foo.example.com"));
+        assert!(!should_bypass(&pool, "foo.example.com"));
         // Does not match filter -> should bypass
-        assert!(pool.should_bypass("other.com"));
+        assert!(should_bypass(&pool, "other.com"));
     }
 
     #[test]
@@ -373,9 +405,9 @@ mod tests {
     fn wildcard_filter_matches_subdomain() {
         let filter = vec!["*.example.com".to_string()];
         let pool = FakeIpPool::new("198.18.0.0/24", &filter, "blacklist").unwrap();
-        assert!(pool.should_bypass("foo.example.com"));
-        assert!(pool.should_bypass("bar.example.com"));
-        assert!(pool.should_bypass("deep.sub.example.com"));
+        assert!(should_bypass(&pool, "foo.example.com"));
+        assert!(should_bypass(&pool, "bar.example.com"));
+        assert!(should_bypass(&pool, "deep.sub.example.com"));
     }
 
     #[test]
@@ -383,7 +415,7 @@ mod tests {
         // *.example.com should also match "example.com" itself
         let filter = vec!["*.example.com".to_string()];
         let pool = FakeIpPool::new("198.18.0.0/24", &filter, "blacklist").unwrap();
-        assert!(pool.should_bypass("example.com"));
+        assert!(should_bypass(&pool, "example.com"));
     }
 
     #[test]
@@ -391,47 +423,47 @@ mod tests {
         let filter = vec!["*.example.com".to_string()];
         let pool = FakeIpPool::new("198.18.0.0/24", &filter, "blacklist").unwrap();
         // "notexample.com" should NOT match *.example.com
-        assert!(!pool.should_bypass("notexample.com"));
-        assert!(!pool.should_bypass("other.com"));
+        assert!(!should_bypass(&pool, "notexample.com"));
+        assert!(!should_bypass(&pool, "other.com"));
     }
 
     #[test]
     fn wildcard_filter_star_lan() {
         let filter = vec!["*.lan".to_string()];
         let pool = FakeIpPool::new("198.18.0.0/24", &filter, "blacklist").unwrap();
-        assert!(pool.should_bypass("router.lan"));
-        assert!(pool.should_bypass("nas.lan"));
-        assert!(pool.should_bypass("lan")); // exact match
-        assert!(!pool.should_bypass("lanmore.com"));
+        assert!(should_bypass(&pool, "router.lan"));
+        assert!(should_bypass(&pool, "nas.lan"));
+        assert!(should_bypass(&pool, "lan")); // exact match
+        assert!(!should_bypass(&pool, "lanmore.com"));
     }
 
     #[test]
     fn wildcard_filter_star_local() {
         let filter = vec!["*.local".to_string()];
         let pool = FakeIpPool::new("198.18.0.0/24", &filter, "blacklist").unwrap();
-        assert!(pool.should_bypass("myhost.local"));
-        assert!(pool.should_bypass("local"));
-        assert!(!pool.should_bypass("localhost")); // not a suffix match for .local
+        assert!(should_bypass(&pool, "myhost.local"));
+        assert!(should_bypass(&pool, "local"));
+        assert!(!should_bypass(&pool, "localhost")); // not a suffix match for .local
     }
 
     #[test]
     fn exact_filter_match() {
         let filter = vec!["dns.msftncsi.com".to_string()];
         let pool = FakeIpPool::new("198.18.0.0/24", &filter, "blacklist").unwrap();
-        assert!(pool.should_bypass("dns.msftncsi.com"));
-        assert!(!pool.should_bypass("sub.dns.msftncsi.com"));
-        assert!(!pool.should_bypass("other.com"));
+        assert!(should_bypass(&pool, "dns.msftncsi.com"));
+        assert!(!should_bypass(&pool, "sub.dns.msftncsi.com"));
+        assert!(!should_bypass(&pool, "other.com"));
     }
 
     #[test]
     fn plus_prefix_filter() {
         let filter = vec!["+.google.com".to_string()];
         let pool = FakeIpPool::new("198.18.0.0/24", &filter, "blacklist").unwrap();
-        assert!(pool.should_bypass("www.google.com"));
-        assert!(pool.should_bypass("mail.google.com"));
+        assert!(should_bypass(&pool, "www.google.com"));
+        assert!(should_bypass(&pool, "mail.google.com"));
         // "google.com" does NOT end with ".google.com" (the + prefix strips
         // only the '+', so the suffix becomes ".google.com" which is longer)
-        assert!(!pool.should_bypass("google.com"));
+        assert!(!should_bypass(&pool, "google.com"));
     }
 
     #[test]
@@ -440,29 +472,29 @@ mod tests {
         let pool = FakeIpPool::new("198.18.0.0/24", &filter, "whitelist").unwrap();
 
         // Matches filter -> should NOT bypass (gets fake IP in whitelist mode)
-        assert!(!pool.should_bypass("foo.example.com"));
-        assert!(!pool.should_bypass("specific.org"));
+        assert!(!should_bypass(&pool, "foo.example.com"));
+        assert!(!should_bypass(&pool, "specific.org"));
 
         // Does NOT match filter -> should bypass (no fake IP)
-        assert!(pool.should_bypass("google.com"));
-        assert!(pool.should_bypass("random.org"));
-        assert!(pool.should_bypass("other.specific.org"));
+        assert!(should_bypass(&pool, "google.com"));
+        assert!(should_bypass(&pool, "random.org"));
+        assert!(should_bypass(&pool, "other.specific.org"));
     }
 
     #[test]
     fn whitelist_empty_filter_bypasses_everything() {
         let pool = FakeIpPool::new("198.18.0.0/24", &[], "whitelist").unwrap();
         // With empty whitelist, nothing matches -> everything is bypassed
-        assert!(pool.should_bypass("any.domain.com"));
-        assert!(pool.should_bypass("example.com"));
+        assert!(should_bypass(&pool, "any.domain.com"));
+        assert!(should_bypass(&pool, "example.com"));
     }
 
     #[test]
     fn blacklist_empty_filter_bypasses_nothing() {
         let pool = FakeIpPool::new("198.18.0.0/24", &[], "blacklist").unwrap();
         // With empty blacklist, nothing matches -> nothing is bypassed
-        assert!(!pool.should_bypass("any.domain.com"));
-        assert!(!pool.should_bypass("example.com"));
+        assert!(!should_bypass(&pool, "any.domain.com"));
+        assert!(!should_bypass(&pool, "example.com"));
     }
 
     #[test]
@@ -474,12 +506,12 @@ mod tests {
             "dns.msftncsi.com".to_string(),
         ];
         let pool = FakeIpPool::new("198.18.0.0/24", &filter, "blacklist").unwrap();
-        assert!(pool.should_bypass("router.lan"));
-        assert!(pool.should_bypass("mypc.local"));
-        assert!(pool.should_bypass("localhost"));
-        assert!(pool.should_bypass("dns.msftncsi.com"));
-        assert!(!pool.should_bypass("google.com"));
-        assert!(!pool.should_bypass("example.com"));
+        assert!(should_bypass(&pool, "router.lan"));
+        assert!(should_bypass(&pool, "mypc.local"));
+        assert!(should_bypass(&pool, "localhost"));
+        assert!(should_bypass(&pool, "dns.msftncsi.com"));
+        assert!(!should_bypass(&pool, "google.com"));
+        assert!(!should_bypass(&pool, "example.com"));
     }
 
     #[test]

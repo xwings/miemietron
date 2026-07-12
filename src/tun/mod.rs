@@ -73,7 +73,15 @@ pub async fn run_tun(
         "TUN {} using {} stack (smoltcp userspace TCP/IP)",
         config.device, stack_type
     );
-    run_gvisor_stack(tun_dev, &config, conn_manager, dns, &stack_type, &dns_listen).await
+    run_gvisor_stack(
+        tun_dev,
+        &config,
+        conn_manager,
+        dns,
+        &stack_type,
+        &dns_listen,
+    )
+    .await
 }
 
 /// Run the gvisor stack: user-space TCP/IP processing raw TUN packets.
@@ -135,10 +143,7 @@ async fn run_gvisor_stack(
 
     let udp_timeout = Duration::from_secs(config.udp_timeout);
 
-    info!(
-        "TUN {} ready — smoltcp userspace stack",
-        config.device
-    );
+    info!("TUN {} ready — smoltcp userspace stack", config.device);
 
     loop {
         tokio::select! {
@@ -190,7 +195,10 @@ async fn run_gvisor_stack(
 
 /// Answer a hijacked DNS-over-UDP flow entirely from the internal resolver,
 /// relaying each query's response back through the stack to the client.
-async fn handle_hijacked_dns_udp(mut flow: crate::stack::smol::SmolUdpFlow, dns: &Arc<DnsResolver>) {
+async fn handle_hijacked_dns_udp(
+    mut flow: crate::stack::smol::SmolUdpFlow,
+    dns: &Arc<DnsResolver>,
+) {
     debug!("[DNS] hijack udp:{} from {}", flow.dst, flow.src);
     // The first datagram is already queued in flow.rx.
     while let Some(query) = flow.rx.recv().await {

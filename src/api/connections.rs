@@ -92,9 +92,7 @@ pub async fn delete_connection(
     State(state): State<ApiState>,
     Path(id): Path<String>,
 ) -> StatusCode {
-    if state.conn_manager.close_connection(&id) {
-        StatusCode::NO_CONTENT
-    } else {
-        StatusCode::NOT_FOUND
-    }
+    // mihomo compat: connections.go:73-79 — always 204, even for unknown ids.
+    let _ = state.conn_manager.close_connection(&id);
+    StatusCode::NO_CONTENT
 }

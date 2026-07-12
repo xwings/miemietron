@@ -14,15 +14,23 @@ pub async fn get_configs(State(state): State<ApiState>) -> Json<Value> {
     let config = state.app.config();
     let rt = state.app.runtime_config.read();
 
-    // mihomo compat: build geox-url object from config or defaults
+    // mihomo compat: GeoXUrl serializes as `geo-ip` / `geo-site` / `mmdb` /
+    // `asn` (config.go:94-99), with the MetaCubeX default URLs when unset
+    // (config.go:571-576).
     let geox_url = {
         let empty = std::collections::HashMap::new();
         let map = config.geox_url.as_ref().unwrap_or(&empty);
+        let get = |k: &str, default: &str| -> String {
+            map.get(k)
+                .cloned()
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| default.to_string())
+        };
         json!({
-            "geoip": map.get("geoip").cloned().unwrap_or_default(),
-            "mmdb": map.get("mmdb").cloned().unwrap_or_default(),
-            "asn": map.get("asn").cloned().unwrap_or_default(),
-            "geosite": map.get("geosite").cloned().unwrap_or_default(),
+            "geo-ip": get("geoip", crate::rules::geodata::DEFAULT_GEOIP_DAT_URL),
+            "mmdb": get("mmdb", crate::rules::geodata::DEFAULT_MMDB_URL),
+            "asn": get("asn", crate::rules::geodata::DEFAULT_ASN_URL),
+            "geo-site": get("geosite", crate::rules::geodata::DEFAULT_GEOSITE_URL),
         })
     };
 
@@ -149,10 +157,7 @@ pub async fn patch_configs(State(state): State<ApiState>, Json(body): Json<Value
         // mihomo compat: reject invalid modes (tunnel/mode.go errors); OpenClash
         // inspects the response body, so a silent 204 would hide the error.
         if !matches!(mode, "rule" | "global" | "direct") {
-            return config_error(
-                StatusCode::BAD_REQUEST,
-                &format!("invalid mode: {mode}"),
-            );
+            return config_error(StatusCode::BAD_REQUEST, &format!("invalid mode: {mode}"));
         }
         let mut rt = state.app.runtime_config.write();
         if rt.mode != mode {
@@ -230,7 +235,24 @@ pub async fn patch_configs(State(state): State<ApiState>, Json(body): Json<Value
     StatusCode::NO_CONTENT.into_response()
 }
 
-pub async fn post_configs_geo(State(_state): State<ApiState>) -> StatusCode {
-    // TODO: update geodata files
-    StatusCode::NO_CONTENT
+/// POST /configs/geo (and /upgrade/geo) — download fresh geo databases.
+/// mihomo compat: hub/route/configs.go:438-448 → updater.UpdateGeoDatabases;
+/// failure returns 500 with the message, success 204. A reload afterwards
+/// re-opens the databases (mihomo's updater reloads the config on success).
+pub async fn post_configs_geo(
+    State(state): State<ApiState>,
+) -> (StatusCode, axum::Json<serde_json::Value>) {
+    let home_dir = state.app.home_dir.clone();
+    let geox = state.app.config().geox_url.clone();
+    match crate::rules::geodata::update_geo_databases(&home_dir, geox.as_ref()).await {
+        Ok(()) => {
+            tracing::info!("Geo databases updated, reloading config to apply");
+            let _ = state.app.restart_tx.try_send(());
+            (StatusCode::NO_CONTENT, axum::Json(serde_json::json!(null)))
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(serde_json::json!({"message": e.to_string()})),
+        ),
+    }
 }

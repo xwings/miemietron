@@ -48,14 +48,17 @@ pub struct DnsConfig {
     pub fallback_filter: Option<FallbackFilter>,
 
     // Policy routing
+    // mihomo compat: policy entries are evaluated in config order
+    // (orderedmap in config.go parseNameServerPolicy) — serde_yaml::Mapping
+    // preserves YAML insertion order, HashMap would not.
     #[serde(default)]
-    pub nameserver_policy: HashMap<String, serde_yaml::Value>,
+    pub nameserver_policy: serde_yaml::Mapping,
 
     // Proxy DNS
     #[serde(default)]
     pub proxy_server_nameserver: Vec<String>,
     #[serde(default)]
-    pub proxy_server_nameserver_policy: HashMap<String, serde_yaml::Value>,
+    pub proxy_server_nameserver_policy: serde_yaml::Mapping,
 
     // Direct DNS
     #[serde(default)]
@@ -77,7 +80,9 @@ pub struct DnsConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub struct FallbackFilter {
-    #[serde(default)]
+    /// mihomo compat: defaults to true (config.go:503-508) — an explicit
+    /// fallback-filter block that omits `geoip` keeps the anti-poison filter.
+    #[serde(default = "default_true")]
     pub geoip: bool,
     #[serde(default = "default_geoip_code")]
     pub geoip_code: String,
@@ -110,9 +115,9 @@ impl Default for DnsConfig {
             nameserver: vec![],
             fallback: vec![],
             fallback_filter: None,
-            nameserver_policy: HashMap::new(),
+            nameserver_policy: serde_yaml::Mapping::new(),
             proxy_server_nameserver: vec![],
-            proxy_server_nameserver_policy: HashMap::new(),
+            proxy_server_nameserver_policy: serde_yaml::Mapping::new(),
             direct_nameserver: vec![],
             direct_nameserver_follow_policy: false,
             cache_algorithm: default_cache_algorithm(),

@@ -32,8 +32,45 @@ enum SiteMatcher {
 /// GeoSite matcher: loads mihomo's GeoSite.dat (protobuf-encoded) and matches
 /// domains against country-code groups.
 pub struct GeoSiteMatcher {
-    /// country_code (upper-cased) -> list of compiled matchers
-    sites: HashMap<String, Vec<SiteMatcher>>,
+    /// country_code (upper-cased) -> list of (matcher, attribute keys)
+    sites: HashMap<String, Vec<(SiteMatcher, Vec<String>)>>,
+}
+
+/// Parsed GEOSITE payload: mihomo compat `component/geodata/utils.go`
+/// LoadGeoSiteMatcher — leading `!` negates the whole matcher, `@attr` parts
+/// filter entries to those carrying ALL listed attribute keys (attr.go
+/// AttributeList.Match over BooleanMatcher).
+struct GeoSitePayload<'a> {
+    negate: bool,
+    base: String,
+    attrs: Vec<&'a str>,
+}
+
+fn parse_geosite_payload(code: &str) -> Option<GeoSitePayload<'_>> {
+    let (negate, rest) = match code.strip_prefix('!') {
+        Some(r) => (true, r),
+        None => (false, code),
+    };
+    if rest.is_empty() {
+        return None;
+    }
+    let mut parts = rest.split('@');
+    let base = parts.next()?.trim();
+    if base.is_empty() {
+        return None;
+    }
+    let attrs = parts.map(|a| a.trim()).filter(|a| !a.is_empty()).collect();
+    Some(GeoSitePayload {
+        negate,
+        base: base.to_uppercase(),
+        attrs,
+    })
+}
+
+fn attrs_match(wanted: &[&str], entry_attrs: &[String]) -> bool {
+    wanted
+        .iter()
+        .all(|w| entry_attrs.iter().any(|a| a.eq_ignore_ascii_case(w)))
 }
 
 impl GeoSiteMatcher {
@@ -74,43 +111,59 @@ impl GeoSiteMatcher {
     }
 
     /// Check if `domain` belongs to the site group identified by `code`
-    /// (e.g. "google", "cn", "category-ads-all").
+    /// (e.g. "google", "cn", "category-ads-all", "cn@cn", "!cn").
     pub fn lookup(&self, domain: &str, code: &str) -> bool {
-        let code_upper = code.to_uppercase();
-        let Some(entries) = self.sites.get(&code_upper) else {
+        let Some(payload) = parse_geosite_payload(code) else {
+            return false;
+        };
+        let Some(entries) = self.sites.get(&payload.base) else {
+            // mihomo fails config load for an unknown list; a missing list
+            // here never matches — including for negated payloads, so absent
+            // data can't accidentally match everything.
             return false;
         };
 
         let domain_lower = domain.to_lowercase();
-        for matcher in entries {
+        let mut matched = false;
+        for (matcher, entry_attrs) in entries {
+            if !payload.attrs.is_empty() && !attrs_match(&payload.attrs, entry_attrs) {
+                continue;
+            }
             match matcher {
                 SiteMatcher::Plain(value) => {
                     // Keyword: domain contains the value as a substring.
                     if domain_lower.contains(value) {
-                        return true;
+                        matched = true;
                     }
                 }
                 SiteMatcher::Suffix(value) => {
                     // Suffix: domain ends with ".value" or equals "value".
                     if domain_lower == *value || domain_lower.ends_with(&format!(".{value}")) {
-                        return true;
+                        matched = true;
                     }
                 }
                 SiteMatcher::Full(value) => {
                     // Exact match.
                     if domain_lower == *value {
-                        return true;
+                        matched = true;
                     }
                 }
                 SiteMatcher::Regex(re) => {
                     // RE2 unanchored match against the lowercased domain.
                     if re.is_match(&domain_lower) {
-                        return true;
+                        matched = true;
                     }
                 }
             }
+            if matched {
+                break;
+            }
         }
-        false
+        if payload.negate {
+            !matched
+        } else {
+            matched
+        }
     }
 
     /// Whether any site data was loaded.
@@ -119,10 +172,24 @@ impl GeoSiteMatcher {
     }
 
     /// Get the number of domain entries for a specific country/group code.
-    /// mihomo compat: matches GEOSITE.GetRecodeSize() via matcher.Count().
+    /// mihomo compat: matches GEOSITE.GetRecodeSize() via matcher.Count() —
+    /// attribute filtering applies to the count too.
     pub fn record_count(&self, code: &str) -> usize {
-        let code_upper = code.to_uppercase();
-        self.sites.get(&code_upper).map(|v| v.len()).unwrap_or(0)
+        let Some(payload) = parse_geosite_payload(code) else {
+            return 0;
+        };
+        self.sites
+            .get(&payload.base)
+            .map(|v| {
+                if payload.attrs.is_empty() {
+                    v.len()
+                } else {
+                    v.iter()
+                        .filter(|(_, ea)| attrs_match(&payload.attrs, ea))
+                        .count()
+                }
+            })
+            .unwrap_or(0)
     }
 }
 
@@ -136,7 +203,8 @@ impl GeoSiteMatcher {
 // GeoSite.dat structure:
 //   GeoSiteList { repeated GeoSite entry = 1; }
 //   GeoSite     { string country_code = 1; repeated Domain domain = 2; }
-//   Domain      { Type type = 1; string value = 2; }
+//   Domain      { Type type = 1; string value = 2; repeated Attribute attribute = 3; }
+//   Attribute   { string key = 1; oneof { bool bool_value = 2; int64 int_value = 3; } }
 //   Domain.Type { Plain=0, Regex=1, Domain=2, Full=3 }
 
 /// Parse a varint from the buffer, returning (value, bytes_consumed).
@@ -204,11 +272,39 @@ fn skip_field(wire_type: u8, buf: &[u8]) -> Option<usize> {
     }
 }
 
-/// Parse a single Domain message, returning (DomainType, value).
-fn parse_domain_msg(buf: &[u8]) -> Option<(DomainType, String)> {
+/// Parse a single Attribute message, returning its key (lowercased).
+fn parse_attribute_msg(buf: &[u8]) -> Option<String> {
+    let mut pos = 0;
+    let mut key = String::new();
+    while pos < buf.len() {
+        let (field_num, wire_type, tag_len) = decode_tag(&buf[pos..])?;
+        pos += tag_len;
+        match (field_num, wire_type) {
+            (1, 2) => {
+                let (len, hdr) = decode_varint(&buf[pos..])?;
+                pos += hdr;
+                let end = pos + len as usize;
+                if end > buf.len() {
+                    return None;
+                }
+                key = String::from_utf8_lossy(&buf[pos..end]).to_lowercase();
+                pos = end;
+            }
+            _ => {
+                let skipped = skip_field(wire_type, &buf[pos..])?;
+                pos += skipped;
+            }
+        }
+    }
+    Some(key)
+}
+
+/// Parse a single Domain message, returning (DomainType, value, attribute keys).
+fn parse_domain_msg(buf: &[u8]) -> Option<(DomainType, String, Vec<String>)> {
     let mut pos = 0;
     let mut dtype = DomainType::Plain; // default = 0
     let mut value = String::new();
+    let mut attrs = Vec::new();
 
     while pos < buf.len() {
         let (field_num, wire_type, tag_len) = decode_tag(&buf[pos..])?;
@@ -238,19 +334,35 @@ fn parse_domain_msg(buf: &[u8]) -> Option<(DomainType, String)> {
                 value = String::from_utf8_lossy(&buf[pos..end]).to_lowercase();
                 pos = end;
             }
+            (3, 2) => {
+                // attribute = embedded message (used by `geosite:cn@cn` payloads)
+                let (len, hdr) = decode_varint(&buf[pos..])?;
+                pos += hdr;
+                let end = pos + len as usize;
+                if end > buf.len() {
+                    return None;
+                }
+                if let Some(key) = parse_attribute_msg(&buf[pos..end]) {
+                    if !key.is_empty() {
+                        attrs.push(key);
+                    }
+                }
+                pos = end;
+            }
             _ => {
-                // Skip unknown fields (attribute list field=3, etc.)
                 let skipped = skip_field(wire_type, &buf[pos..])?;
                 pos += skipped;
             }
         }
     }
 
-    Some((dtype, value))
+    Some((dtype, value, attrs))
 }
 
+type ParsedDomain = (DomainType, String, Vec<String>);
+
 /// Parse a single GeoSite message, returning (country_code, domains).
-fn parse_geosite_msg(buf: &[u8]) -> Option<(String, Vec<(DomainType, String)>)> {
+fn parse_geosite_msg(buf: &[u8]) -> Option<(String, Vec<ParsedDomain>)> {
     let mut pos = 0;
     let mut country_code = String::new();
     let mut domains = Vec::new();
@@ -300,8 +412,8 @@ fn parse_geosite_msg(buf: &[u8]) -> Option<(String, Vec<(DomainType, String)>)> 
 /// Parse an entire GeoSite.dat file (GeoSiteList protobuf).
 ///
 /// Returns a map of uppercase country_code -> list of (DomainType, value).
-fn parse_geosite_dat(data: &[u8]) -> HashMap<String, Vec<(DomainType, String)>> {
-    let mut result: HashMap<String, Vec<(DomainType, String)>> = HashMap::new();
+fn parse_geosite_dat(data: &[u8]) -> HashMap<String, Vec<ParsedDomain>> {
+    let mut result: HashMap<String, Vec<ParsedDomain>> = HashMap::new();
     let mut pos = 0;
 
     while pos < data.len() {
@@ -344,18 +456,19 @@ fn parse_geosite_dat(data: &[u8]) -> HashMap<String, Vec<(DomainType, String)>> 
 /// just that one entry so a single malformed pattern in a huge DB can't take
 /// down the whole router; every other entry still matches the DB verbatim.
 fn compile_sites(
-    parsed: HashMap<String, Vec<(DomainType, String)>>,
-) -> HashMap<String, Vec<SiteMatcher>> {
-    let mut out: HashMap<String, Vec<SiteMatcher>> = HashMap::with_capacity(parsed.len());
+    parsed: HashMap<String, Vec<ParsedDomain>>,
+) -> HashMap<String, Vec<(SiteMatcher, Vec<String>)>> {
+    let mut out: HashMap<String, Vec<(SiteMatcher, Vec<String>)>> =
+        HashMap::with_capacity(parsed.len());
     for (code, entries) in parsed {
         let mut matchers = Vec::with_capacity(entries.len());
-        for (dtype, value) in entries {
+        for (dtype, value, attrs) in entries {
             match dtype {
-                DomainType::Plain => matchers.push(SiteMatcher::Plain(value)),
-                DomainType::Domain => matchers.push(SiteMatcher::Suffix(value)),
-                DomainType::Full => matchers.push(SiteMatcher::Full(value)),
+                DomainType::Plain => matchers.push((SiteMatcher::Plain(value), attrs)),
+                DomainType::Domain => matchers.push((SiteMatcher::Suffix(value), attrs)),
+                DomainType::Full => matchers.push((SiteMatcher::Full(value), attrs)),
                 DomainType::Regex => match regex::Regex::new(&value) {
-                    Ok(re) => matchers.push(SiteMatcher::Regex(re)),
+                    Ok(re) => matchers.push((SiteMatcher::Regex(re), attrs)),
                     Err(e) => {
                         tracing::warn!(
                             "GeoSite regex in category {} failed to compile ({}): {}",
@@ -378,7 +491,7 @@ mod tests {
 
     /// Build a matcher directly from parsed tuples (mirrors `new`'s compile
     /// step) so tests don't need a GeoSite.dat file on disk.
-    fn matcher_from(sites: HashMap<String, Vec<(DomainType, String)>>) -> GeoSiteMatcher {
+    fn matcher_from(sites: HashMap<String, Vec<ParsedDomain>>) -> GeoSiteMatcher {
         GeoSiteMatcher {
             sites: compile_sites(sites),
         }
@@ -463,7 +576,7 @@ mod tests {
     #[test]
     fn parse_domain_msg_plain() {
         let data = encode_domain(0, "google");
-        let (dtype, val) = parse_domain_msg(&data).unwrap();
+        let (dtype, val, _attrs) = parse_domain_msg(&data).unwrap();
         assert_eq!(dtype, DomainType::Plain);
         assert_eq!(val, "google");
     }
@@ -471,7 +584,7 @@ mod tests {
     #[test]
     fn parse_domain_msg_full() {
         let data = encode_domain(3, "www.google.com");
-        let (dtype, val) = parse_domain_msg(&data).unwrap();
+        let (dtype, val, _attrs) = parse_domain_msg(&data).unwrap();
         assert_eq!(dtype, DomainType::Full);
         assert_eq!(val, "www.google.com");
     }
@@ -485,9 +598,18 @@ mod tests {
         let (code, domains) = parse_geosite_msg(&data).unwrap();
         assert_eq!(code, "GOOGLE");
         assert_eq!(domains.len(), 3);
-        assert_eq!(domains[0], (DomainType::Plain, "google".to_string()));
-        assert_eq!(domains[1], (DomainType::Domain, "google.com".to_string()));
-        assert_eq!(domains[2], (DomainType::Full, "www.google.com".to_string()));
+        assert_eq!(
+            domains[0],
+            (DomainType::Plain, "google".to_string(), vec![])
+        );
+        assert_eq!(
+            domains[1],
+            (DomainType::Domain, "google.com".to_string(), vec![])
+        );
+        assert_eq!(
+            domains[2],
+            (DomainType::Full, "www.google.com".to_string(), vec![])
+        );
     }
 
     #[test]
@@ -501,13 +623,16 @@ mod tests {
 
         let google = map.get("GOOGLE").unwrap();
         assert_eq!(google.len(), 2);
-        assert_eq!(google[0], (DomainType::Plain, "google".to_string()));
-        assert_eq!(google[1], (DomainType::Domain, "google.com".to_string()));
+        assert_eq!(google[0], (DomainType::Plain, "google".to_string(), vec![]));
+        assert_eq!(
+            google[1],
+            (DomainType::Domain, "google.com".to_string(), vec![])
+        );
 
         let cn = map.get("CN").unwrap();
         assert_eq!(cn.len(), 2);
-        assert_eq!(cn[0], (DomainType::Domain, "baidu.com".to_string()));
-        assert_eq!(cn[1], (DomainType::Full, "www.qq.com".to_string()));
+        assert_eq!(cn[0], (DomainType::Domain, "baidu.com".to_string(), vec![]));
+        assert_eq!(cn[1], (DomainType::Full, "www.qq.com".to_string(), vec![]));
     }
 
     #[test]
@@ -518,8 +643,14 @@ mod tests {
         let map = parse_geosite_dat(&dat);
         let entries = map.get("TEST").unwrap();
         assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0], (DomainType::Regex, "^regex.*pattern$".to_string()));
-        assert_eq!(entries[1], (DomainType::Domain, "example.com".to_string()));
+        assert_eq!(
+            entries[0],
+            (DomainType::Regex, "^regex.*pattern$".to_string(), vec![])
+        );
+        assert_eq!(
+            entries[1],
+            (DomainType::Domain, "example.com".to_string(), vec![])
+        );
     }
 
     #[test]

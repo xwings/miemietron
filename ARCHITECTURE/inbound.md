@@ -35,6 +35,10 @@ Accept local client connections — HTTP proxy, SOCKS5, mixed-port auto-detect, 
 - `cargo test inbound` — SOCKS5 reply formatting and protocol constants. Pass = `test result: ok`.
 - Integration: `timeout 30 target/debug/miemietron -d <dir> -f <config.yaml>` then `curl -x http://127.0.0.1:7890 <url>` and `curl --socks5 127.0.0.1:7891 <url>`.
 
+## mihomo parity notes (2026-07 audit)
+- All accepted TCP sockets get keepalive via `transport::tcp::apply_inbound_keepalive` (mihomo keepalive.TCPKeepAlive), honoring `disable-keep-alive` set at boot.
+- Still missing vs mihomo: SOCKS4/4a on socks/mixed listeners, `skip-auth-prefixes` / `lan-allowed-ips` / `lan-disallowed-ips`, HTTP 403-on-wrong-credentials (we always 407), per-request routing on plain-HTTP keep-alive connections.
+
 ## Open Gaps / Roadmap
 - redir/TPROXY raw-socket setup is IPv4-first; broaden pure-v6 coverage.
 - SOCKS5 UDP NAT sessions use a fixed idle timeout with a reaper; not configurable.

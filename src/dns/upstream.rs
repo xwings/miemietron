@@ -28,12 +28,12 @@ static DNS_GEOIP: std::sync::LazyLock<GeoIpMatcher> = std::sync::LazyLock::new(|
 
 /// Race multiple DNS servers concurrently, return first successful result.
 /// Matches mihomo's batchExchange() pattern. Returns (IP, TTL).
-async fn batch_resolve(domain: &str, servers: &[String]) -> Result<(IpAddr, u32)> {
+async fn batch_resolve(domain: &str, servers: &[String], qtype: u16) -> Result<(IpAddr, u32)> {
     if servers.is_empty() {
         return Err(anyhow::anyhow!("no DNS servers configured"));
     }
     if servers.len() == 1 {
-        return query_server(domain, &servers[0]).await;
+        return query_server(domain, &servers[0], qtype).await;
     }
 
     let (tx, mut rx) = tokio::sync::mpsc::channel(servers.len());
@@ -42,7 +42,7 @@ async fn batch_resolve(domain: &str, servers: &[String]) -> Result<(IpAddr, u32)
         let domain = domain.to_string();
         let server = server.clone();
         tokio::spawn(async move {
-            let result = query_server(&domain, &server).await;
+            let result = query_server(&domain, &server, qtype).await;
             let _ = tx.send(result).await;
         });
     }
@@ -70,7 +70,7 @@ async fn batch_resolve_reject_fakeip(
         return Err(anyhow::anyhow!("no DNS servers configured"));
     }
     if servers.len() == 1 {
-        let (ip, _ttl) = query_server(domain, &servers[0]).await?;
+        let (ip, _ttl) = query_server(domain, &servers[0], 1).await?;
         if is_in_fakeip_range(&ip, fake_ip_range) {
             return Err(anyhow::anyhow!(
                 "DNS {source_label} returned FakeIP {ip} for proxy server {domain}, rejecting"
@@ -87,7 +87,7 @@ async fn batch_resolve_reject_fakeip(
         let fake_ip_range = fake_ip_range.to_string();
         let source_label = source_label.to_string();
         tokio::spawn(async move {
-            match query_server(&domain, &server).await {
+            match query_server(&domain, &server, 1).await {
                 Ok((ip, _ttl)) => {
                     if is_in_fakeip_range(&ip, &fake_ip_range) {
                         let _ = tx
@@ -131,7 +131,7 @@ async fn batch_resolve_reject_fakeip(
 pub async fn resolve_proxy_server(domain: &str, config: &DnsConfig) -> Result<IpAddr> {
     // 0. Check nameserver-policy first (e.g. "+.oix_nodes.com": "124.221.68.73:1053")
     if let Some(server) = match_nameserver_policy(domain, &config.nameserver_policy) {
-        match query_server(domain, &server).await {
+        match query_server(domain, &server, 1).await {
             Ok((ip, _ttl)) => {
                 if is_in_fakeip_range(&ip, &config.fake_ip_range) {
                     warn!(
@@ -222,6 +222,37 @@ pub async fn resolve_proxy_server(domain: &str, config: &DnsConfig) -> Result<Ip
 /// for a public domain, or an IP in the fake-ip range), races all fallback
 /// servers concurrently.
 pub async fn resolve(domain: &str, config: &DnsConfig) -> Result<(IpAddr, u32)> {
+    resolve_qtype(domain, config, 1).await
+}
+
+/// Race a specific server list (nameserver-policy hit) — no fallback logic.
+/// mihomo compat: resolver.go matchPolicy results are used directly.
+pub async fn resolve_via(domain: &str, servers: &[String], qtype: u16) -> Result<(IpAddr, u32)> {
+    batch_resolve(domain, servers, qtype).await
+}
+
+/// The first configured main nameserver usable for raw passthrough (plain
+/// "ip" / "ip:port" UDP entries only).
+pub fn plain_udp_server(config: &DnsConfig) -> Option<String> {
+    config
+        .nameserver
+        .iter()
+        .chain(config.default_nameserver.iter())
+        .find_map(|s| {
+            if s.contains("://") || s == "system" {
+                return None;
+            }
+            if s.parse::<std::net::SocketAddr>().is_ok() {
+                return Some(s.clone());
+            }
+            s.parse::<IpAddr>().ok().map(|ip| match ip {
+                IpAddr::V4(_) => format!("{ip}:53"),
+                IpAddr::V6(_) => format!("[{ip}]:53"),
+            })
+        })
+}
+
+pub async fn resolve_qtype(domain: &str, config: &DnsConfig, qtype: u16) -> Result<(IpAddr, u32)> {
     // Determine primary nameserver list
     let servers = if !config.nameserver.is_empty() {
         &config.nameserver
@@ -229,11 +260,11 @@ pub async fn resolve(domain: &str, config: &DnsConfig) -> Result<(IpAddr, u32)> 
         &config.default_nameserver
     } else {
         // Hardcoded fallback
-        return resolve_udp(domain, "8.8.8.8:53").await;
+        return resolve_udp(domain, "8.8.8.8:53", qtype).await;
     };
 
     // Race all primary nameservers concurrently
-    let primary_result = batch_resolve(domain, servers).await;
+    let primary_result = batch_resolve(domain, servers, qtype).await;
 
     // If we got a result, check if it needs fallback
     if let Ok((ip, ttl)) = primary_result {
@@ -243,7 +274,7 @@ pub async fn resolve(domain: &str, config: &DnsConfig) -> Result<(IpAddr, u32)> 
                 ip, domain
             );
             // Race all fallback nameservers concurrently
-            match batch_resolve(domain, &config.fallback).await {
+            match batch_resolve(domain, &config.fallback, qtype).await {
                 Ok((fallback_ip, fallback_ttl)) => {
                     debug!(
                         "DNS fallback returned {} for {} (primary was {})",
@@ -262,7 +293,7 @@ pub async fn resolve(domain: &str, config: &DnsConfig) -> Result<(IpAddr, u32)> 
 
     // Primary failed entirely, try fallback servers concurrently
     if !config.fallback.is_empty() {
-        if let Ok(result) = batch_resolve(domain, &config.fallback).await {
+        if let Ok(result) = batch_resolve(domain, &config.fallback, qtype).await {
             return Ok(result);
         }
     }
@@ -291,25 +322,34 @@ fn should_use_fallback(ip: &IpAddr, domain: &str, config: &DnsConfig) -> bool {
         return false;
     }
 
-    // Check fallback-filter rules if present
-    if let Some(ref filter) = config.fallback_filter {
-        // GeoIP filter: fallback when the resolved IP's country does NOT match
-        // geoip_code. A domestic (matching-country) answer from the main
-        // nameserver is trusted; a foreign or unknown-country answer is treated
-        // as potentially GFW-poisoned and re-queried through the fallback tier.
-        if filter.geoip && !filter.geoip_code.is_empty() {
-            let matches_code = DNS_GEOIP
-                .lookup_country(ip)
-                .is_some_and(|country| country.eq_ignore_ascii_case(&filter.geoip_code));
-            if !matches_code {
-                debug!(
-                    "DNS fallback triggered: {} resolved to {} (country not {}), using fallback",
-                    domain, ip, filter.geoip_code
-                );
-                return true;
-            }
-        }
+    // mihomo compat: fallback-filter defaults to {geoip: true, geoip-code: CN}
+    // (config.go:503-508) and is active whenever `fallback:` is configured —
+    // an omitted fallback-filter block still gets the GeoIP anti-poison filter.
+    let (geoip_on, geoip_code) = match config.fallback_filter {
+        Some(ref f) => (f.geoip, f.geoip_code.as_str()),
+        None => (true, "CN"),
+    };
 
+    // GeoIP filter: fallback when the resolved IP's country does NOT match
+    // geoip_code. A domestic (matching-country) answer from the main
+    // nameserver is trusted; a foreign or unknown-country answer is treated
+    // as potentially GFW-poisoned and re-queried through the fallback tier.
+    if geoip_on && !geoip_code.is_empty() {
+        let matches_code = DNS_GEOIP
+            .lookup_codes(ip)
+            .iter()
+            .any(|country| country.eq_ignore_ascii_case(geoip_code));
+        if !matches_code {
+            debug!(
+                "DNS fallback triggered: {} resolved to {} (country not {}), using fallback",
+                domain, ip, geoip_code
+            );
+            return true;
+        }
+    }
+
+    // Check the remaining fallback-filter rules if a block is present
+    if let Some(ref filter) = config.fallback_filter {
         // IP CIDR filter
         for cidr_str in &filter.ipcidr {
             if let Ok((base, prefix_len)) = parse_cidr_simple(cidr_str) {
@@ -409,14 +449,14 @@ fn parse_cidr_simple(cidr: &str) -> Result<(u32, u32)> {
 
 /// Route a DNS query to the appropriate upstream based on the server URL scheme.
 /// Returns (IP, TTL).
-async fn query_server(domain: &str, server: &str) -> Result<(IpAddr, u32)> {
+async fn query_server(domain: &str, server: &str, qtype: u16) -> Result<(IpAddr, u32)> {
     // Strip quotes that OpenClash sometimes leaves (e.g. dhcp://"eth1")
     let server = server.trim_matches('"').trim_matches('\'');
 
     if server.starts_with("https://") {
-        resolve_doh(domain, server).await
+        resolve_doh(domain, server, qtype).await
     } else if server.starts_with("tls://") {
-        resolve_dot(domain, server).await
+        resolve_dot(domain, server, qtype).await
     } else if server.starts_with("dhcp://") {
         // mihomo's `dns/dhcp.go` reads DNS from the DHCP lease on the named
         // interface. miemietron does not have a DHCP client — surface that as
@@ -440,7 +480,7 @@ async fn query_server(domain: &str, server: &str) -> Result<(IpAddr, u32)> {
         } else {
             format!("{server}:53")
         };
-        resolve_udp(domain, &addr).await
+        resolve_udp(domain, &addr, qtype).await
     }
 }
 
@@ -456,7 +496,7 @@ async fn resolve_system(domain: &str) -> Result<(IpAddr, u32)> {
 }
 
 /// Resolve via plain UDP DNS. Returns (IP, TTL).
-async fn resolve_udp(domain: &str, server: &str) -> Result<(IpAddr, u32)> {
+async fn resolve_udp(domain: &str, server: &str, qtype: u16) -> Result<(IpAddr, u32)> {
     let addr: SocketAddr = server
         .parse()
         .map_err(|e| anyhow::anyhow!("invalid DNS server address {server}: {e}"))?;
@@ -471,7 +511,7 @@ async fn resolve_udp(domain: &str, server: &str) -> Result<(IpAddr, u32)> {
 
     socket.connect(addr).await?;
 
-    let query = build_dns_query(domain, 1); // Type A = 1
+    let query = build_dns_query(domain, qtype);
     socket.send(&query).await?;
 
     let mut buf = vec![0u8; 4096];
@@ -480,12 +520,12 @@ async fn resolve_udp(domain: &str, server: &str) -> Result<(IpAddr, u32)> {
     let n = timeout.await??;
     let response = &buf[..n];
 
-    parse_dns_response(response)
+    parse_dns_response(response, qtype)
 }
 
 /// Resolve via DNS-over-HTTPS (RFC 8484). Returns (IP, TTL).
-async fn resolve_doh(domain: &str, url: &str) -> Result<(IpAddr, u32)> {
-    let query = build_dns_query(domain, 1);
+async fn resolve_doh(domain: &str, url: &str, qtype: u16) -> Result<(IpAddr, u32)> {
+    let query = build_dns_query(domain, qtype);
     let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&query);
 
     let request_url = format!("{url}?dns={encoded}");
@@ -501,7 +541,7 @@ async fn resolve_doh(domain: &str, url: &str) -> Result<(IpAddr, u32)> {
         .await?;
 
     let body = response.bytes().await?;
-    parse_dns_response(&body)
+    parse_dns_response(&body, qtype)
 }
 
 use base64::Engine;
@@ -522,7 +562,7 @@ static DOT_POOL: std::sync::LazyLock<DotPool> =
 /// Connects to the server on port 853, wraps the TCP connection in TLS,
 /// and sends/receives DNS messages with 2-byte length prefix framing.
 /// Connections are pooled for reuse.
-async fn resolve_dot(domain: &str, server: &str) -> Result<(IpAddr, u32)> {
+async fn resolve_dot(domain: &str, server: &str, qtype: u16) -> Result<(IpAddr, u32)> {
     let addr_str = server.trim_start_matches("tls://");
     let (host, port_str) = if let Some(idx) = addr_str.rfind(':') {
         // Check if this is an IPv6 address in brackets
@@ -560,7 +600,7 @@ async fn resolve_dot(domain: &str, server: &str) -> Result<(IpAddr, u32)> {
     {
         let mut slot = conn_slot.lock().await;
         if let Some(ref mut tls_stream) = *slot {
-            match dot_query_on_stream(tls_stream, domain).await {
+            match dot_query_on_stream(tls_stream, domain, qtype).await {
                 Ok(ip) => return Ok(ip),
                 Err(_) => {
                     // Connection is stale, drop it and create a new one
@@ -587,7 +627,7 @@ async fn resolve_dot(domain: &str, server: &str) -> Result<(IpAddr, u32)> {
     };
 
     let mut tls_stream = wrap_tls(tcp_stream, &tls_opts).await?;
-    let ip = dot_query_on_stream(&mut tls_stream, domain).await?;
+    let ip = dot_query_on_stream(&mut tls_stream, domain, qtype).await?;
 
     // Pool the connection for reuse
     {
@@ -602,8 +642,9 @@ async fn resolve_dot(domain: &str, server: &str) -> Result<(IpAddr, u32)> {
 async fn dot_query_on_stream(
     stream: &mut tokio_rustls::client::TlsStream<TcpStream>,
     domain: &str,
+    qtype: u16,
 ) -> Result<(IpAddr, u32)> {
-    let query = build_dns_query(domain, 1);
+    let query = build_dns_query(domain, qtype);
 
     // Write 2-byte length prefix + query
     let len_prefix = (query.len() as u16).to_be_bytes();
@@ -632,7 +673,7 @@ async fn dot_query_on_stream(
     )
     .await??;
 
-    parse_dns_response(&resp_buf)
+    parse_dns_response(&resp_buf, qtype)
 }
 
 /// Build a DNS query packet for the given domain and record type.
@@ -666,7 +707,7 @@ fn build_dns_query(domain: &str, qtype: u16) -> Vec<u8> {
 ///
 /// mihomo compat: returns (ip, min_ttl) where min_ttl is the smallest TTL
 /// across all answer records (see dns/util.go minimalTTL).
-fn parse_dns_response(data: &[u8]) -> Result<(IpAddr, u32)> {
+fn parse_dns_response(data: &[u8], qtype: u16) -> Result<(IpAddr, u32)> {
     if data.len() < 12 {
         return Err(anyhow::anyhow!("DNS response too short"));
     }
@@ -708,7 +749,8 @@ fn parse_dns_response(data: &[u8]) -> Result<(IpAddr, u32)> {
             min_ttl = ttl;
         }
 
-        if rtype == 1 && rdlength == 4 && pos + 4 <= data.len() && result_ip.is_none() {
+        if rtype == 1 && qtype == 1 && rdlength == 4 && pos + 4 <= data.len() && result_ip.is_none()
+        {
             // A record — take the first one
             result_ip = Some(IpAddr::V4(Ipv4Addr::new(
                 data[pos],
@@ -716,6 +758,16 @@ fn parse_dns_response(data: &[u8]) -> Result<(IpAddr, u32)> {
                 data[pos + 2],
                 data[pos + 3],
             )));
+        } else if rtype == 28
+            && qtype == 28
+            && rdlength == 16
+            && pos + 16 <= data.len()
+            && result_ip.is_none()
+        {
+            // AAAA record — take the first one
+            let mut octets = [0u8; 16];
+            octets.copy_from_slice(&data[pos..pos + 16]);
+            result_ip = Some(IpAddr::V6(std::net::Ipv6Addr::from(octets)));
         }
 
         pos += rdlength;
@@ -723,7 +775,7 @@ fn parse_dns_response(data: &[u8]) -> Result<(IpAddr, u32)> {
 
     match result_ip {
         Some(ip) => Ok((ip, if min_ttl == u32::MAX { 0 } else { min_ttl })),
-        None => Err(anyhow::anyhow!("no A record found in DNS response")),
+        None => Err(anyhow::anyhow!("no matching record found in DNS response")),
     }
 }
 
@@ -744,6 +796,22 @@ fn skip_dns_name(data: &[u8], mut pos: usize) -> Result<usize> {
     }
 }
 
+/// mihomo compat: DomainTrie insert semantics for policy/hosts keys —
+/// "example.com" exact, "+.example.com" the domain and any subdomain,
+/// "*.example.com" exactly one extra label.
+pub(crate) fn domain_pattern_match(pattern: &str, domain: &str) -> bool {
+    if let Some(suffix) = pattern.strip_prefix("+.") {
+        domain == suffix || domain.ends_with(&format!(".{suffix}"))
+    } else if let Some(suffix) = pattern.strip_prefix("*.") {
+        domain.len() > suffix.len() + 1
+            && domain.ends_with(suffix)
+            && domain.as_bytes()[domain.len() - suffix.len() - 1] == b'.'
+            && !domain[..domain.len() - suffix.len() - 1].contains('.')
+    } else {
+        domain == pattern
+    }
+}
+
 /// Match a domain against nameserver-policy entries.
 ///
 /// Policy keys can be:
@@ -752,26 +820,25 @@ fn skip_dns_name(data: &[u8], mut pos: usize) -> Result<usize> {
 /// - `"geosite:xxx"` — not supported yet, returns None
 ///
 /// Policy values can be a string (single server) or YAML array.
-fn match_nameserver_policy(
-    domain: &str,
-    policy: &std::collections::HashMap<String, serde_yaml::Value>,
-) -> Option<String> {
+fn match_nameserver_policy(domain: &str, policy: &serde_yaml::Mapping) -> Option<String> {
     let domain_lower = domain.to_lowercase();
 
-    for (pattern, value) in policy {
-        let pattern_lower = pattern.to_lowercase();
-
-        // Skip geosite: patterns (not supported in proxy server resolution)
-        if pattern_lower.starts_with("geosite:") {
+    for (key, value) in policy {
+        let Some(pattern_raw) = key.as_str() else {
             continue;
-        }
-
-        let matches = if let Some(suffix) = pattern_lower.strip_prefix("+.") {
-            // "+.domain.com" matches "domain.com" and "*.domain.com"
-            domain_lower == suffix || domain_lower.ends_with(&format!(".{suffix}"))
-        } else {
-            domain_lower == pattern_lower
         };
+        // mihomo compat: a policy key can be a comma-separated list of
+        // patterns (config.go parseNameServerPolicy).
+        let matches = pattern_raw.split(',').any(|pattern| {
+            let pattern_lower = pattern.trim().to_lowercase();
+            // geosite:/rule-set: keys need the rule engine — not available in
+            // the proxy-server bootstrap path; the resolver-level policy
+            // handles them (DnsResolver::nameserver_policy_servers).
+            if pattern_lower.starts_with("geosite:") || pattern_lower.starts_with("rule-set:") {
+                return false;
+            }
+            domain_pattern_match(&pattern_lower, &domain_lower)
+        });
 
         if matches {
             // Extract server string from YAML value
@@ -968,8 +1035,23 @@ mod tests {
             fallback_filter: None,
             ..Default::default()
         };
-        // A public IP with no fallback filter should not trigger.
+        // mihomo compat: fallback-filter defaults to {geoip: true, geoip-code:
+        // CN} (config.go:503-508) even when the block is omitted — a public
+        // non-CN answer from the main nameservers triggers the fallback tier.
         let ip = IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8));
+        assert!(should_use_fallback(&ip, "example.com", &config));
+
+        // Explicitly disabling geoip turns the anti-poison filter off.
+        let config = DnsConfig {
+            fallback_filter: Some(crate::config::dns::FallbackFilter {
+                geoip: false,
+                geoip_code: "CN".to_string(),
+                geosite: vec![],
+                ipcidr: vec![],
+                domain: vec![],
+            }),
+            ..Default::default()
+        };
         assert!(!should_use_fallback(&ip, "example.com", &config));
     }
 
@@ -1004,7 +1086,7 @@ mod tests {
 
     #[test]
     fn parse_dns_response_too_short() {
-        assert!(parse_dns_response(&[0u8; 5]).is_err());
+        assert!(parse_dns_response(&[0u8; 5], 1).is_err());
     }
 
     #[test]
@@ -1012,6 +1094,6 @@ mod tests {
         // Minimal DNS response header with 0 answers.
         let data = vec![0u8; 12];
         // ancount = 0 (bytes 6-7 already zero).
-        assert!(parse_dns_response(&data).is_err());
+        assert!(parse_dns_response(&data, 1).is_err());
     }
 }

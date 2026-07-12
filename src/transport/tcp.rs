@@ -81,10 +81,7 @@ pub async fn connect(addr: SocketAddr, opts: &ConnectOpts) -> Result<TcpStream> 
     // fall back to the global auto-detected default interface (loop avoidance).
     #[cfg(target_os = "linux")]
     {
-        let iface = opts
-            .interface
-            .clone()
-            .or_else(default_outbound_interface);
+        let iface = opts.interface.clone().or_else(default_outbound_interface);
         if let Some(iface) = iface {
             socket.bind_device(Some(iface.as_bytes()))?;
         }
@@ -145,4 +142,24 @@ pub async fn connect(addr: SocketAddr, opts: &ConnectOpts) -> Result<TcpStream> 
     }
 
     Ok(stream)
+}
+
+/// mihomo compat: inbound listeners enable TCP keepalive on accepted sockets
+/// (keepalive.TCPKeepAlive — redir/tproxy call it directly, proxy listeners
+/// inherit it via inbound.Listen's ListenConfig). Without it, half-dead client
+/// connections linger in /connections forever. Honors `disable-keep-alive`.
+pub fn apply_inbound_keepalive(stream: &tokio::net::TcpStream) {
+    if INBOUND_KEEPALIVE_DISABLED.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let sock = socket2::SockRef::from(stream);
+    let _ = sock.set_keepalive(true);
+}
+
+static INBOUND_KEEPALIVE_DISABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Set at boot from the config's `disable-keep-alive`.
+pub fn set_inbound_keepalive_disabled(disabled: bool) {
+    INBOUND_KEEPALIVE_DISABLED.store(disabled, std::sync::atomic::Ordering::Relaxed);
 }

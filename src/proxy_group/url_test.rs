@@ -27,6 +27,8 @@ pub struct UrlTestGroup {
     test_url: String,
     interval: Duration,
     tolerance: u32,
+    /// mihomo compat: expected-status ranges for the health check.
+    expected_status: Option<Vec<(u16, u16)>>,
     /// Centralized state store for delay/alive tracking.
     state_store: Arc<ProxyStateStore>,
     /// Current best proxy (tolerance-aware sticky selection).
@@ -69,6 +71,7 @@ impl UrlTestGroup {
             test_url: hc.url,
             interval: Duration::from_secs(hc.interval_secs),
             tolerance,
+            expected_status: hc.expected_status,
             state_store,
             current_best: parking_lot::RwLock::new(None),
             force_selected: parking_lot::RwLock::new(None),
@@ -124,58 +127,17 @@ impl UrlTestGroup {
         proxies: &HashMap<String, Arc<dyn OutboundHandler>>,
         dns: &Arc<DnsResolver>,
     ) {
-        // mihomo compat: healthcheck.go uses errgroup.SetLimit(10) to bound
-        // concurrent health checks. Without this, spawning ALL proxies at once
-        // accumulates hundreds of hanging TCP connections on ARM routers,
-        // eventually burning 100% CPU.
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(10));
-        let mut handles = Vec::new();
-        let timeout = Duration::from_millis(self.test_timeout);
-
-        for name in &self.proxy_names {
-            let handler = match proxies.get(name) {
-                Some(h) => h.clone(),
-                None => continue,
-            };
-            let name = name.clone();
-            let url = self.test_url.clone();
-            let dns = dns.clone();
-            let state_store = self.state_store.clone();
-            let sem = semaphore.clone();
-
-            let handle = tokio::spawn(async move {
-                // Acquire semaphore permit (max 10 concurrent checks)
-                let _permit = sem.acquire().await;
-                // mihomo compat: per-proxy timeout from hc.timeout (default 5000ms)
-                let result =
-                    tokio::time::timeout(timeout, measure_unified_delay(&handler, &url, &dns))
-                        .await;
-                match result {
-                    Ok(Ok(ms)) => {
-                        debug!("url-test {}: {}ms", name, ms);
-                        let delay = if ms > u16::MAX as u64 {
-                            u16::MAX
-                        } else {
-                            ms as u16
-                        };
-                        state_store.record_result(&name, &url, Some(delay));
-                    }
-                    Ok(Err(e)) => {
-                        warn!("url-test {}: {}", name, e);
-                        state_store.record_result(&name, &url, None);
-                    }
-                    Err(_) => {
-                        warn!("url-test {}: timeout", name);
-                        state_store.record_result(&name, &url, None);
-                    }
-                }
-            });
-            handles.push(handle);
-        }
-
-        for h in handles {
-            let _ = h.await;
-        }
+        super::health::run_health_check(
+            "url-test",
+            &self.proxy_names,
+            &self.test_url,
+            self.test_timeout,
+            self.expected_status.clone(),
+            proxies,
+            dns,
+            &self.state_store,
+        )
+        .await;
     }
 
     /// Get the current delay results (for API reporting).
@@ -201,15 +163,18 @@ impl UrlTestGroup {
     }
 
     fn compute_fast(&self) -> String {
-        // mihomo compat: if a proxy is force-pinned via API, return it
-        // (as long as it's alive — matching mihomo's fast() logic).
+        // mihomo compat: urltest.go fast() (urltest.go:110-120) — a
+        // force-pinned proxy is only returned while alive for the test URL;
+        // a dead pin falls through to fastest-alive selection WITHOUT
+        // clearing `selected`, so the pin resumes when the proxy comes back
+        // alive. (alive_for_url returns true when no state is recorded, so
+        // a fresh pin is honored before the first health check.)
         if let Some(ref selected) = *self.force_selected.read() {
-            if self.state_store.alive_for_url(selected, &self.test_url) {
+            if self.proxy_names.iter().any(|n| n == selected)
+                && self.state_store.alive_for_url(selected, &self.test_url)
+            {
                 return selected.clone();
             }
-            // If no health check yet, still honor the force selection
-            // (alive_for_url returns true when no state is recorded)
-            return selected.clone();
         }
 
         // Find the proxy with the lowest delay among alive proxies
@@ -303,6 +268,12 @@ impl ProxyGroup for UrlTestGroup {
         self.fast_single.reset();
     }
 
+    fn fixed(&self) -> String {
+        // mihomo compat: urltest.go:181 — `fixed` is the pinned name, kept
+        // even while the pinned proxy is dead.
+        self.force_selected.read().clone().unwrap_or_default()
+    }
+
     fn get_proxy(
         &self,
         proxies: &HashMap<String, Arc<dyn OutboundHandler>>,
@@ -376,19 +347,26 @@ impl ProxyGroup for UrlTestGroup {
     }
 }
 
+/// Parse the HTTP status code from a response status line ("HTTP/1.1 204 ...").
+fn parse_status_line(buf: &[u8]) -> Option<u16> {
+    let s = std::str::from_utf8(buf).ok()?;
+    if !s.starts_with("HTTP/") {
+        return None;
+    }
+    s.get(9..12)?.trim().parse().ok()
+}
+
 /// Measure latency by connecting through a proxy and sending an HTTP HEAD request.
-/// Returns the total elapsed time in milliseconds.
-///
-/// Measure latency by connecting through a proxy and sending an HTTP HEAD request.
-/// Returns the total elapsed time in milliseconds.
+/// Returns the total elapsed time in milliseconds and the HTTP status code.
 ///
 /// mihomo compat: matches adapter.go URLTest() which uses a 30s HTTP client timeout,
-/// dials through the proxy, sends HEAD, reads the status line.
+/// dials through the proxy, sends HEAD, reads the status line. The status code
+/// is returned so callers can apply expected-status "satisfied" semantics.
 pub(crate) async fn measure_unified_delay(
     handler: &Arc<dyn OutboundHandler>,
     url: &str,
     dns: &DnsResolver,
-) -> anyhow::Result<u64> {
+) -> anyhow::Result<(u64, u16)> {
     // Parse URL to extract host and port
     let parsed: url::Url = url.parse()?;
     let host = parsed.host_str().unwrap_or("www.gstatic.com").to_string();
@@ -417,7 +395,7 @@ pub(crate) async fn measure_unified_delay(
         let req = format!(
             "HEAD {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: clash\r\nConnection: close\r\n\r\n"
         );
-        let ok = if is_https {
+        let status = if is_https {
             let provider = rustls::crypto::ring::default_provider();
             let tls_connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(
                 rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(provider))
@@ -429,33 +407,29 @@ pub(crate) async fn measure_unified_delay(
                     ))
                     .with_no_client_auth(),
             ));
-            let server_name = rustls::pki_types::ServerName::try_from(host.clone())
-                .unwrap_or_else(|_| {
+            let server_name =
+                rustls::pki_types::ServerName::try_from(host.clone()).unwrap_or_else(|_| {
                     rustls::pki_types::ServerName::try_from("localhost".to_string()).unwrap()
                 });
             let mut tls_stream = tls_connector.connect(server_name, stream).await?;
             tls_stream.write_all(req.as_bytes()).await?;
             let mut buf = [0u8; 256];
             let n = tls_stream.read(&mut buf).await?;
-            let response = String::from_utf8_lossy(&buf[..n]);
-            let ok = response.starts_with("HTTP/");
+            let status = parse_status_line(&buf[..n]);
             let _ = tls_stream.shutdown().await;
-            ok
+            status
         } else {
             let mut stream = stream;
             stream.write_all(req.as_bytes()).await?;
             let mut buf = [0u8; 256];
             let n = stream.read(&mut buf).await?;
-            let response = String::from_utf8_lossy(&buf[..n]);
-            let ok = response.starts_with("HTTP/");
+            let status = parse_status_line(&buf[..n]);
             let _ = stream.shutdown().await;
-            ok
+            status
         };
 
-        if !ok {
-            return Err(anyhow::anyhow!("invalid HTTP response"));
-        }
-        Ok::<u64, anyhow::Error>(start.elapsed().as_millis() as u64)
+        let status = status.ok_or_else(|| anyhow::anyhow!("invalid HTTP response"))?;
+        Ok::<(u64, u16), anyhow::Error>((start.elapsed().as_millis() as u64, status))
     })
     .await
     .map_err(|_| anyhow::anyhow!("connect timeout"))??;
@@ -478,6 +452,7 @@ mod tests {
             max_failed_times: None,
             test_timeout: None,
             lazy: false,
+            expected_status: None,
         }
     }
 
@@ -487,13 +462,7 @@ mod tests {
             "auto".to_string(),
             vec!["a".to_string(), "b".to_string()],
             150,
-            HealthCheckOpts {
-                url: "http://test.example/204".to_string(),
-                interval_secs: 300,
-                max_failed_times: None,
-                test_timeout: None,
-                lazy: false,
-            },
+            make_hc("http://test.example/204"),
             make_store(),
         );
         assert_eq!(group.name(), "auto");
@@ -533,6 +502,38 @@ mod tests {
         assert_eq!(group.now(), "a"); // falls back to first
                                       // Can't select a proxy not in the group
         assert!(!group.select("nonexistent"));
+    }
+
+    #[test]
+    fn dead_pin_falls_through_to_fastest_but_is_kept() {
+        // mihomo compat: urltest.go fast() — a dead pinned proxy is skipped
+        // (fastest alive wins) but `selected` is NOT cleared, so it resumes
+        // when the proxy comes back alive.
+        let store = make_store();
+        let url = "http://test.example/204";
+        store.record_result("a", url, Some(100));
+        store.record_result("b", url, Some(200));
+
+        let group = UrlTestGroup::new(
+            "auto".to_string(),
+            vec!["a".to_string(), "b".to_string()],
+            0,
+            make_hc(url),
+            store.clone(),
+        );
+        assert!(group.select("b"));
+        assert_eq!(group.now(), "b");
+
+        // "b" goes dead: fall through to fastest alive, pin kept.
+        store.record_result("b", url, None);
+        group.reset_fast_single();
+        assert_eq!(group.now(), "a");
+        assert_eq!(group.fixed(), "b");
+
+        // "b" comes back alive: pin resumes.
+        store.record_result("b", url, Some(300));
+        group.reset_fast_single();
+        assert_eq!(group.now(), "b");
     }
 
     #[test]

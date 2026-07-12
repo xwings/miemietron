@@ -195,6 +195,16 @@ pub(crate) fn inbound_type_display(conn_type: &'static str) -> &'static str {
     }
 }
 
+/// mihomo compat: constant/adapters.go Chain.String() — a connection's chain
+/// renders as `last[first]` (e.g. `MyGroup[node]`), or the single element.
+fn chain_display(chains: &[String]) -> String {
+    match chains.len() {
+        0 => String::new(),
+        1 => chains[0].clone(),
+        n => format!("{}[{}]", chains[n - 1], chains[0]),
+    }
+}
+
 /// Maximum number of bytes to peek for sniffing (TLS ClientHello / HTTP headers).
 const SNIFF_PEEK_SIZE: usize = 1024;
 
@@ -404,12 +414,19 @@ impl ConnectionManager {
             rt.mode.clone()
         };
 
-        // mihomo compat: preHandleMetadata + sniffing flow.
+        // mihomo compat: preHandleMetadata + sniffing flow (tunnel.go
+        // handleTCPConn + component/sniffer/dispatcher.go).
         // 1. Try FakeIP reverse lookup (preHandleMetadata)
-        // 2. If failed AND sniffing enabled, try sniffing TLS SNI / HTTP Host
+        // 2. If failed AND sniffing gates allow, try sniffing TLS SNI / HTTP Host
         // 3. Only drop if BOTH failed for FakeIP destinations
+        let domain_from_inbound = host_override.is_some();
         let mut domain = host_override.or_else(|| dns.reverse_lookup(&dst.ip()));
-        let mut pre_handle_failed = domain.is_none() && dns.is_fake_ip(&dst.ip());
+        let is_fakeip_dst = dns.is_fake_ip(&dst.ip());
+        let mut pre_handle_failed = domain.is_none() && is_fakeip_dst;
+        // mihomo DNSMode classification: a domain recovered from the ip→host
+        // mapping under redir-host is DNSMapping; a fake-ip recovery is
+        // DNSFakeIP (never sniffed unless force-domain matches).
+        let domain_from_mapping = domain.is_some() && !domain_from_inbound && !is_fakeip_dst;
 
         let sniff_cfg = config.sniffer.as_ref();
         let sniff_override = sniff_cfg.and_then(|s| s.should_sniff(dst.port()));
@@ -421,6 +438,17 @@ impl ConnectionManager {
             .map(|s| domain.as_deref().is_some_and(|d| s.is_force_domain(d)))
             .unwrap_or(false);
 
+        // mihomo compat: dispatcher.go shouldOverride — sniffing only runs when
+        // (no host && parse-pure-ip), (mapping-recovered && force-dns-mapping),
+        // or the existing host matches force-domain. A client-supplied host or
+        // a fake-ip-recovered domain is NOT sniffed otherwise.
+        let (parse_pure_ip, force_dns_mapping) = sniff_cfg
+            .map(|s| (s.parse_pure_ip, s.force_dns_mapping))
+            .unwrap_or((true, true));
+        let should_override = (domain.is_none() && parse_pure_ip)
+            || (domain_from_mapping && force_dns_mapping)
+            || force_sniffer;
+
         // mihomo compat: skip list check — skip sniffing for destinations that
         // have repeatedly failed, unless forced. Matches mihomo's skipList check
         // in TCPSniff: `if count, ok := sd.skipList.Get(dst); ok && count > 5`.
@@ -431,73 +459,111 @@ impl ConnectionManager {
             false
         };
 
-        let mut peek_arr = [0u8; SNIFF_PEEK_SIZE]; // stack, not heap
-        let peeked_len = if sniff_override.is_some() && !skip_sniff {
-            // mihomo compat: the sniff peek is bounded by a read deadline
-            // (component/sniffer/dispatcher.go SetReadDeadline(now+1s)). Without
-            // it, a server-speaks-first protocol (SMTP/IMAP/MySQL) on a sniffed
-            // port blocks the connection forever before dialing.
-            match tokio::time::timeout(
+        let mut peek_buf: Vec<u8> = Vec::new();
+        // mihomo compat: metadata.SniffHost — recorded for /connections even
+        // when override-destination is false.
+        let mut sniff_host = String::new();
+        // Set when the sniffed host replaces the metadata host — mihomo's
+        // replaceDomain also blanks DstIP so rules match the new domain.
+        let mut sniff_overrode = false;
+        if sniff_override.is_some() && should_override && !skip_sniff {
+            use tokio::io::AsyncReadExt;
+            let mut tmp = [0u8; SNIFF_PEEK_SIZE];
+            // mihomo compat: dispatcher.go sniffDomain — the first peek has a
+            // 1s deadline; a timeout means the peer sent nothing (likely a
+            // server-speaks-first protocol): cache the failure, log, and CLOSE
+            // the connection ("Consider adding skip").
+            let first = tokio::time::timeout(
                 SNIFF_PEEK_TIMEOUT,
-                tokio::io::AsyncReadExt::read(&mut stream, &mut peek_arr),
+                AsyncReadExt::read(&mut stream, &mut tmp),
             )
-            .await
-            {
-                Ok(Ok(n)) => n,
+            .await;
+            let mut verdict = match first {
+                Ok(Ok(0)) => sniffer::SniffAttempt::Fail,
+                Ok(Ok(n)) => {
+                    peek_buf.extend_from_slice(&tmp[..n]);
+                    sniffer::sniff_domain_ex(&peek_buf)
+                }
                 Ok(Err(e)) => {
                     debug!("Sniff peek read failed: {}", e);
-                    0
+                    sniffer::SniffAttempt::Fail
                 }
                 Err(_) => {
-                    debug!("[Sniffer] peek timed out for {}, proceeding without sniff", dst);
-                    0
+                    sniff_cache.record_failure(dst);
+                    tracing::error!(
+                        "[Sniffer] [{}] may not have any sent data, Consider adding skip",
+                        dst.ip()
+                    );
+                    return Ok(());
                 }
-            }
-        } else {
-            if skip_sniff && sniff_override.is_some() {
-                debug!("[Sniffer] Skip sniffing[{}] due to multiple failures", dst);
-            }
-            0
-        };
-        // Only heap-allocate the actual peeked bytes (not the full 1KB buffer)
-        let peek_buf = peek_arr[..peeked_len].to_vec();
+            };
 
-        let mut sniff_host = String::new();
-        let mut sniff_succeeded = false;
-        if peeked_len > 0 {
-            if let Some(sniffed) = sniffer::sniff_domain(&peek_buf) {
-                sniff_host = sniffed.clone();
-                sniff_succeeded = true;
-
-                let sniffer = sniff_cfg.unwrap();
-                let override_dst = sniff_override.unwrap_or(false);
-
-                let should_override = if sniffer.is_force_domain(&sniffed) {
-                    true
-                } else if sniffer.is_skip_domain(&sniffed) {
-                    false
-                } else {
-                    override_dst
+            // mihomo compat: on errNeedAtLeastData, peek again with a fresh 1s
+            // deadline until the needed length is buffered, then re-sniff once.
+            if let sniffer::SniffAttempt::NeedMore(needed) = verdict {
+                let needed = needed.min(5 + 16384 + 256); // TLS record cap
+                let deadline = tokio::time::Instant::now() + SNIFF_PEEK_TIMEOUT;
+                while peek_buf.len() < needed {
+                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    if remaining.is_zero() {
+                        break;
+                    }
+                    match tokio::time::timeout(remaining, AsyncReadExt::read(&mut stream, &mut tmp))
+                        .await
+                    {
+                        Ok(Ok(0)) => break,
+                        Ok(Ok(n)) => peek_buf.extend_from_slice(&tmp[..n]),
+                        _ => break,
+                    }
+                }
+                verdict = match sniffer::sniff_domain_ex(&peek_buf) {
+                    sniffer::SniffAttempt::NeedMore(_) => sniffer::SniffAttempt::Fail,
+                    v => v,
                 };
+            }
 
-                if domain.is_none() {
-                    domain = Some(sniffed);
-                    pre_handle_failed = false; // Sniffing recovered the domain
-                } else if should_override {
-                    domain = Some(sniffed);
+            match verdict {
+                sniffer::SniffAttempt::Found(sniffed) => {
+                    // mihomo compat: TCPSniff — IP literals are rejected
+                    // (sniffDomain netip.ParseAddr) and the host must pass
+                    // domainCanReplace (valid domain name, not skip-domain).
+                    let can_replace = sniffed.parse::<std::net::IpAddr>().is_err()
+                        && sniffer::is_domain_name(&sniffed)
+                        && !sniff_cfg
+                            .map(|s| s.is_skip_domain(&sniffed))
+                            .unwrap_or(false);
+                    if can_replace {
+                        sniff_cache.record_success(dst);
+                        sniff_host = sniffed.clone();
+                        let override_dst = sniff_override.unwrap_or(false);
+                        if override_dst {
+                            debug!(
+                                "[Sniffer] Sniff TCP [{}]-->[{}] success, replace domain [{:?}]-->[{}]",
+                                src, dst, domain, sniffed
+                            );
+                            domain = Some(sniffed);
+                            pre_handle_failed = false;
+                            sniff_overrode = true;
+                        }
+                        // mihomo compat: override-destination false only sets
+                        // SniffHost — rules keep matching the original
+                        // host/IP, so the sniffed name is NOT adopted.
+                    } else {
+                        debug!("[Sniffer] Skip sni[{}]", sniffed);
+                    }
+                }
+                _ => {
+                    if !force_sniffer {
+                        sniff_cache.record_failure(dst);
+                    }
+                    debug!(
+                        "[Sniffer] All sniffing sniff failed from [{}] to [{}]",
+                        src, dst
+                    );
                 }
             }
-        }
-
-        // mihomo compat: update skip list based on sniff result.
-        // On success: delete from skip list (`sd.skipList.Delete(dst)`).
-        // On failure: increment failure counter (`sd.cacheSniffFailed(metadata)`).
-        if sniff_override.is_some() && !skip_sniff {
-            if sniff_succeeded {
-                sniff_cache.record_success(dst);
-            } else if peeked_len > 0 && !force_sniffer {
-                sniff_cache.record_failure(dst);
-            }
+        } else if skip_sniff && sniff_override.is_some() && should_override {
+            debug!("[Sniffer] Skip sniffing[{}] due to multiple failures", dst);
         }
 
         // mihomo compat: only drop if preHandle failed AND sniffing didn't recover
@@ -558,13 +624,15 @@ impl ConnectionManager {
         // mihomo compat: clear dst_ip when domain is known and IP is a FakeIP
         // or unresolved placeholder (tunnel.go:288-290). preHandleMetadata sets
         // DstIP = netip.Addr{} for FakeIP so IP-CIDR rules don't match the
-        // FakeIP range. Same for HTTP proxy 0.0.0.0 placeholder.
-        let rule_dst_ip =
-            if domain.is_some() && (dns.is_fake_ip(&dst.ip()) || dst.ip().is_unspecified()) {
-                None
-            } else {
-                Some(dst.ip())
-            };
+        // FakeIP range. Same for HTTP proxy 0.0.0.0 placeholder, and for a
+        // sniff override (dispatcher.go replaceDomain blanks DstIP).
+        let rule_dst_ip = if domain.is_some()
+            && (sniff_overrode || dns.is_fake_ip(&dst.ip()) || dst.ip().is_unspecified())
+        {
+            None
+        } else {
+            Some(dst.ip())
+        };
 
         let mut rule_meta = RuleMetadata {
             domain: domain.clone(),
@@ -579,6 +647,19 @@ impl ConnectionManager {
             in_type: Some(inbound_type_display(conn_type)),
             ..Default::default()
         };
+
+        // mihomo compat: resolveMetadata — a hosts-mapped domain gets its IP
+        // set BEFORE rule matching (tunnel.go:329-332), so IP-CIDR/GEOIP rules
+        // match the hosts-mapped address.
+        if let Some(ref d) = rule_meta.domain {
+            if let Some(host_ip_str) = config.hosts.get(&d.to_lowercase()) {
+                if let Ok(ip) = host_ip_str.parse::<std::net::IpAddr>() {
+                    if !dns.is_fake_ip(&ip) {
+                        rule_meta.dst_ip = Some(ip);
+                    }
+                }
+            }
+        }
 
         // mihomo compat: tunnel.go match() — resolve the host to a real IP on
         // demand when rule evaluation needs it (GEOIP / IP-CIDR / ... without
@@ -724,13 +805,16 @@ impl ConnectionManager {
                 Ok(Err(e)) => {
                     let err_str = e.to_string();
 
-                    // mihomo compat: shouldStopRetry (tunnel.go:679-693)
-                    let should_stop = err_str.contains("IP not found")
+                    // mihomo compat: shouldStopRetry (tunnel.go:698-712) — ONLY
+                    // resolver couldn't-find-ip, ip-version, ipv6-disabled and
+                    // reject-loopback errors are terminal. Everything else
+                    // (including transient DNS-server failures) is retried;
+                    // each retry re-resolves.
+                    let should_stop = err_str.contains("couldn't find ip")
+                        || err_str.contains("IP not found")
+                        || err_str.contains("ip version error")
                         || err_str.contains("IPv6 disabled")
-                        || err_str.contains("loopback")
-                        || err_str.contains("connection rejected")
-                        || err_str.contains("all DNS servers failed")
-                        || err_str.contains("cached negative result");
+                        || err_str.contains("reject loopback connection");
 
                     if should_stop {
                         last_err = Some(e);
@@ -826,10 +910,21 @@ impl ConnectionManager {
             .insert(conn_id.clone(), (up_counter.clone(), down_counter.clone()));
         stats.add_connection();
 
-        // mihomo compat: single info log per connection (tunnel.go:617-629)
+        // mihomo compat: single info log per connection, logMetadata format
+        // (tunnel.go:633-650): `match Type(payload) using Group[proxy]`,
+        // distinct lines for GLOBAL/DIRECT modes and unmatched connections.
         if let Some(ci) = self.connections.get(&conn_id) {
-            let chains_str = format!("{:?}", ci.chains);
-            if !ci.rule_payload.is_empty() {
+            let chains_str = chain_display(&ci.chains);
+            if mode == "global" {
+                info!("[TCP] {} --> {} using GLOBAL", src, target);
+            } else if mode == "direct" {
+                info!("[TCP] {} --> {} using DIRECT", src, target);
+            } else if ci.rule.is_empty() {
+                info!(
+                    "[TCP] {} --> {} doesn't match any rule using {}",
+                    src, target, chains_str
+                );
+            } else if !ci.rule_payload.is_empty() {
                 info!(
                     "[TCP] {} --> {} match {}({}) using {}",
                     src, target, ci.rule, ci.rule_payload, chains_str
@@ -924,13 +1019,82 @@ impl ConnectionManager {
         }
 
         // mihomo compat: global mode routes to proxies["GLOBAL"]
-        let action = if mode == "global" {
-            Action::Proxy("GLOBAL".to_string())
+        let proxies = self.app.proxy_manager();
+        let (action, rule_type, rule_payload) = if mode == "global" {
+            (
+                Action::Proxy("GLOBAL".to_string()),
+                String::new(),
+                String::new(),
+            )
         } else if mode == "direct" {
-            Action::Direct
+            (Action::Direct, String::new(), String::new())
         } else {
-            rules.match_rules(&rule_meta)
+            // mihomo compat: tunnel.go match() — a matched rule whose adapter
+            // doesn't support UDP is skipped and evaluation continues with the
+            // later rules ("%s UDP is not supported").
+            let adapter_udp_ok = |action: &Action| -> bool {
+                match action {
+                    // DIRECT / REJECT support UDP in mihomo.
+                    Action::Direct | Action::Reject | Action::RejectDrop => true,
+                    // Unresolvable names are NOT skipped here — resolve_action
+                    // reports them loudly downstream (no silent fallback).
+                    Action::Proxy(name) => proxies
+                        .resolve(name)
+                        .map(|h| h.supports_udp())
+                        .unwrap_or(true),
+                }
+            };
+            rules.match_rules_detailed_filtered(&rule_meta, Some(&adapter_udp_ok))
         };
+
+        // mihomo compat: UDP sessions get the same one info log per session as
+        // TCP (tunnel.go:475 logMetadata) — without it UDP activity is
+        // invisible at info level.
+        {
+            let target_str = domain
+                .as_deref()
+                .map(|d| format!("{}:{}", d, dst.port()))
+                .unwrap_or_else(|| dst.to_string());
+            let chain = match &action {
+                Action::Direct => "DIRECT".to_string(),
+                Action::Reject => "REJECT".to_string(),
+                Action::RejectDrop => "REJECT-DROP".to_string(),
+                Action::Proxy(name) => {
+                    let final_name = proxies
+                        .resolve(name)
+                        .map(|h| h.name().to_string())
+                        .unwrap_or_default();
+                    if final_name.is_empty() || final_name == *name {
+                        name.clone()
+                    } else {
+                        format!("{name}[{final_name}]")
+                    }
+                }
+            };
+            if mode == "global" {
+                info!("[UDP] {} --> {} using GLOBAL", src, target_str);
+            } else if mode == "direct" {
+                info!("[UDP] {} --> {} using DIRECT", src, target_str);
+            } else if rule_type.is_empty() {
+                info!(
+                    "[UDP] {} --> {} doesn't match any rule using {}",
+                    src, target_str, chain
+                );
+            } else {
+                let rule_disp = crate::rules::rule_type_display(&rule_type);
+                if rule_payload.is_empty() {
+                    info!(
+                        "[UDP] {} --> {} match {} using {}",
+                        src, target_str, rule_disp, chain
+                    );
+                } else {
+                    info!(
+                        "[UDP] {} --> {} match {}({}) using {}",
+                        src, target_str, rule_disp, rule_payload, chain
+                    );
+                }
+            }
+        }
 
         (action, domain)
     }

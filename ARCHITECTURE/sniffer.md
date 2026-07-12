@@ -29,6 +29,11 @@ Recover a destination domain from a connection's first bytes — TLS ClientHello
 ## How to Test
 - `cargo test sniffer` — TLS/HTTP extraction across methods and ports, plus skip-list counter/TTL behavior. Pass = `test result: ok`.
 
+## mihomo parity notes (2026-07 audit)
+- `sniff_domain_ex` returns Found/NeedMore/Fail — NeedMore carries the byte count for the dispatcher's re-peek loop (tls_sniffer.go errNeedAtLeastData), so >1024-byte ClientHellos (post-quantum key shares) sniff correctly.
+- An empty `sniff:` map registers no sniffers — nothing is sniffed (previously it sniffed every port).
+- `is_domain_name` validates sniffed hosts (IP literals and non-DNS strings are discarded, dispatcher.go domainCanReplace).
+
 ## Open Gaps / Roadmap
 - QUIC sniffing is out of scope (heuristic-only path; full QUIC Initial decryption is not implemented).
 - The skip-list approximates mihomo's `lru.New(WithSize(128), WithAge(600))` with a `DashMap` + TTL — TTL bounds growth but there is no strict 128-entry cap.

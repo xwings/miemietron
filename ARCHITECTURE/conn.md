@@ -21,7 +21,7 @@ was changed to `async fn` to support resolve-on-demand parity with the TCP path.
 - `src/conn/mod.rs:185` - `relay_bidirectional` - split-stream copy loop with pooled 16 KB buffers and conditional flush.
 - `src/conn/mod.rs:314` - `handle_tcp` - public TCP entry; `handle_tcp_with_host` (`:325`) and `handle_tcp_typed` (`:339`) are the host-override / typed variants.
 - `src/conn/mod.rs:350` - `handle_tcp_inner` - full TCP pipeline: fixMetadata → preHandleMetadata → sniff → rule match → dial+retry → relay.
-- `src/conn/mod.rs:836` - `resolve_udp_action` - **now async**: reverse-lookup, dst_ip blanking, resolve-on-demand, rule match → `(Action, domain)`.
+- `src/conn/mod.rs:836` - `resolve_udp_action` - **now async**: reverse-lookup, dst_ip blanking, resolve-on-demand, rule match → `(Action, domain)`. Passes an adapter filter to `match_rules_detailed_filtered` so a matched rule whose adapter doesn't support UDP is skipped and evaluation continues to later rules (mihomo `tunnel.go match()` — UDP traffic falls through to `GEOIP,CN,DIRECT`/`MATCH` instead of being dropped).
 - `src/conn/mod.rs:527` - dst_ip blanking (TCP) - clears `dst_ip` when the domain is known and the IP is a FakeIP/unspecified placeholder, so IP-CIDR rules don't match the fake range.
 - `src/conn/mod.rs:552` - resolve-on-demand (TCP) - when `needs_ip_resolution` is true and a domain is present, awaits `dns.resolve_real_ip` (`:559`) and writes the result back to `rule_meta.dst_ip`.
 - `src/conn/mod.rs:850` - dst_ip blanking + resolve-on-demand (UDP) - the UDP-path equivalent; `dns.resolve_real_ip` awaited at `:883`.
@@ -35,6 +35,14 @@ was changed to `async fn` to support resolve-on-demand parity with the TCP path.
 ## How to Test
 - `cargo test conn` — pass = output contains `test result: ok` (incl. `stress_relay_200_concurrent`, `stress_counting_stream_accuracy`).
 - Integration: `timeout 30 target/debug/miemietron -d <openclash-dir> -f <config.yaml>`, then `curl` a domestic and a foreign URL through `127.0.0.1:7890`; confirm via `GET /connections` that chains/rule/upload/download populate and that domestic traffic under fake-ip routes DIRECT (resolve-on-demand working).
+
+## mihomo parity notes (2026-07 audit)
+- Sniffer gates match dispatcher.go `shouldOverride`: sniffing runs only for (no host && parse-pure-ip), (mapping-recovered host && force-dns-mapping), or a force-domain hit; a client-supplied or fake-ip-recovered host is otherwise never sniffed. Sniffed hosts must be valid non-IP domain names outside skip-domain; `override-destination: false` records SniffHost without changing matching; an override blanks dst_ip for rule matching (replaceDomain). The TLS sniff re-peeks until the full ClientHello record is buffered (errNeedAtLeastData); a first-peek timeout caches a failure and closes the connection.
+- `hosts:` mapping sets `rule_meta.dst_ip` BEFORE matching (resolveMetadata) so IP rules see the mapped address.
+- shouldStopRetry uses mihomo's four terminal conditions only; transient DNS failures are retried with re-resolution.
+- Info logs follow logMetadata: `[TCP|UDP] src --> dst match Type(payload) using Group[proxy]`, `using GLOBAL`/`using DIRECT` for those modes, `doesn't match any rule using ...` for nil-rule fallthrough; UDP sessions log at info too.
+- Inbound accepted sockets get TCP keepalive (keepalive.TCPKeepAlive), honoring `disable-keep-alive`.
+- Known divergences kept (documented, not yet ported): UDP NAT is per-(src,dst) symmetric (mihomo is full-cone with per-source PacketSender); plain-HTTP proxy handles only the first request per connection (mihomo loops per request and strips all hop-by-hop headers); SOCKS4/4a inbound is unsupported; skip-auth-prefixes / lan-allowed-ips are unimplemented.
 
 ## Open Gaps / Roadmap
 - `listeners:` config block is out of scope; inbounds come only from top-level port flags.

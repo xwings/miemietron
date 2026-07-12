@@ -419,32 +419,45 @@ impl ProxyManager {
                 Some(n) => n,
             };
             let hc_lazy = gc.lazy.unwrap_or(true);
+            // mihomo compat: parser.go:118-121 — an invalid expected-status
+            // fails the whole config load with `<group>: <err>`.
+            let expected_status = crate::proxy_group::parse_expected_status(
+                gc.expected_status.as_deref().unwrap_or(""),
+            )
+            .map_err(|e| anyhow::anyhow!("{}: {}", gc.name, e))?;
+            let make_hc = |interval_secs: u64| crate::proxy_group::HealthCheckOpts {
+                url: gc.url.clone().unwrap_or_else(default_test_url),
+                interval_secs,
+                max_failed_times: gc.max_failed_times,
+                test_timeout: gc.timeout,
+                lazy: hc_lazy,
+                expected_status: expected_status.clone(),
+            };
 
             let group: Arc<dyn ProxyGroup> = match gc.group_type.as_str() {
-                "select" => Arc::new(SelectorGroup::new(gc.name.clone(), all_proxies)),
+                // mihomo compat: parser.go:166-171 + healthcheck.go auto() —
+                // select groups get a periodic health check only when the
+                // user configures a non-zero interval (no 300s default).
+                "select" => match gc.interval {
+                    Some(n) if n > 0 => Arc::new(SelectorGroup::with_health_check(
+                        gc.name.clone(),
+                        all_proxies,
+                        make_hc(n),
+                        state_store.clone(),
+                    )),
+                    _ => Arc::new(SelectorGroup::new(gc.name.clone(), all_proxies)),
+                },
                 "url-test" => Arc::new(UrlTestGroup::new(
                     gc.name.clone(),
                     all_proxies,
                     gc.tolerance.unwrap_or(0),
-                    crate::proxy_group::HealthCheckOpts {
-                        url: gc.url.clone().unwrap_or_else(default_test_url),
-                        interval_secs: hc_interval,
-                        max_failed_times: gc.max_failed_times,
-                        test_timeout: gc.timeout,
-                        lazy: hc_lazy,
-                    },
+                    make_hc(hc_interval),
                     state_store.clone(),
                 )),
                 "fallback" => Arc::new(FallbackGroup::new(
                     gc.name.clone(),
                     all_proxies,
-                    crate::proxy_group::HealthCheckOpts {
-                        url: gc.url.clone().unwrap_or_else(default_test_url),
-                        interval_secs: hc_interval,
-                        max_failed_times: gc.max_failed_times,
-                        test_timeout: gc.timeout,
-                        lazy: hc_lazy,
-                    },
+                    make_hc(hc_interval),
                     state_store.clone(),
                 )),
                 "load-balance" => Arc::new(LoadBalanceGroup::new(
@@ -453,21 +466,22 @@ impl ProxyManager {
                     LoadBalanceStrategy::from_str(
                         gc.strategy.as_deref().unwrap_or("consistent-hashing"),
                     ),
+                    make_hc(hc_interval),
+                    state_store.clone(),
                 )),
                 "relay" => {
-                    // mihomo compat: relay groups removed in Meta branch
-                    tracing::error!(
-                        "The group [{}] with relay type was removed, please using dialer-proxy instead",
+                    // mihomo compat: parser.go:196-197 — relay groups were
+                    // removed in Meta; this is a hard config error, not a skip.
+                    return Err(anyhow::anyhow!(
+                        "unsupport proxy group type: The group [{}] with relay type was removed, please using dialer-proxy instead",
                         gc.name
-                    );
-                    continue;
+                    ));
                 }
                 other => {
-                    info!(
-                        "Unknown proxy group type '{}' for '{}', treating as selector",
-                        other, gc.name
-                    );
-                    Arc::new(SelectorGroup::new(gc.name.clone(), all_proxies))
+                    // mihomo compat: parser.go:198-199 — unknown group types
+                    // fail the config load; degrading to a selector would
+                    // silently change routing.
+                    return Err(anyhow::anyhow!("unsupport proxy group type: {}", other));
                 }
             };
             info!(

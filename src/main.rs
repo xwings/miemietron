@@ -249,19 +249,30 @@ impl AppState {
 
         // Build new components from the new config
         let mut new_dns = dns::DnsResolver::with_hosts(&new_config.dns, &new_config.hosts).await?;
-        let mut new_rules = rules::RuleEngine::with_home_dir(
+        let mut new_rules = rules::RuleEngine::with_home_dir_geox(
             &new_config.rules,
             &new_config.rule_providers,
             home_dir,
+            new_config.geox_url.as_ref(),
         )
         .await?;
         new_rules.set_sub_rules(&new_config.sub_rules);
         let new_rules = Arc::new(new_rules);
-        // Wire geosite checker for fake-ip-filter bypass
+        // Wire geosite + rule-set checkers for fake-ip-filter bypass
         {
             let re = new_rules.clone();
             new_dns
                 .set_geosite_checker(move |domain, code| re.geosite_matcher().lookup(domain, code));
+            let re = new_rules.clone();
+            new_dns.set_ruleset_checker(move |domain, name| re.provider_domain_match(name, domain));
+            for name in new_dns.fakeip_ruleset_names() {
+                if !new_rules.has_provider(name) {
+                    tracing::error!(
+                        "dns.fake-ip-filter references rule-set '{}' but the provider did not load; entry is inert (mihomo fails the config load here)",
+                        name
+                    );
+                }
+            }
         }
         // Reuse the existing proxy state store so delay history survives reloads
         let new_proxies = proxy::ProxyManager::with_state_store(
@@ -470,8 +481,7 @@ async fn async_main() -> Result<()> {
         // Wrap the filter in a reload layer so PATCH /configs {"log-level"} can
         // change the effective verbosity at runtime (OpenClash's debug-log
         // feature flips to `debug`, collects, then restores).
-        let (reloadable_filter, reload_handle) =
-            tracing_subscriber::reload::Layer::new(env_filter);
+        let (reloadable_filter, reload_handle) = tracing_subscriber::reload::Layer::new(env_filter);
         api::set_log_reload_fn(Box::new(move |level: &str| {
             let target = match level {
                 "silent" => "off",
@@ -481,8 +491,7 @@ async fn async_main() -> Result<()> {
                 "trace" => "trace",
                 _ => "info",
             };
-            let _ = reload_handle
-                .modify(|f| *f = tracing_subscriber::EnvFilter::new(target));
+            let _ = reload_handle.modify(|f| *f = tracing_subscriber::EnvFilter::new(target));
         }));
 
         // mihomo compat: output logs in logrus format so OpenClash can parse them.
@@ -576,9 +585,12 @@ impl Engine {
     /// starting any listeners or servers. Mirrors mihomo's `executor.Parse`.
     async fn validate(&self) -> Result<()> {
         let _dns = dns::DnsResolver::with_hosts(&self.config.dns, &self.config.hosts).await?;
-        let mut rule_engine =
-            rules::RuleEngine::with_home_dir(&self.config.rules, &self.config.rule_providers, &self.home_dir)
-                .await?;
+        let mut rule_engine = rules::RuleEngine::with_home_dir(
+            &self.config.rules,
+            &self.config.rule_providers,
+            &self.home_dir,
+        )
+        .await?;
         rule_engine.set_sub_rules(&self.config.sub_rules);
         let state_store = Arc::new(proxy_group::proxy_state::ProxyStateStore::new());
         let _pm = proxy::ProxyManager::with_state_store(
@@ -601,6 +613,10 @@ impl Engine {
     async fn run(self) -> Result<()> {
         let home_dir = self.home_dir;
         let config_path = self.config_path;
+
+        // mihomo compat: inbound listeners keep-alive follows disable-keep-alive
+        // (keepalive.SetDisableKeepAlive applies to inbound ListenConfig too).
+        transport::tcp::set_inbound_keepalive_disabled(self.config.disable_keep_alive);
 
         // Start DNS resolver (without Arc yet — we need to set geosite checker after rule engine)
         let mut dns_resolver_inner =
@@ -625,23 +641,36 @@ impl Engine {
         }
 
         // Build rule engine
-        let mut rule_engine_inner = rules::RuleEngine::with_home_dir(
+        let mut rule_engine_inner = rules::RuleEngine::with_home_dir_geox(
             &self.config.rules,
             &self.config.rule_providers,
             &home_dir,
+            self.config.geox_url.as_ref(),
         )
         .await?;
         rule_engine_inner.set_sub_rules(&self.config.sub_rules);
         let rule_engine = Arc::new(rule_engine_inner);
         info!("Rule engine loaded with {} rules", rule_engine.rule_count());
 
-        // Wire geosite checker into DNS resolver for fake-ip-filter bypass.
-        // This allows "geosite:cn" in fake-ip-filter to correctly bypass FakeIP
-        // for Chinese domains, resolving them to real IPs instead.
+        // Wire geosite + rule-set checkers into DNS resolver for fake-ip-filter
+        // bypass. This allows "geosite:cn" / "rule-set:oc-cn-domain" in
+        // fake-ip-filter to correctly bypass FakeIP for Chinese domains,
+        // resolving them to real IPs instead.
         {
             let re = rule_engine.clone();
             dns_resolver_inner
                 .set_geosite_checker(move |domain, code| re.geosite_matcher().lookup(domain, code));
+            let re = rule_engine.clone();
+            dns_resolver_inner
+                .set_ruleset_checker(move |domain, name| re.provider_domain_match(name, domain));
+            for name in dns_resolver_inner.fakeip_ruleset_names() {
+                if !rule_engine.has_provider(name) {
+                    error!(
+                        "dns.fake-ip-filter references rule-set '{}' but the provider did not load; entry is inert (mihomo fails the config load here)",
+                        name
+                    );
+                }
+            }
         }
         let dns_resolver = Arc::new(dns_resolver_inner);
 

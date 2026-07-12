@@ -48,6 +48,7 @@ pub async fn run_socks_proxy(
                 continue;
             }
         };
+        crate::transport::tcp::apply_inbound_keepalive(&stream);
 
         let cm = conn_manager.clone();
         let auth = auth.clone();

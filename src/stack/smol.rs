@@ -294,10 +294,7 @@ impl AsyncWrite for SmolTcpStream {
         Poll::Ready(Ok(()))
     }
 
-    fn poll_shutdown(
-        mut self: Pin<&mut Self>,
-        cx: &mut TaskContext<'_>,
-    ) -> Poll<io::Result<()>> {
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
         if self.shutdown_sent {
             return Poll::Ready(Ok(()));
         }
@@ -412,12 +409,7 @@ impl SmolStack {
     }
 
     /// Decompose into the TCP and UDP channels for use with tokio::select!.
-    pub fn into_channels(
-        self,
-    ) -> (
-        mpsc::Receiver<SmolTcpStream>,
-        mpsc::Receiver<SmolUdpFlow>,
-    ) {
+    pub fn into_channels(self) -> (mpsc::Receiver<SmolTcpStream>, mpsc::Receiver<SmolUdpFlow>) {
         (self.tcp_rx, self.udp_rx)
     }
 }
@@ -669,7 +661,10 @@ impl StackCore {
             // Newly established -> emit a stream to the caller. CloseWait
             // covers a client that sent data + FIN before we serviced.
             if conn.io.is_none()
-                && matches!(sock.state(), tcp::State::Established | tcp::State::CloseWait)
+                && matches!(
+                    sock.state(),
+                    tcp::State::Established | tcp::State::CloseWait
+                )
             {
                 let (to_app, app_rx) = mpsc::channel(CHAN_CAP);
                 let (app_tx, from_app) = mpsc::channel::<AppMsg>(CHAN_CAP);
@@ -685,7 +680,10 @@ impl StackCore {
                 };
                 if self.tcp_tx.try_send(stream).is_err() {
                     // Caller can't keep up with accepts: refuse the connection.
-                    warn!("smol: accept queue full, aborting {} -> {}", conn.src, conn.dst);
+                    warn!(
+                        "smol: accept queue full, aborting {} -> {}",
+                        conn.src, conn.dst
+                    );
                     sock.abort();
                     dead.push(handle);
                     continue;
@@ -925,9 +923,8 @@ fn run_loop(tun: TunDevice, mut core: StackCore, waker: Arc<LoopWaker>) {
     loop {
         // (a) Drain all readable TUN packets.
         loop {
-            let n = unsafe {
-                libc::read(tun_fd, rbuf.as_mut_ptr() as *mut libc::c_void, rbuf.len())
-            };
+            let n =
+                unsafe { libc::read(tun_fd, rbuf.as_mut_ptr() as *mut libc::c_void, rbuf.len()) };
             if n > 0 {
                 core.push_rx(rbuf[..n as usize].to_vec());
                 continue;
@@ -960,9 +957,7 @@ fn run_loop(tun: TunDevice, mut core: StackCore, waker: Arc<LoopWaker>) {
                     None => break,
                 },
             };
-            let n = unsafe {
-                libc::write(tun_fd, pkt.as_ptr() as *const libc::c_void, pkt.len())
-            };
+            let n = unsafe { libc::write(tun_fd, pkt.as_ptr() as *const libc::c_void, pkt.len()) };
             if n < 0 {
                 let err = io::Error::last_os_error();
                 match err.kind() {
@@ -1387,7 +1382,10 @@ mod tests {
         now += SmolDuration::from_millis(5);
         core.poll(now);
         assert!(core.udp_flows.is_empty(), "dropped flow must be reaped");
-        assert!(core.udp_socks.is_empty(), "orphan UDP socket must be reaped");
+        assert!(
+            core.udp_socks.is_empty(),
+            "orphan UDP socket must be reaped"
+        );
     }
 
     #[test]

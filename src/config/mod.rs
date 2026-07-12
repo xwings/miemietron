@@ -198,8 +198,14 @@ pub struct MiemieConfig {
 pub struct CorsConfig {
     #[serde(default)]
     pub allow_origins: Vec<String>,
-    #[serde(default)]
+    /// mihomo compat: defaults to true (config.go:588-591) — an explicit
+    /// cors block that omits the key keeps private-network access enabled.
+    #[serde(default = "default_cors_private_network")]
     pub allow_private_network: bool,
+}
+
+fn default_cors_private_network() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -242,8 +248,11 @@ impl SnifferConfig {
             return None;
         }
         if self.sniff.is_empty() {
-            // No per-protocol config — sniff all ports, use top-level override
-            return Some(self.override_destination);
+            // mihomo compat: an empty `sniff:` map registers zero sniffers —
+            // nothing is sniffed (config.go parseSniffer + dispatcher.go
+            // SupportPort). The old sniff-all fallback silently overrode
+            // destinations mihomo would never touch.
+            return None;
         }
         for pcfg in self.sniff.values() {
             if port_matches(&pcfg.ports, dst_port) {
@@ -367,6 +376,20 @@ pub struct GlobalTlsConfig {
 
 impl MiemieConfig {
     pub fn load(path: &Path) -> Result<Self> {
+        // mihomo compat: main.go:159 + config/initial.go — a missing config
+        // file is created with `mixed-port: 7890` instead of failing.
+        if !path.exists() {
+            tracing::info!(
+                "Can't find config, create an initial config file at {}",
+                path.display()
+            );
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            std::fs::write(path, "mixed-port: 7890\n").map_err(|e| {
+                anyhow::anyhow!("failed to create initial config {}: {}", path.display(), e)
+            })?;
+        }
         let content = std::fs::read_to_string(path)
             .map_err(|e| anyhow::anyhow!("failed to read config {}: {}", path.display(), e))?;
         Self::parse_str(&content)
@@ -387,6 +410,25 @@ impl MiemieConfig {
         let config: Self = serde_yaml::from_value(value)
             .map_err(|e| anyhow::anyhow!("failed to parse config: {e}"))?;
         config.validate_listeners()?;
+        // mihomo compat: tunnel/mode.go and log/level.go UnmarshalText — an
+        // unknown mode or log-level fails the config load (case-insensitive).
+        let mode = config.mode.to_lowercase();
+        if !matches!(mode.as_str(), "" | "rule" | "global" | "direct") {
+            return Err(anyhow::anyhow!(
+                "unmarshal error: invalid mode: {}",
+                config.mode
+            ));
+        }
+        let level = config.log_level.to_lowercase();
+        if !matches!(
+            level.as_str(),
+            "" | "debug" | "info" | "warning" | "error" | "silent"
+        ) {
+            return Err(anyhow::anyhow!(
+                "unmarshal error: invalid log-level: {}",
+                config.log_level
+            ));
+        }
         Ok(config)
     }
 

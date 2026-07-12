@@ -87,26 +87,78 @@ impl SniffCache {
 /// Tries TLS SNI first (if the data starts with 0x16), then QUIC Initial
 /// packets, then HTTP Host header. Returns `None` if no domain can be
 /// extracted.
-pub fn sniff_domain(data: &[u8]) -> Option<String> {
+/// Test convenience wrapper over [`sniff_domain_ex`] — the connection path
+/// uses the three-way result directly (it needs NeedMore for the re-peek).
+#[cfg(test)]
+fn sniff_domain(data: &[u8]) -> Option<String> {
+    match sniff_domain_ex(data) {
+        SniffAttempt::Found(host) => Some(host),
+        _ => None,
+    }
+}
+
+/// Result of a TCP sniff attempt over buffered bytes.
+/// mihomo compat: `errNeedAtLeastData` (tls_sniffer.go) tells the dispatcher
+/// to peek again until the whole TLS record is buffered — modern browser
+/// ClientHellos with post-quantum key shares exceed a single read.
+pub enum SniffAttempt {
+    Found(String),
+    /// Need at least this many bytes buffered before deciding.
+    NeedMore(usize),
+    Fail,
+}
+
+pub fn sniff_domain_ex(data: &[u8]) -> SniffAttempt {
     if data.is_empty() {
-        return None;
+        return SniffAttempt::NeedMore(1);
     }
 
     // TLS handshake starts with 0x16
     if data[0] == 0x16 {
-        return extract_tls_sni(data);
+        if data.len() < 5 {
+            return SniffAttempt::NeedMore(5);
+        }
+        let record_len = u16::from_be_bytes([data[3], data[4]]) as usize;
+        let needed = 5 + record_len;
+        if data.len() < needed {
+            return SniffAttempt::NeedMore(needed);
+        }
+        return match extract_tls_sni(data) {
+            Some(host) => SniffAttempt::Found(host),
+            None => SniffAttempt::Fail,
+        };
     }
 
     // QUIC Initial packet: long header with form bit set (0x80) and
     // version field at bytes 1-4 that matches QUIC v1 (0x00000001) or v2
     if data.len() > 5 && (data[0] & 0x80) != 0 {
         if let Some(sni) = extract_quic_sni(data) {
-            return Some(sni);
+            return SniffAttempt::Found(sni);
         }
     }
 
     // Try HTTP Host header
-    extract_http_host(data)
+    match extract_http_host(data) {
+        Some(host) => SniffAttempt::Found(host),
+        None => SniffAttempt::Fail,
+    }
+}
+
+/// mihomo compat: metadata.IsDomainName (net/dnsmessage rules) — the sniffed
+/// host must be a plausible DNS name; IP literals are rejected separately.
+pub fn is_domain_name(host: &str) -> bool {
+    if host.is_empty() || host.len() > 254 || host == "." {
+        return false;
+    }
+    let host = host.strip_suffix('.').unwrap_or(host);
+    !host.is_empty()
+        && host.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        })
 }
 
 /// Extract SNI from a QUIC Initial packet.

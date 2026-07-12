@@ -46,6 +46,7 @@ pub async fn run_redir_listener(port: u16, conn_manager: Arc<ConnectionManager>)
                 continue;
             }
         };
+        crate::transport::tcp::apply_inbound_keepalive(&stream);
 
         let orig_dst = match get_original_dst(stream.as_raw_fd()) {
             Ok(dst) => dst,
@@ -129,6 +130,7 @@ pub async fn run_tproxy_tcp_listener(
                 continue;
             }
         };
+        crate::transport::tcp::apply_inbound_keepalive(&stream);
 
         // For TPROXY, local_addr() IS the original destination
         let orig_dst = match stream.local_addr() {

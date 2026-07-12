@@ -39,6 +39,8 @@ Proxy groups let a rule target a logical name (e.g. `Proxy`, `Auto`) that resolv
 - Integration: launch with a config containing `select`/`url-test`/`fallback`/`load-balance` groups, then `curl http://127.0.0.1:9090/proxies` and `PUT /proxies/<group>` to verify selection and live delay.
 
 ## Open Gaps / Roadmap
-- `relay` group type is intentionally removed (mihomo Meta dropped it; config is told to use `dialer-proxy`).
-- Health checking covers `url-test` and `fallback`; `select` and `load-balance` rely on connect-time behavior, matching mihomo.
-- Unknown group types degrade to a selector (matches mihomo's Compatible fallback) rather than erroring.
+- `relay` and unknown group types fail the config load (mihomo parser.go:196-199) — no silent selector fallback.
+- Health checking covers `url-test`, `fallback`, and `load-balance` (default interval 300s per mihomo parser.go:166-173); `select` groups are checked when the user configures a non-zero `interval`. Load-balance strategies (round-robin / consistent-hashing / sticky-sessions) skip dead members like loadbalance.go.
+- Force-pin semantics match mihomo: a url-test pin is bypassed (kept) while dead; a fallback pin is cleared when found dead. Fallback `Set()` on a dead proxy triggers the health loop rather than mihomo's one-shot 5s probe (TODO in fallback.rs).
+- `expected-status` is wired into health checks and the API delay test; an unexpected status keeps default alive+delay but marks the per-URL extra state dead (adapter.go:166-200).
+- `unified-delay: true` is still accepted-but-single-request — the second same-connection HEAD (adapter.go:259-274) is not implemented; reported delays include the handshake.
