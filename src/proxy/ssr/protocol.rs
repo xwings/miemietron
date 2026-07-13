@@ -84,10 +84,7 @@ impl SsrProtocol {
 /// mihomo's `origin.Encode`/`origin.Decode`, which just copy bytes through.
 pub struct SsrProtocolStream<T> {
     inner: T,
-    protocol: SsrProtocol,
 }
-
-impl<T: Unpin> Unpin for SsrProtocolStream<T> {}
 
 impl<T> SsrProtocolStream<T> {
     /// Create a new SSR protocol stream.
@@ -100,13 +97,7 @@ impl<T> SsrProtocolStream<T> {
             "SsrProtocolStream constructed with unimplemented protocol {protocol:?}; \
              SsrOutbound::from_config must reject it at load"
         );
-        Self { inner, protocol }
-    }
-
-    /// Get the effective protocol type (for diagnostics).
-    #[allow(dead_code)]
-    pub fn protocol(&self) -> SsrProtocol {
-        self.protocol
+        Self { inner }
     }
 }
 

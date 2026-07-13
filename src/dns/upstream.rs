@@ -1,4 +1,5 @@
 use anyhow::Result;
+use base64::Engine;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -26,14 +27,28 @@ static DNS_GEOIP: std::sync::LazyLock<GeoIpMatcher> = std::sync::LazyLock::new(|
     GeoIpMatcher::new(&home_dir)
 });
 
-/// Race multiple DNS servers concurrently, return first successful result.
-/// Matches mihomo's batchExchange() pattern. Returns (IP, TTL).
-async fn batch_resolve(domain: &str, servers: &[String], qtype: u16) -> Result<(IpAddr, u32)> {
+/// Shared scaffolding for racing multiple DNS servers concurrently
+/// (mihomo batchExchange): one query task per server, first result accepted
+/// by `filter` wins. `filter` receives a display label for the answering
+/// server (empty in the single-server path, " <server>" otherwise) so error
+/// messages can name it. Errors are optionally warned and the last one is
+/// returned if every server fails.
+async fn batch_resolve_inner<T, F>(
+    domain: &str,
+    servers: &[String],
+    qtype: u16,
+    warn_errors: bool,
+    filter: F,
+) -> Result<T>
+where
+    F: Fn(&str, IpAddr, u32) -> Result<T>,
+{
     if servers.is_empty() {
         return Err(anyhow::anyhow!("no DNS servers configured"));
     }
     if servers.len() == 1 {
-        return query_server(domain, &servers[0], qtype).await;
+        let (ip, ttl) = query_server(domain, &servers[0], qtype).await?;
+        return filter("", ip, ttl);
     }
 
     let (tx, mut rx) = tokio::sync::mpsc::channel(servers.len());
@@ -43,19 +58,33 @@ async fn batch_resolve(domain: &str, servers: &[String], qtype: u16) -> Result<(
         let server = server.clone();
         tokio::spawn(async move {
             let result = query_server(&domain, &server, qtype).await;
-            let _ = tx.send(result).await;
+            let _ = tx.send((server, result)).await;
         });
     }
     drop(tx);
 
     let mut last_err = anyhow::anyhow!("all DNS servers failed for {domain}");
-    while let Some(result) = rx.recv().await {
-        match result {
-            Ok(ip_ttl) => return Ok(ip_ttl),
-            Err(e) => last_err = e,
+    while let Some((server, result)) = rx.recv().await {
+        match result.and_then(|(ip, ttl)| filter(&format!(" {server}"), ip, ttl)) {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                if warn_errors {
+                    warn!("{}", e);
+                }
+                last_err = e;
+            }
         }
     }
     Err(last_err)
+}
+
+/// Race multiple DNS servers concurrently, return first successful result.
+/// Matches mihomo's batchExchange() pattern. Returns (IP, TTL).
+async fn batch_resolve(domain: &str, servers: &[String], qtype: u16) -> Result<(IpAddr, u32)> {
+    batch_resolve_inner(domain, servers, qtype, false, |_server, ip, ttl| {
+        Ok((ip, ttl))
+    })
+    .await
 }
 
 /// Race multiple DNS servers concurrently, rejecting FakeIP results.
@@ -66,58 +95,16 @@ async fn batch_resolve_reject_fakeip(
     fake_ip_range: &str,
     source_label: &str,
 ) -> Result<IpAddr> {
-    if servers.is_empty() {
-        return Err(anyhow::anyhow!("no DNS servers configured"));
-    }
-    if servers.len() == 1 {
-        let (ip, _ttl) = query_server(domain, &servers[0], 1).await?;
+    batch_resolve_inner(domain, servers, 1, true, |server, ip, _ttl| {
         if is_in_fakeip_range(&ip, fake_ip_range) {
-            return Err(anyhow::anyhow!(
-                "DNS {source_label} returned FakeIP {ip} for proxy server {domain}, rejecting"
-            ));
+            Err(anyhow::anyhow!(
+                "DNS {source_label}{server} returned FakeIP {ip} for proxy server {domain}, rejecting"
+            ))
+        } else {
+            Ok(ip)
         }
-        return Ok(ip);
-    }
-
-    let (tx, mut rx) = tokio::sync::mpsc::channel(servers.len());
-    for server in servers {
-        let tx = tx.clone();
-        let domain = domain.to_string();
-        let server = server.clone();
-        let fake_ip_range = fake_ip_range.to_string();
-        let source_label = source_label.to_string();
-        tokio::spawn(async move {
-            match query_server(&domain, &server, 1).await {
-                Ok((ip, _ttl)) => {
-                    if is_in_fakeip_range(&ip, &fake_ip_range) {
-                        let _ = tx
-                            .send(Err(anyhow::anyhow!(
-                                "DNS {source_label} {server} returned FakeIP {ip} for proxy server {domain}, rejecting"
-                            )))
-                            .await;
-                    } else {
-                        let _ = tx.send(Ok(ip)).await;
-                    }
-                }
-                Err(e) => {
-                    let _ = tx.send(Err(e)).await;
-                }
-            }
-        });
-    }
-    drop(tx);
-
-    let mut last_err = anyhow::anyhow!("all DNS servers failed for {domain}");
-    while let Some(result) = rx.recv().await {
-        match result {
-            Ok(ip) => return Ok(ip),
-            Err(e) => {
-                warn!("{}", e);
-                last_err = e;
-            }
-        }
-    }
-    Err(last_err)
+    })
+    .await
 }
 
 /// Resolve a proxy server hostname using only direct/bootstrap DNS.
@@ -523,6 +510,15 @@ async fn resolve_udp(domain: &str, server: &str, qtype: u16) -> Result<(IpAddr, 
     parse_dns_response(response, qtype)
 }
 
+/// Shared HTTP client for DoH queries — built once so TCP+TLS connections
+/// are pooled and reused across queries (mirrors DOT_POOL below).
+static DOH_CLIENT: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::new(|| {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .expect("failed to build DoH HTTP client")
+});
+
 /// Resolve via DNS-over-HTTPS (RFC 8484). Returns (IP, TTL).
 async fn resolve_doh(domain: &str, url: &str, qtype: u16) -> Result<(IpAddr, u32)> {
     let query = build_dns_query(domain, qtype);
@@ -530,11 +526,7 @@ async fn resolve_doh(domain: &str, url: &str, qtype: u16) -> Result<(IpAddr, u32
 
     let request_url = format!("{url}?dns={encoded}");
 
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .build()?;
-
-    let response = client
+    let response = DOH_CLIENT
         .get(&request_url)
         .header("Accept", "application/dns-message")
         .send()
@@ -543,8 +535,6 @@ async fn resolve_doh(domain: &str, url: &str, qtype: u16) -> Result<(IpAddr, u32
     let body = response.bytes().await?;
     parse_dns_response(&body, qtype)
 }
-
-use base64::Engine;
 
 /// Global connection pool for DoT servers.
 /// Maps server address to a pooled TLS connection.
@@ -583,7 +573,9 @@ async fn resolve_dot(domain: &str, server: &str, qtype: u16) -> Result<(IpAddr, 
         (addr_str, "853")
     };
 
-    let port: u16 = port_str.parse().unwrap_or(853);
+    let port: u16 = port_str
+        .parse()
+        .map_err(|e| anyhow::anyhow!("invalid DNS server address {server}: {e}"))?;
     let sock_addr = format!("{host}:{port}");
     let sni = host.to_string();
 
@@ -661,7 +653,7 @@ async fn dot_query_on_stream(
     .await??;
 
     let resp_len = u16::from_be_bytes(resp_len_buf) as usize;
-    if resp_len == 0 || resp_len > 65535 {
+    if resp_len == 0 {
         return Err(anyhow::anyhow!("invalid DoT response length: {resp_len}"));
     }
 
@@ -812,51 +804,68 @@ pub(crate) fn domain_pattern_match(pattern: &str, domain: &str) -> bool {
     }
 }
 
-/// Match a domain against nameserver-policy entries.
+/// Iterate nameserver-policy entries and return the server list of the first
+/// key matching `domain`.
 ///
-/// Policy keys can be:
-/// - `"+.domain.com"` — matches domain.com and all subdomains
-/// - `"domain.com"` — exact match
-/// - `"geosite:xxx"` — not supported yet, returns None
-///
-/// Policy values can be a string (single server) or YAML array.
-fn match_nameserver_policy(domain: &str, policy: &serde_yaml::Mapping) -> Option<String> {
+/// mihomo compat: config.go parseNameServerPolicy — a policy key can be a
+/// comma-separated list of patterns; each trimmed, lowercased pattern (plain
+/// domain patterns as well as `geosite:`/`rule-set:` prefixed ones) is fed to
+/// `pattern_match` together with the lowercased domain. Values can be a
+/// string (single server) or a YAML sequence.
+pub(crate) fn find_nameserver_policy<F>(
+    domain: &str,
+    policy: &serde_yaml::Mapping,
+    pattern_match: F,
+) -> Option<Vec<String>>
+where
+    F: Fn(&str, &str) -> bool,
+{
     let domain_lower = domain.to_lowercase();
 
     for (key, value) in policy {
         let Some(pattern_raw) = key.as_str() else {
             continue;
         };
-        // mihomo compat: a policy key can be a comma-separated list of
-        // patterns (config.go parseNameServerPolicy).
-        let matches = pattern_raw.split(',').any(|pattern| {
-            let pattern_lower = pattern.trim().to_lowercase();
-            // geosite:/rule-set: keys need the rule engine — not available in
-            // the proxy-server bootstrap path; the resolver-level policy
-            // handles them (DnsResolver::nameserver_policy_servers).
-            if pattern_lower.starts_with("geosite:") || pattern_lower.starts_with("rule-set:") {
-                return false;
-            }
-            domain_pattern_match(&pattern_lower, &domain_lower)
+        let matched = pattern_raw.split(',').any(|pattern| {
+            let pattern = pattern.trim().to_lowercase();
+            pattern_match(&pattern, &domain_lower)
         });
-
-        if matches {
-            // Extract server string from YAML value
-            let server = match value {
-                serde_yaml::Value::String(s) => Some(s.clone()),
-                serde_yaml::Value::Sequence(seq) => {
-                    // Use first server in the list
-                    seq.first().and_then(|v| v.as_str().map(String::from))
-                }
-                _ => None,
+        if matched {
+            let servers: Vec<String> = match value {
+                serde_yaml::Value::String(s) => vec![s.clone()],
+                serde_yaml::Value::Sequence(seq) => seq
+                    .iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect(),
+                _ => vec![],
             };
-            if let Some(s) = server {
-                return Some(s);
+            if !servers.is_empty() {
+                return Some(servers);
             }
         }
     }
 
     None
+}
+
+/// Match a domain against nameserver-policy entries, returning the first
+/// server of the matched entry.
+///
+/// Policy keys can be:
+/// - `"+.domain.com"` — matches domain.com and all subdomains
+/// - `"domain.com"` — exact match
+/// - `"geosite:xxx"` / `"rule-set:xxx"` — skipped: they need the rule engine,
+///   which is not available in the proxy-server bootstrap path; the
+///   resolver-level policy handles them
+///   (DnsResolver::nameserver_policy_servers).
+fn match_nameserver_policy(domain: &str, policy: &serde_yaml::Mapping) -> Option<String> {
+    find_nameserver_policy(domain, policy, |pattern, domain| {
+        if pattern.starts_with("geosite:") || pattern.starts_with("rule-set:") {
+            return false;
+        }
+        domain_pattern_match(pattern, domain)
+    })
+    .and_then(|servers| servers.into_iter().next())
 }
 
 fn rand_u16() -> u16 {

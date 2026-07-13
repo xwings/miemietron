@@ -57,8 +57,6 @@ pub struct LoadBalanceGroup {
     /// Sticky-session cache: destination -> proxy name (LRU, bounded).
     sticky_map: RwLock<HashMap<String, String>>,
     sticky_order: RwLock<VecDeque<String>>,
-    /// Destination hint set by the caller before calling `get_proxy`.
-    destination_hint: RwLock<String>,
     /// mihomo compat: onDialFailed tracking fields (from GroupBase).
     failed_times: AtomicU32,
     failed_time: Mutex<Instant>,
@@ -94,7 +92,9 @@ fn jump_hash(mut key: u64, buckets: i32) -> i32 {
 }
 
 /// Extract the hash key from a destination string.
-/// mihomo compat: uses eTLD+1 for domains, raw IP for IP addresses.
+/// Approximates mihomo's getKey (loadbalance.go), which uses the
+/// publicsuffix list for eTLD+1 — here a small two-part-TLD heuristic
+/// stands in. IP addresses are used raw, as in mihomo.
 fn get_key(dst: &str) -> String {
     // Strip port if present
     let host = if let Some(bracket_end) = dst.find(']') {
@@ -156,7 +156,6 @@ impl LoadBalanceGroup {
             rr_idx: Mutex::new(0),
             sticky_map: RwLock::new(HashMap::new()),
             sticky_order: RwLock::new(VecDeque::new()),
-            destination_hint: RwLock::new(String::new()),
             failed_times: AtomicU32::new(0),
             failed_time: Mutex::new(Instant::now()),
             failed_testing: AtomicBool::new(false),
@@ -180,12 +179,6 @@ impl LoadBalanceGroup {
     /// The configured health check interval.
     pub fn interval(&self) -> Duration {
         self.interval
-    }
-
-    /// The configured test URL.
-    #[allow(dead_code)]
-    pub fn test_url(&self) -> &str {
-        &self.test_url
     }
 
     /// Run a health check against all proxies concurrently through their
@@ -219,13 +212,6 @@ impl LoadBalanceGroup {
 
     fn alive(&self, name: &str) -> bool {
         self.state_store.alive_for_url(name, &self.test_url)
-    }
-
-    /// Set the destination hint used by consistent-hashing and sticky-session
-    /// strategies. Must be called before `get_proxy`.
-    #[allow(dead_code)]
-    pub fn set_destination_hint(&self, dst: &str) {
-        *self.destination_hint.write() = dst.to_string();
     }
 
     /// mihomo compat: loadbalance.go strategyConsistentHashing — try
@@ -383,12 +369,12 @@ impl ProxyGroup for LoadBalanceGroup {
             return None;
         }
 
-        let dst = self.destination_hint.read().clone();
-
+        // TODO(parity): mihomo hashes the connection destination (lb.Unified)
+        // — destination plumbing not yet wired, so hash key is constant.
         let name = match self.strategy {
-            LoadBalanceStrategy::ConsistentHashing => self.pick_consistent_hash(&dst),
+            LoadBalanceStrategy::ConsistentHashing => self.pick_consistent_hash(""),
             LoadBalanceStrategy::RoundRobin => self.pick_round_robin(),
-            LoadBalanceStrategy::StickySession => self.pick_sticky_session(&dst, proxies),
+            LoadBalanceStrategy::StickySession => self.pick_sticky_session("", proxies),
         };
 
         name.and_then(|n| proxies.get(&n).cloned())
@@ -446,6 +432,10 @@ impl ProxyGroup for LoadBalanceGroup {
             .unwrap_or_default()
             .as_millis() as u64;
         self.last_touch.store(now, Ordering::Relaxed);
+    }
+
+    fn as_any_arc(self: Arc<Self>) -> Arc<dyn std::any::Any + Send + Sync> {
+        self
     }
 }
 
@@ -512,7 +502,7 @@ mod tests {
         // (get_key extracts eTLD+1, so subdomains of the same domain hash identically.)
         let mut picks = std::collections::HashSet::new();
         for i in 0..100 {
-            picks.insert(group.pick_consistent_hash(&format!("example-{}.com:443", i)));
+            picks.insert(group.pick_consistent_hash(&format!("example-{i}.com:443")));
         }
         // With 4 proxies and 100 different eTLD+1 domains, we should hit more than 1 bucket.
         assert!(picks.len() > 1);
@@ -533,7 +523,7 @@ mod tests {
 
         for i in 0..50 {
             assert_eq!(
-                group.pick_consistent_hash(&format!("example-{}.com:443", i)),
+                group.pick_consistent_hash(&format!("example-{i}.com:443")),
                 Some("b".to_string())
             );
         }

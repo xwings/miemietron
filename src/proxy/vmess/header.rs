@@ -47,8 +47,6 @@ const VMESS_HEADER_VERSION: u8 = 1;
 
 /// VMess command types.
 pub const CMD_TCP: u8 = 0x01;
-#[allow(dead_code)]
-pub const CMD_UDP: u8 = 0x02;
 
 /// Address types.
 const ATYP_IPV4: u8 = 0x01;
@@ -407,7 +405,7 @@ pub fn encode_request_header(
 
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap()
+        .unwrap_or_default()
         .as_secs() as i64;
 
     // newConn: randBytes[33] -> reqBodyIV(16) reqBodyKey(16) respV(1).
@@ -456,19 +454,9 @@ pub fn encode_request_header(
     }
 }
 
-/// Parse a UUID string into 16 raw bytes.
-pub fn parse_uuid(s: &str) -> Result<[u8; 16], &'static str> {
-    let hex: String = s.chars().filter(|c| *c != '-').collect();
-    if hex.len() != 32 {
-        return Err("invalid UUID length");
-    }
-    let mut bytes = [0u8; 16];
-    for i in 0..16 {
-        bytes[i] =
-            u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).map_err(|_| "invalid hex in UUID")?;
-    }
-    Ok(bytes)
-}
+// mihomo compat: UUID parsing is identical across VMess/VLESS; reuse the VLESS
+// copy rather than duplicating it (Trojan already reuses vless::encode_address).
+pub use crate::proxy::vless::header::parse_uuid;
 
 #[cfg(test)]
 mod tests {

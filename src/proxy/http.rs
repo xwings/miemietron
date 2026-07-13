@@ -151,8 +151,9 @@ impl HttpOutbound {
         let mut status_line = String::new();
         reader.read_line(&mut status_line).await?;
 
-        // Expect "HTTP/1.x 200 ..."
-        if !status_line.contains(" 200 ") {
+        // Expect "HTTP/1.x 200[ reason]" — the reason phrase is optional.
+        // mihomo compat: http.ReadResponse parses the status code proper.
+        if status_line.split_whitespace().nth(1) != Some("200") {
             return Err(anyhow!("HTTP proxy CONNECT failed: {}", status_line.trim()));
         }
 
@@ -167,12 +168,9 @@ impl HttpOutbound {
 
         debug!("HTTP proxy tunnel established to {}", host_port);
 
-        // Return the underlying stream (unwrap BufReader, keeping any buffered data)
-        // BufReader may have buffered bytes; we return it as-is since it implements
-        // AsyncRead + AsyncWrite (via pin-project on the inner stream).
-        // However, BufReader doesn't impl AsyncWrite, so we need the raw stream.
-        // The proxy response is fully consumed, so no buffered leftover.
-        let inner = reader.into_inner();
-        Ok(Box::new(inner))
+        // Return the BufReader itself: it keeps any bytes it read past the
+        // final header CRLF (server-speaks-first data must not be dropped)
+        // and passes AsyncWrite through to the inner stream.
+        Ok(Box::new(reader))
     }
 }

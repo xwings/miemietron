@@ -3,37 +3,8 @@ pub mod proxy;
 pub mod rules;
 pub mod tun;
 
-/// Deserialize a u16 that might be a quoted string (e.g. `port: "7890"`).
-fn deserialize_flex_u16<'de, D>(deserializer: D) -> Result<u16, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    use serde::de;
-
-    struct FlexU16;
-    impl<'de> de::Visitor<'de> for FlexU16 {
-        type Value = u16;
-        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-            f.write_str("a number or string-encoded number")
-        }
-        fn visit_u64<E: de::Error>(self, v: u64) -> Result<Self::Value, E> {
-            Ok(v as u16)
-        }
-        fn visit_i64<E: de::Error>(self, v: i64) -> Result<Self::Value, E> {
-            Ok(v as u16)
-        }
-        fn visit_f64<E: de::Error>(self, v: f64) -> Result<Self::Value, E> {
-            Ok(v as u16)
-        }
-        fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
-            v.parse::<u16>().map_err(de::Error::custom)
-        }
-    }
-    deserializer.deserialize_any(FlexU16)
-}
-
 use anyhow::Result;
-use serde::{Deserialize, Serialize};
+use serde::{de, Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -41,6 +12,76 @@ pub use self::dns::DnsConfig;
 pub use self::proxy::{ProxyConfig, ProxyGroupConfig, ProxyProviderConfig};
 pub use self::rules::{RuleProviderConfig, RuleString};
 pub use self::tun::TunConfig;
+
+/// Visitor for config numbers that may also arrive as quoted strings —
+/// subscription configs often have `port: "7890"` or `interval: "3600"`.
+/// mihomo compat: Go's yaml.v3 errors when decoding a negative or
+/// out-of-range number into a sized unsigned integer field, so those fail
+/// the config load here too instead of silently wrapping.
+pub(crate) struct FlexNumVisitor<T>(std::marker::PhantomData<T>);
+
+impl<T> FlexNumVisitor<T> {
+    pub(crate) fn new() -> Self {
+        Self(std::marker::PhantomData)
+    }
+}
+
+impl<'de, T> de::Visitor<'de> for FlexNumVisitor<T>
+where
+    T: TryFrom<u64> + std::str::FromStr,
+    <T as std::str::FromStr>::Err: std::fmt::Display,
+{
+    type Value = Option<T>;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("a number or string-encoded number")
+    }
+
+    fn visit_u64<E: de::Error>(self, v: u64) -> Result<Self::Value, E> {
+        T::try_from(v)
+            .map(Some)
+            .map_err(|_| E::custom(format!("number {v} out of range")))
+    }
+
+    fn visit_i64<E: de::Error>(self, v: i64) -> Result<Self::Value, E> {
+        let v = u64::try_from(v).map_err(|_| E::custom(format!("number {v} out of range")))?;
+        self.visit_u64(v)
+    }
+
+    fn visit_f64<E: de::Error>(self, v: f64) -> Result<Self::Value, E> {
+        if v < 0.0 || v > u64::MAX as f64 {
+            return Err(E::custom(format!("number {v} out of range")));
+        }
+        self.visit_u64(v as u64)
+    }
+
+    fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+        v.parse::<T>().map(Some).map_err(de::Error::custom)
+    }
+
+    fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_some<D: serde::Deserializer<'de>>(self, d: D) -> Result<Self::Value, D::Error> {
+        d.deserialize_any(self)
+    }
+}
+
+/// Deserialize a u16 that might be a quoted string (e.g. `port: "7890"`).
+fn deserialize_flex_u16<'de, D>(deserializer: D) -> Result<u16, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    // mihomo compat: yaml.v3 decodes an explicit null into the zero value.
+    Ok(deserializer
+        .deserialize_any(FlexNumVisitor::<u16>::new())?
+        .unwrap_or(0))
+}
 
 /// Top-level configuration, compatible with mihomo config.yaml format.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -72,6 +113,7 @@ pub struct MiemieConfig {
 
     #[serde(default)]
     pub external_controller: Option<String>,
+    /// Accepted for mihomo config parity; parsed but never read.
     #[serde(default)]
     pub external_controller_tls: Option<String>,
     #[serde(default)]
@@ -124,19 +166,19 @@ pub struct MiemieConfig {
     #[serde(default)]
     pub proxies: Vec<ProxyConfig>,
 
-    #[serde(default, rename = "proxy-groups")]
+    #[serde(default)]
     pub proxy_groups: Vec<ProxyGroupConfig>,
 
     #[serde(default)]
     pub rules: Vec<RuleString>,
 
-    #[serde(default, rename = "sub-rules")]
+    #[serde(default)]
     pub sub_rules: HashMap<String, Vec<RuleString>>,
 
-    #[serde(default, rename = "proxy-providers")]
+    #[serde(default)]
     pub proxy_providers: HashMap<String, ProxyProviderConfig>,
 
-    #[serde(default, rename = "rule-providers")]
+    #[serde(default)]
     pub rule_providers: HashMap<String, RuleProviderConfig>,
 
     #[serde(default)]
@@ -151,11 +193,12 @@ pub struct MiemieConfig {
     #[serde(default)]
     pub ntp: crate::ntp::NtpConfig,
 
-    #[serde(default, rename = "geox-url")]
+    #[serde(default)]
     pub geox_url: Option<HashMap<String, String>>,
 
     #[serde(default)]
     pub geodata_mode: bool,
+    /// Accepted for mihomo config parity; parsed but never read.
     #[serde(default)]
     pub geodata_loader: Option<String>,
     #[serde(default)]
@@ -163,6 +206,7 @@ pub struct MiemieConfig {
     #[serde(default)]
     pub geo_update_interval: Option<u64>,
 
+    /// Accepted for mihomo config parity; parsed but never read.
     #[serde(default)]
     pub tunnels: Vec<serde_yaml::Value>,
 
@@ -174,18 +218,23 @@ pub struct MiemieConfig {
     #[serde(default)]
     pub listeners: Vec<serde_yaml::Value>,
 
+    /// Accepted for mihomo config parity; parsed but never read.
     #[serde(default)]
     pub iptables: Option<IptablesConfig>,
 
+    /// Accepted for mihomo config parity; parsed but never read.
     #[serde(default)]
     pub tls: Option<GlobalTlsConfig>,
 
+    /// Accepted for mihomo config parity; parsed but never read.
     #[serde(default)]
     pub experimental: Option<serde_yaml::Value>,
 
-    #[serde(default, rename = "inbound-tfo")]
+    /// Accepted for mihomo config parity; parsed but never read.
+    #[serde(default)]
     pub inbound_tfo: bool,
-    #[serde(default, rename = "inbound-mptcp")]
+    /// Accepted for mihomo config parity; parsed but never read.
+    #[serde(default)]
     pub inbound_mptcp: bool,
 
     // Catch-all for unknown fields (forward compat)
@@ -242,7 +291,7 @@ pub struct SniffProtocolConfig {
 impl SnifferConfig {
     /// Check whether sniffing should be attempted for the given destination port.
     /// Returns the effective override-destination flag for that port.
-    /// If no `sniff` map is configured, sniff all ports (backwards compat).
+    /// An empty `sniff` map registers zero sniffers — nothing is sniffed.
     pub fn should_sniff(&self, dst_port: u16) -> Option<bool> {
         if !self.enable {
             return None;
@@ -308,23 +357,30 @@ fn port_matches(specs: &[serde_yaml::Value], port: u16) -> bool {
 }
 
 /// Check if a domain matches any entry in a list (exact, `+.` suffix, `*.` wildcard).
+/// Comparisons are ASCII case-insensitive and allocation-free (hot path — runs
+/// per connection).
 fn domain_matches_list(domain: &str, list: &[String]) -> bool {
-    let d = domain.to_lowercase();
     for pattern in list {
-        let p = pattern.to_lowercase();
-        if let Some(suffix) = p.strip_prefix("+.") {
-            if d == suffix || d.ends_with(&format!(".{suffix}")) {
+        if let Some(suffix) = pattern.strip_prefix("+.") {
+            if domain.eq_ignore_ascii_case(suffix) || has_domain_suffix(domain, suffix) {
                 return true;
             }
-        } else if let Some(suffix) = p.strip_prefix("*.") {
-            if d.ends_with(&format!(".{suffix}")) {
+        } else if let Some(suffix) = pattern.strip_prefix("*.") {
+            if has_domain_suffix(domain, suffix) {
                 return true;
             }
-        } else if d == p {
+        } else if domain.eq_ignore_ascii_case(pattern) {
             return true;
         }
     }
     false
+}
+
+/// True when `domain` ends with `.suffix` (ASCII case-insensitive).
+fn has_domain_suffix(domain: &str, suffix: &str) -> bool {
+    domain.len() > suffix.len()
+        && domain.as_bytes()[domain.len() - suffix.len() - 1] == b'.'
+        && domain[domain.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -346,10 +402,11 @@ impl Default for ProfileConfig {
     }
 }
 
-fn default_true() -> bool {
+pub(crate) fn default_true() -> bool {
     true
 }
 
+/// Accepted for mihomo config parity; parsed but never read.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub struct IptablesConfig {
@@ -363,6 +420,7 @@ pub struct IptablesConfig {
     pub extra: HashMap<String, serde_yaml::Value>,
 }
 
+/// Accepted for mihomo config parity; parsed but never read.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub struct GlobalTlsConfig {
@@ -654,6 +712,38 @@ another-unknown:
         assert_eq!(config.port, 0);
         assert!(config.proxies.is_empty());
         assert!(config.rules.is_empty());
+    }
+
+    #[test]
+    fn out_of_range_port_rejected() {
+        // mihomo compat: Go's yaml.v3 errors when decoding an out-of-range or
+        // negative number into uint16 — no silent wrapping.
+        assert!(serde_yaml::from_str::<MiemieConfig>("mixed-port: 99999").is_err());
+        assert!(serde_yaml::from_str::<MiemieConfig>("mixed-port: -1").is_err());
+        assert!(serde_yaml::from_str::<MiemieConfig>("mixed-port: \"99999\"").is_err());
+        // String-encoded and null ports still work.
+        let config: MiemieConfig = serde_yaml::from_str("mixed-port: \"7890\"").unwrap();
+        assert_eq!(config.mixed_port, 7890);
+        let config: MiemieConfig = serde_yaml::from_str("mixed-port: ~").unwrap();
+        assert_eq!(config.mixed_port, 0);
+    }
+
+    #[test]
+    fn domain_match_semantics() {
+        let list = vec![
+            "+.Example.COM".to_string(),
+            "Exact.Test".to_string(),
+            "*.Wild.Org".to_string(),
+        ];
+        // Case-insensitive across all three pattern forms.
+        assert!(domain_matches_list("www.EXAMPLE.com", &list));
+        assert!(domain_matches_list("example.com", &list)); // +. matches apex
+        assert!(domain_matches_list("exact.TEST", &list));
+        assert!(domain_matches_list("a.wild.org", &list));
+        // *. requires at least one extra label; suffix must sit on a dot boundary.
+        assert!(!domain_matches_list("wild.org", &list));
+        assert!(!domain_matches_list("notexample.com", &list));
+        assert!(!domain_matches_list("exact.test.other", &list));
     }
 
     #[test]

@@ -98,31 +98,20 @@ impl SsrObfs {
 /// `plain.StreamConn`, which returns the connection unchanged.
 pub struct SsrObfsStream<T> {
     inner: T,
-    obfs: SsrObfs,
-    #[allow(dead_code)]
-    param: String,
 }
-
-impl<T: Unpin> Unpin for SsrObfsStream<T> {}
 
 impl<T> SsrObfsStream<T> {
     /// Create a new SSR obfuscation stream.
     ///
     /// Callers MUST have validated `obfs.is_implemented()` at config load;
     /// only `plain` reaches this point.
-    pub fn new(inner: T, obfs: SsrObfs, param: String) -> Self {
+    pub fn new(inner: T, obfs: SsrObfs, _param: &str) -> Self {
         debug_assert!(
             obfs.is_implemented(),
             "SsrObfsStream constructed with unimplemented obfs {obfs:?}; \
              SsrOutbound::from_config must reject it at load"
         );
-        Self { inner, obfs, param }
-    }
-
-    /// Get the effective obfs type (for diagnostics).
-    #[allow(dead_code)]
-    pub fn obfs(&self) -> SsrObfs {
-        self.obfs
+        Self { inner }
     }
 }
 

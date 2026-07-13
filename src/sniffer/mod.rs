@@ -57,21 +57,21 @@ impl SniffCache {
     /// Record a failed sniff attempt.
     /// mihomo compat: increments counter up to 6, matching `cacheSniffFailed`.
     pub fn record_failure(&self, dst: std::net::SocketAddr) {
-        if let Some(entry) = self.skip_list.get(&dst) {
-            let (count, recorded) = entry.value();
-            if recorded.elapsed() >= SNIFF_SKIP_TTL {
-                drop(entry);
-                self.skip_list
-                    .insert(dst, (AtomicU8::new(1), Instant::now()));
-            } else {
-                let old = count.load(Ordering::Relaxed);
-                if old <= SNIFF_SKIP_THRESHOLD {
-                    count.store(old + 1, Ordering::Relaxed);
-                }
-            }
+        // entry() holds the shard write lock, so the reset/increment is atomic
+        // (no load+store or get-then-insert races).
+        let mut entry = self
+            .skip_list
+            .entry(dst)
+            .or_insert_with(|| (AtomicU8::new(0), Instant::now()));
+        let (count, recorded) = entry.value_mut();
+        if recorded.elapsed() >= SNIFF_SKIP_TTL {
+            *count.get_mut() = 1;
+            *recorded = Instant::now();
         } else {
-            self.skip_list
-                .insert(dst, (AtomicU8::new(1), Instant::now()));
+            let count = count.get_mut();
+            if *count <= SNIFF_SKIP_THRESHOLD {
+                *count += 1;
+            }
         }
     }
 
@@ -129,8 +129,8 @@ pub fn sniff_domain_ex(data: &[u8]) -> SniffAttempt {
         };
     }
 
-    // QUIC Initial packet: long header with form bit set (0x80) and
-    // version field at bytes 1-4 that matches QUIC v1 (0x00000001) or v2
+    // QUIC long header: form bit (0x80) set. No version check is done here —
+    // extract_quic_sni heuristically hunts for the embedded ClientHello.
     if data.len() > 5 && (data[0] & 0x80) != 0 {
         if let Some(sni) = extract_quic_sni(data) {
             return SniffAttempt::Found(sni);
@@ -212,7 +212,7 @@ fn extract_quic_sni(data: &[u8]) -> Option<String> {
 ///
 /// Recognises requests starting with common HTTP methods:
 /// GET, POST, PUT, DELETE, HEAD, CONNECT, OPTIONS, PATCH, TRACE.
-pub fn extract_http_host(data: &[u8]) -> Option<String> {
+fn extract_http_host(data: &[u8]) -> Option<String> {
     // Quick check: is this an HTTP request?
     let http_methods: &[&[u8]] = &[
         b"GET ",
@@ -246,39 +246,20 @@ pub fn extract_http_host(data: &[u8]) -> Option<String> {
         }
     };
 
-    // Look for the Host header
+    // Look for the Host header (case-insensitive, no per-line allocation)
     for line in text.split("\r\n").skip(1) {
         if line.is_empty() {
             // End of headers
             break;
         }
-        if let Some(rest) = line
-            .strip_prefix("Host:")
-            .or_else(|| line.strip_prefix("host:"))
-        {
-            let host = rest.trim();
-            // Strip port suffix if present (e.g., "example.com:443")
-            let domain = if let Some(bracket_end) = host.find(']') {
+        if line.len() >= 5 && line.as_bytes()[..5].eq_ignore_ascii_case(b"Host:") {
+            let host = line[5..].trim();
+            if host.contains(']') {
                 // IPv6 literal like [::1]:80 — not a domain
-                let _ = bracket_end;
                 return None;
-            } else if let Some(colon) = host.rfind(':') {
-                &host[..colon]
-            } else {
-                host
-            };
-            if !domain.is_empty() {
-                return Some(domain.to_string());
             }
-        }
-        // Also handle mixed case (e.g., "HOST:", "Host:")
-        let lower = line.to_ascii_lowercase();
-        if lower.starts_with("host:") && !line.starts_with("Host:") && !line.starts_with("host:") {
-            let rest = &line[5..];
-            let host = rest.trim();
-            let domain = if host.find(']').is_some() {
-                return None;
-            } else if let Some(colon) = host.rfind(':') {
+            // Strip port suffix if present (e.g., "example.com:443")
+            let domain = if let Some(colon) = host.rfind(':') {
                 &host[..colon]
             } else {
                 host
@@ -293,7 +274,7 @@ pub fn extract_http_host(data: &[u8]) -> Option<String> {
 }
 
 /// Extract SNI from a TLS ClientHello message.
-pub fn extract_tls_sni(data: &[u8]) -> Option<String> {
+fn extract_tls_sni(data: &[u8]) -> Option<String> {
     // TLS record layer
     if data.len() < 5 || data[0] != 0x16 {
         return None; // Not a TLS handshake
@@ -410,7 +391,7 @@ mod tests {
         // SNI extension data:
         //   sni_list_len (2) + name_type (1) + name_len (2) + name
         let sni_list_len = (1 + 2 + sni_bytes.len()) as u16;
-        let sni_ext_data_len = (2 + sni_list_len) as u16;
+        let sni_ext_data_len = 2 + sni_list_len;
 
         let mut sni_ext = Vec::new();
         // Extension type: SNI (0x0000)
@@ -456,11 +437,12 @@ mod tests {
         // Handshake header:
         //   type(1) = ClientHello(0x01) + length(3)
         let ch_len = ch_body.len();
-        let mut handshake = Vec::new();
-        handshake.push(0x01); // ClientHello
-        handshake.push(((ch_len >> 16) & 0xFF) as u8);
-        handshake.push(((ch_len >> 8) & 0xFF) as u8);
-        handshake.push((ch_len & 0xFF) as u8);
+        let mut handshake = vec![
+            0x01, // ClientHello
+            ((ch_len >> 16) & 0xFF) as u8,
+            ((ch_len >> 8) & 0xFF) as u8,
+            (ch_len & 0xFF) as u8,
+        ];
         handshake.extend_from_slice(&ch_body);
 
         // TLS record layer:

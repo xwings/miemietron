@@ -4,7 +4,7 @@
 The transport subsystem provides the shared stream-layer building blocks that every outbound dials through: raw TCP with keepalive, TLS (rustls, no OpenSSL), and the obfuscation/multiplexing wrappers WebSocket, gRPC, HTTP/2, and Reality, plus a uTLS-style ClientHello fingerprint shim. It mirrors mihomo's `transport/` and `component/keepalive` packages 1:1 for the OpenClash runtime parity set. Protocol adapters (vmess/vless/trojan/ss/anytls/…) compose these wrappers over a base `TcpStream`, so transport code is protocol-agnostic: it takes any `AsyncRead + AsyncWrite` and returns a wrapped stream.
 
 ## Status
-`done` for TCP+keepalive, TLS, WS, gRPC, H2, XHTTP-over-H2, fingerprint. **REALITY is a non-functional stub** — `wrap_reality` does a normal TLS handshake and writes an auth header as application data, which is NOT the REALITY protocol (a real REALITY server proxies the connection to the camouflage site and the payload hangs). Correct REALITY needs the auth embedded in the TLS ClientHello `session_id` + post-handshake server-cert signature verification, which requires uTLS-level ClientHello control that rustls does not expose (mihomo uses metacubex/utls). QUIC-based transports (h3), XHTTP-over-H3, and XHTTP's exact-ALPN HTTP/1.1 mode remain out of scope. `transport::*` tests pass.
+`done` for TCP+keepalive, TLS, WS, gRPC, H2, XHTTP-over-H2, REALITY, fingerprint. **REALITY is functional**: `wrap_reality` builds a real TLS 1.3 ClientHello whose `session_id` carries the AES-256-GCM-sealed REALITY auth (version + timestamp + zero-padded short-id), keyed from the X25519 ECDH of the client key-share and the server public key. This requires the TLS 1.3 key-share secret and a ClientHello mutation hook that stock rustls does not expose, so the build pins an audited rustls fork (`Watfaq/rustls`, exact commit) via `[patch.crates-io]`; the fork adds `ClientConfig::with_reality` while keeping rustls's normal API. A `RealityOnlyVerifier` rejects every certificate, so a successful TLS handshake is synonymous with successful REALITY auth — a camouflage site's ordinary valid cert can never be accepted as the proxy. `support-x25519mlkem768` (post-quantum hybrid key exchange) is not implemented and errors at config parse rather than silently downgrading. QUIC-based transports (h3), XHTTP-over-H3, and XHTTP's exact-ALPN HTTP/1.1 mode remain out of scope. `transport::*` tests pass.
 
 ## Code Structure
 | File | Role |
@@ -16,7 +16,7 @@ The transport subsystem provides the shared stream-layer building blocks that ev
 | `src/transport/grpc.rs` | `GrpcStream`, `connect_grpc` — gRPC framing over H2 |
 | `src/transport/h2_transport.rs` | `H2Stream`, `connect_h2` — HTTP/2 stream transport |
 | `src/transport/xhttp.rs` | mihomo-compatible XHTTP config normalization and H2 `stream-one` / `stream-up` / `packet-up` client |
-| `src/transport/reality.rs` | `RealityConfig`, `wrap_reality` — REALITY handshake |
+| `src/transport/reality.rs` | `RealityConfig`, `wrap_reality`, `RealityOnlyVerifier` — REALITY handshake over the rustls fork's `with_reality` hook |
 | `src/transport/fingerprint.rs` | `TlsFingerprint`, crypto-provider + ALPN selection for uTLS-style ClientHello |
 
 ## Key Types and Entry Points
@@ -28,7 +28,7 @@ The transport subsystem provides the shared stream-layer building blocks that ev
 - `src/transport/grpc.rs:217` - `connect_grpc(stream, service_name, host)` - gRPC transport producing a `GrpcStream` (`:20`).
 - `src/transport/h2_transport.rs:134` - `connect_h2(stream, host, path)` - HTTP/2 transport producing an `H2Stream` (`:13`).
 - `src/transport/xhttp.rs` - `XHttpConfig::from_options` and `connect_h2` — XHTTP request shaping, padding, session/sequence placement, packet batching, and duplex stream bridge.
-- `src/transport/reality.rs:136` - `wrap_reality(stream, config)` - REALITY handshake; `RealityConfig::from_opts` at `:56`.
+- `src/transport/reality.rs:141` - `wrap_reality(stream, config)` - REALITY handshake; `RealityConfig::from_opts` at `:42` (raw-URL-safe base64 public key, zero-padded short-id, ALPN, `support-x25519mlkem768` guard).
 - `src/transport/fingerprint.rs:23` - `TlsFingerprint` - enum (Chrome/Firefox/Safari/Ios/Android/Random/None); `make_crypto_provider` (`:189`) and `default_alpn_for` (`:215`).
 
 ## Interactions
@@ -45,4 +45,5 @@ The transport subsystem provides the shared stream-layer building blocks that ev
 - QUIC-based transports (`h3://`) and the QUIC stack are out of scope — no HTTP/3 transport.
 - XHTTP exact-ALPN HTTP/1.1, XMUX reuse across logical streams, and separate `download-settings` are not implemented; configs that require a different wire path are rejected explicitly.
 - Fingerprint is a ClientHello/crypto-provider shim over rustls, not a full uTLS reimplementation; it covers the common browser presets used by Chinese-subscription configs.
+- REALITY depends on the pinned `Watfaq/rustls` fork for the ClientHello/key-share hook; `support-x25519mlkem768` (post-quantum hybrid) and a `None` client-fingerprint both error at config parse rather than downgrading.
 - gRPC/H2 transports target the client side for outbound dialing only (no inbound server transports — out of OpenClash scope).

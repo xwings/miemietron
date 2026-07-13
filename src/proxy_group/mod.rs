@@ -134,4 +134,8 @@ pub trait ProxyGroup: Send + Sync {
     /// Touch the group to mark it as recently used (for lazy health checks).
     /// mihomo compat: matches GroupBase.Touch() in groupbase.go
     fn touch(&self) {}
+
+    /// Upcast to `Any` for safe downcasting to the concrete group type
+    /// (used by health.rs to wire background health checks).
+    fn as_any_arc(self: Arc<Self>) -> Arc<dyn std::any::Any + Send + Sync>;
 }

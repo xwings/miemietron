@@ -148,11 +148,6 @@ impl GeoIpMatcher {
         }
     }
 
-    /// Look up the primary ISO country code (e.g. "US", "CN") for the given IP.
-    pub fn lookup_country(&self, ip: &IpAddr) -> Option<String> {
-        self.lookup_codes(ip).into_iter().next()
-    }
-
     /// Look up the Autonomous System Number for the given IP address.
     pub fn lookup_asn(&self, ip: &IpAddr) -> Option<u32> {
         let reader = self.asn_reader.as_ref()?;

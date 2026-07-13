@@ -69,16 +69,8 @@ impl OutboundHandler for DirectOutbound {
         // mihomo compat: only set SO_MARK when routing-mark is configured.
         // When not configured, GID 65534 (via OpenClash procd) handles bypass.
         if let Some(mark) = self.routing_mark {
-            use std::os::unix::io::AsRawFd;
-            let fd = socket.as_raw_fd();
-            unsafe {
-                libc::setsockopt(
-                    fd,
-                    libc::SOL_SOCKET,
-                    libc::SO_MARK,
-                    &mark as *const u32 as *const libc::c_void,
-                    std::mem::size_of::<u32>() as libc::socklen_t,
-                );
+            if let Err(e) = socket2::SockRef::from(&socket).set_mark(mark) {
+                tracing::warn!("DIRECT UDP: failed to set SO_MARK {mark}: {e}");
             }
         }
 
@@ -87,16 +79,8 @@ impl OutboundHandler for DirectOutbound {
         // bypasses the TUN instead of looping back into it.
         #[cfg(target_os = "linux")]
         if let Some(iface) = crate::transport::tcp::default_outbound_interface_public() {
-            use std::os::unix::io::AsRawFd;
-            let fd = socket.as_raw_fd();
-            unsafe {
-                libc::setsockopt(
-                    fd,
-                    libc::SOL_SOCKET,
-                    libc::SO_BINDTODEVICE,
-                    iface.as_ptr() as *const libc::c_void,
-                    iface.len() as libc::socklen_t,
-                );
+            if let Err(e) = socket2::SockRef::from(&socket).bind_device(Some(iface.as_bytes())) {
+                tracing::warn!("DIRECT UDP: failed to bind to device '{iface}': {e}");
             }
         }
 
@@ -215,8 +199,8 @@ impl OutboundHandler for NamedDirectOutbound {
 /// User-named REJECT outbound (config `type: reject`).
 ///
 /// mihomo compat: `adapter/outbound/reject.go::NewRejectWithOption`. Same
-/// "drop the dial with EOF" behavior as the built-in REJECT, but with a
-/// caller-chosen display name.
+/// behavior as the built-in REJECT — the dial fails with a "connection
+/// rejected" error — but with a caller-chosen display name.
 pub struct NamedRejectOutbound {
     proxy_name: String,
 }

@@ -7,7 +7,7 @@
 //! nodes) and select groups with a configured interval.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -77,7 +77,7 @@ pub(crate) async fn run_health_check(
                     };
                     let satisfied = expected
                         .as_deref()
-                        .map_or(true, |r| status_matches(status, r));
+                        .is_none_or(|r| status_matches(status, r));
                     if satisfied {
                         debug!("{} {}: {}ms", kind, name, ms);
                         store.record_result(&name, &url, Some(delay));
@@ -115,16 +115,6 @@ enum HealthCheckable {
 }
 
 impl HealthCheckable {
-    #[allow(dead_code)]
-    fn name(&self) -> &str {
-        match self {
-            HealthCheckable::UrlTest(g) => g.name(),
-            HealthCheckable::Fallback(g) => g.name(),
-            HealthCheckable::LoadBalance(g) => g.name(),
-            HealthCheckable::Selector(g) => g.name(),
-        }
-    }
-
     fn interval(&self) -> Duration {
         match self {
             HealthCheckable::UrlTest(g) => g.interval(),
@@ -173,9 +163,8 @@ impl HealthCheckable {
     /// Called after a health check completes to reset cached state.
     /// For UrlTestGroup, resets the fast_single cache.
     fn after_health_check(&self) {
-        match self {
-            HealthCheckable::UrlTest(g) => g.reset_fast_single(),
-            _ => {}
+        if let HealthCheckable::UrlTest(g) = self {
+            g.reset_fast_single()
         }
     }
 
@@ -187,10 +176,12 @@ impl HealthCheckable {
             HealthCheckable::UrlTest(g) => g.health_notify.clone(),
             HealthCheckable::Fallback(g) => g.health_notify.clone(),
             HealthCheckable::LoadBalance(g) => g.health_notify.clone(),
+            // try_into_checkable only yields Selector when health() is Some.
             HealthCheckable::Selector(g) => g
                 .health()
-                .map(|h| h.health_notify.clone())
-                .unwrap_or_else(|| Arc::new(Notify::new())),
+                .expect("Selector checkable always has health configured")
+                .health_notify
+                .clone(),
         }
     }
 
@@ -225,11 +216,9 @@ pub fn spawn_health_checks(
     let proxies = Arc::new(proxies);
 
     for (name, group) in groups {
-        let checkable = try_into_checkable(group);
-        if checkable.is_none() {
+        let Some(checkable) = try_into_checkable(group) else {
             continue;
-        }
-        let checkable = checkable.unwrap();
+        };
         let interval = checkable.interval();
         let group_name = name.clone();
         let proxies = proxies.clone();
@@ -237,9 +226,6 @@ pub fn spawn_health_checks(
 
         let lazy = checkable.lazy();
         let notify = checkable.health_notify();
-        // mihomo compat: singleDo guard prevents overlapping health checks.
-        // If a check is still running when the next tick fires, skip it.
-        let checking = Arc::new(AtomicBool::new(false));
         let handle = tokio::spawn(async move {
             info!(
                 "Health check loop started for '{}' (interval: {:?}, lazy: {})",
@@ -276,17 +262,6 @@ pub fn spawn_health_checks(
                     }
                 }
 
-                // mihomo compat: singleDo dedup — skip if previous check is still running.
-                // Matches healthcheck.go line 128: `singleDo.Do(func() { ... })`.
-                if checking.swap(true, Ordering::SeqCst) {
-                    debug!(
-                        "Skip health check for '{}' (previous still running)",
-                        group_name
-                    );
-                    continue;
-                }
-                let checking_flag = checking.clone();
-
                 debug!(
                     "Running health check for '{}' ({})",
                     group_name,
@@ -300,7 +275,6 @@ pub fn spawn_health_checks(
                 if triggered {
                     checkable.set_health_testing(false);
                 }
-                checking_flag.store(false, Ordering::SeqCst);
             }
         });
 
@@ -312,50 +286,28 @@ pub fn spawn_health_checks(
 
 /// Try to downcast a `dyn ProxyGroup` to a type that supports health checking.
 fn try_into_checkable(group: &Arc<dyn ProxyGroup>) -> Option<HealthCheckable> {
-    // We use the group_type() string to decide. This avoids requiring
-    // `Any` on the trait (which would complicate the trait object).
-    match group.group_type() {
-        "URLTest" => {
-            // SAFETY: we know the concrete type behind the trait object
-            // because group_type() == "URLTest" is only returned by
-            // UrlTestGroup. We clone the Arc and transmute. A safer
-            // approach would be to add an `as_any()` method to ProxyGroup.
-            //
-            // For now we rely on the fact that ProxyManager builds these
-            // objects and the type tag is authoritative.
-            // Increment refcount via from_raw + into_raw round-trip
-            let cloned = group.clone();
-            let raw = Arc::into_raw(cloned) as *const UrlTestGroup;
-            let arc = unsafe { Arc::from_raw(raw) };
-            Some(HealthCheckable::UrlTest(arc))
+    let any = group.clone().as_any_arc();
+    let any = match any.downcast::<UrlTestGroup>() {
+        Ok(g) => return Some(HealthCheckable::UrlTest(g)),
+        Err(any) => any,
+    };
+    let any = match any.downcast::<FallbackGroup>() {
+        Ok(g) => return Some(HealthCheckable::Fallback(g)),
+        Err(any) => any,
+    };
+    // mihomo compat: parser.go:166-171 — load-balance is a non-select
+    // type, so it always gets a periodic health check (interval
+    // defaults to 300s).
+    let any = match any.downcast::<LoadBalanceGroup>() {
+        Ok(g) => return Some(HealthCheckable::LoadBalance(g)),
+        Err(any) => any,
+    };
+    // mihomo compat: healthcheck.go auto() — select groups run
+    // periodic checks only when the user configured an interval.
+    if let Ok(g) = any.downcast::<SelectorGroup>() {
+        if g.health().is_some() {
+            return Some(HealthCheckable::Selector(g));
         }
-        "Fallback" => {
-            let cloned = group.clone();
-            let raw = Arc::into_raw(cloned) as *const FallbackGroup;
-            let arc = unsafe { Arc::from_raw(raw) };
-            Some(HealthCheckable::Fallback(arc))
-        }
-        "LoadBalance" => {
-            // mihomo compat: parser.go:166-171 — load-balance is a non-select
-            // type, so it always gets a periodic health check (interval
-            // defaults to 300s).
-            let cloned = group.clone();
-            let raw = Arc::into_raw(cloned) as *const LoadBalanceGroup;
-            let arc = unsafe { Arc::from_raw(raw) };
-            Some(HealthCheckable::LoadBalance(arc))
-        }
-        "Selector" => {
-            // mihomo compat: healthcheck.go auto() — select groups run
-            // periodic checks only when the user configured an interval.
-            let cloned = group.clone();
-            let raw = Arc::into_raw(cloned) as *const SelectorGroup;
-            let arc = unsafe { Arc::from_raw(raw) };
-            if arc.health().is_some() {
-                Some(HealthCheckable::Selector(arc))
-            } else {
-                None
-            }
-        }
-        _ => None,
     }
+    None
 }

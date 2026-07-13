@@ -83,15 +83,9 @@ impl FallbackGroup {
         self.interval
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn test_url(&self) -> &str {
         &self.test_url
-    }
-
-    /// Get a reference to the state store (for API reporting).
-    #[allow(dead_code)]
-    pub fn state_store(&self) -> &Arc<ProxyStateStore> {
-        &self.state_store
     }
 
     /// Run a health check against all proxies concurrently through their
@@ -119,7 +113,9 @@ impl FallbackGroup {
     /// found dead the pin is CLEARED and the remaining proxies are scanned
     /// for the first alive one. Falls back to the first proxy.
     fn find_alive_proxy(&self) -> Option<String> {
-        let mut selected = self.force_selected.write();
+        // Read-lock the pin; upgrade to a write lock only when a dead pin
+        // must be cleared, so the hot path stays contention-free.
+        let mut selected = self.force_selected.read().clone();
         for name in &self.proxy_names {
             match selected.as_deref() {
                 None => {
@@ -132,27 +128,13 @@ impl FallbackGroup {
                         if self.state_store.alive_for_url(name, &self.test_url) {
                             return Some(name.clone());
                         }
-                        *selected = None;
+                        *self.force_selected.write() = None;
+                        selected = None;
                     }
                 }
             }
         }
         self.proxy_names.first().cloned()
-    }
-
-    /// Get alive proxies with their delays (for API reporting).
-    #[allow(dead_code)]
-    pub fn get_alive(&self) -> HashMap<String, u64> {
-        let mut result = HashMap::new();
-        for name in &self.proxy_names {
-            if self.state_store.alive_for_url(name, &self.test_url) {
-                let delay = self.state_store.last_delay_for_url(name, &self.test_url);
-                if delay != 0xFFFF {
-                    result.insert(name.clone(), delay as u64);
-                }
-            }
-        }
-        result
     }
 
     /// Trigger an immediate health check via the background loop.
@@ -284,6 +266,10 @@ impl ProxyGroup for FallbackGroup {
             .unwrap_or_default()
             .as_millis() as u64;
         self.last_touch.store(now, Ordering::Relaxed);
+    }
+
+    fn as_any_arc(self: Arc<Self>) -> Arc<dyn std::any::Any + Send + Sync> {
+        self
     }
 }
 

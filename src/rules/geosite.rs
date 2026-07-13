@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -42,7 +43,7 @@ pub struct GeoSiteMatcher {
 /// AttributeList.Match over BooleanMatcher).
 struct GeoSitePayload<'a> {
     negate: bool,
-    base: String,
+    base: Cow<'a, str>,
     attrs: Vec<&'a str>,
 }
 
@@ -60,9 +61,16 @@ fn parse_geosite_payload(code: &str) -> Option<GeoSitePayload<'_>> {
         return None;
     }
     let attrs = parts.map(|a| a.trim()).filter(|a| !a.is_empty()).collect();
+    // Avoid an allocation per lookup when the code is already uppercase
+    // (codes in GeoSite.dat are uppercase ASCII).
+    let base = if base.bytes().any(|b| b.is_ascii_lowercase()) {
+        Cow::Owned(base.to_uppercase())
+    } else {
+        Cow::Borrowed(base)
+    };
     Some(GeoSitePayload {
         negate,
-        base: base.to_uppercase(),
+        base,
         attrs,
     })
 }
@@ -116,14 +124,20 @@ impl GeoSiteMatcher {
         let Some(payload) = parse_geosite_payload(code) else {
             return false;
         };
-        let Some(entries) = self.sites.get(&payload.base) else {
+        let Some(entries) = self.sites.get(payload.base.as_ref()) else {
             // mihomo fails config load for an unknown list; a missing list
             // here never matches — including for negated payloads, so absent
             // data can't accidentally match everything.
             return false;
         };
 
-        let domain_lower = domain.to_lowercase();
+        // Callers pass pre-lowered domains — avoid an allocation per lookup
+        // when nothing needs lowering.
+        let domain_lower: Cow<'_, str> = if domain.bytes().any(|b| b.is_ascii_uppercase()) {
+            Cow::Owned(domain.to_lowercase())
+        } else {
+            Cow::Borrowed(domain)
+        };
         let mut matched = false;
         for (matcher, entry_attrs) in entries {
             if !payload.attrs.is_empty() && !attrs_match(&payload.attrs, entry_attrs) {
@@ -132,19 +146,25 @@ impl GeoSiteMatcher {
             match matcher {
                 SiteMatcher::Plain(value) => {
                     // Keyword: domain contains the value as a substring.
-                    if domain_lower.contains(value) {
+                    if domain_lower.contains(value.as_str()) {
                         matched = true;
                     }
                 }
                 SiteMatcher::Suffix(value) => {
-                    // Suffix: domain ends with ".value" or equals "value".
-                    if domain_lower == *value || domain_lower.ends_with(&format!(".{value}")) {
+                    // Suffix: domain ends with ".value" or equals "value"
+                    // (allocation-free boundary check).
+                    let d = domain_lower.as_ref();
+                    if d == value.as_str()
+                        || (d.len() > value.len()
+                            && d.ends_with(value.as_str())
+                            && d.as_bytes()[d.len() - value.len() - 1] == b'.')
+                    {
                         matched = true;
                     }
                 }
                 SiteMatcher::Full(value) => {
                     // Exact match.
-                    if domain_lower == *value {
+                    if domain_lower.as_ref() == value.as_str() {
                         matched = true;
                     }
                 }
@@ -166,11 +186,6 @@ impl GeoSiteMatcher {
         }
     }
 
-    /// Whether any site data was loaded.
-    pub fn is_loaded(&self) -> bool {
-        !self.sites.is_empty()
-    }
-
     /// Get the number of domain entries for a specific country/group code.
     /// mihomo compat: matches GEOSITE.GetRecodeSize() via matcher.Count() —
     /// attribute filtering applies to the count too.
@@ -179,7 +194,7 @@ impl GeoSiteMatcher {
             return 0;
         };
         self.sites
-            .get(&payload.base)
+            .get(payload.base.as_ref())
             .map(|v| {
                 if payload.attrs.is_empty() {
                     v.len()

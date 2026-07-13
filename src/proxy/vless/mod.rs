@@ -1,5 +1,4 @@
 pub mod header;
-pub mod vision;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -72,11 +71,6 @@ impl VlessOutbound {
             if alpn.len() == 1 && alpn[0] == "http/1.1" {
                 anyhow::bail!("VLESS XHTTP: HTTP/1.1 transport is not implemented yet");
             }
-            if config.reality_opts.is_some() {
-                anyhow::bail!(
-                    "VLESS XHTTP over REALITY is unavailable until REALITY ClientHello support is implemented"
-                );
-            }
             Some(
                 XHttpConfig::from_options(
                     config.xhttp_opts.as_ref(),
@@ -126,6 +120,274 @@ impl VlessOutbound {
     }
 }
 
+#[async_trait]
+impl OutboundHandler for VlessOutbound {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn proto(&self) -> &str {
+        // mihomo compat: AdapterType.String() == "Vless" (adapters.go).
+        "Vless"
+    }
+
+    fn supports_udp(&self) -> bool {
+        // UDP relay (connect_datagram) is not yet implemented for VLESS; this
+        // flag only mirrors config, so requesting UDP errors at runtime.
+        self.udp
+    }
+
+    async fn connect_stream(
+        &self,
+        target: &Address,
+        dns: &DnsResolver,
+    ) -> Result<Box<dyn ProxyStream>> {
+        let tcp_stream = self.dial_server(dns).await?;
+        let header = self.build_header(CMD_TCP, target);
+
+        // Check if Reality transport is configured.
+        if let Some(reality_config) = self.build_reality_config()? {
+            // Reality transport — perform the Reality handshake which
+            // includes TLS with camouflage SNI + x25519 auth, then
+            // layer the VLESS protocol on top.
+            debug!("VLESS [{}]: using Reality transport", self.name);
+
+            let reality_stream = reality::wrap_reality(tcp_stream, &reality_config)
+                .await
+                .context("VLESS: Reality handshake failed")?;
+
+            match self.network.as_str() {
+                "ws" => {
+                    let ws_opts = self.build_ws_options();
+                    let ws_stream = ws::wrap_ws(reality_stream, &ws_opts)
+                        .await
+                        .context("VLESS: WebSocket upgrade over Reality failed")?;
+
+                    Ok(Box::new(VlessStream::new(ws_stream, header)))
+                }
+                "grpc" => {
+                    let service_name = self.grpc_service_name();
+                    let grpc_stream = grpc::connect_grpc(reality_stream, &service_name, &self.sni)
+                        .await
+                        .context("VLESS: gRPC connect over Reality failed")?;
+
+                    Ok(Box::new(VlessStream::new(grpc_stream, header)))
+                }
+                "h2" => {
+                    let (host, path) = self.h2_host_path();
+                    let h2_stream = h2_transport::connect_h2(reality_stream, &host, &path)
+                        .await
+                        .context("VLESS: H2 connect over Reality failed")?;
+
+                    Ok(Box::new(VlessStream::new(h2_stream, header)))
+                }
+                "xhttp" => {
+                    let xhttp_config = self
+                        .xhttp_config
+                        .clone()
+                        .context("VLESS XHTTP: missing normalized configuration")?;
+                    let xhttp_stream = xhttp::connect_h2(reality_stream, xhttp_config)
+                        .await
+                        .context("VLESS XHTTP: HTTP/2 connect over Reality failed")?;
+                    Ok(Box::new(VlessStream::new(xhttp_stream, header)))
+                }
+                _ => Ok(Box::new(VlessStream::new(reality_stream, header))),
+            }
+        } else {
+            // Standard transport (TLS or plain TCP).
+            match self.network.as_str() {
+                "ws" => {
+                    // WebSocket transport (optionally over TLS).
+                    if self.tls {
+                        // mihomo compat: vless.go:165 forces ALPN http/1.1 for
+                        // WebSocket regardless of the config's `alpn` — a WS
+                        // upgrade cannot run over an h2/h3-negotiated TLS conn.
+                        let tls_opts = self.tls_options().with_alpn(vec!["http/1.1".to_string()]);
+                        let tls_stream = tls::wrap_tls(tcp_stream, &tls_opts)
+                            .await
+                            .context("VLESS: TLS handshake failed")?;
+
+                        let ws_opts = self.build_ws_options();
+                        let ws_stream = ws::wrap_ws(tls_stream, &ws_opts)
+                            .await
+                            .context("VLESS: WebSocket upgrade failed")?;
+
+                        Ok(Box::new(VlessStream::new(ws_stream, header)))
+                    } else {
+                        let ws_opts = self.build_ws_options();
+                        let ws_stream = ws::wrap_ws(tcp_stream, &ws_opts)
+                            .await
+                            .context("VLESS: WebSocket upgrade failed")?;
+
+                        Ok(Box::new(VlessStream::new(ws_stream, header)))
+                    }
+                }
+                "grpc" => {
+                    // gRPC requires TLS with ALPN=h2
+                    let tls_opts = self.tls_options().with_alpn(vec!["h2".to_string()]);
+                    let tls_stream = tls::wrap_tls(tcp_stream, &tls_opts)
+                        .await
+                        .context("VLESS: TLS handshake for gRPC failed")?;
+
+                    let service_name = self.grpc_service_name();
+                    let grpc_stream = grpc::connect_grpc(tls_stream, &service_name, &self.sni)
+                        .await
+                        .context("VLESS: gRPC connect failed")?;
+
+                    Ok(Box::new(VlessStream::new(grpc_stream, header)))
+                }
+                "h2" => {
+                    // H2 requires TLS with ALPN=h2
+                    let tls_opts = self.tls_options().with_alpn(vec!["h2".to_string()]);
+                    let tls_stream = tls::wrap_tls(tcp_stream, &tls_opts)
+                        .await
+                        .context("VLESS: TLS handshake for H2 failed")?;
+
+                    let (host, path) = self.h2_host_path();
+                    let h2_stream = h2_transport::connect_h2(tls_stream, &host, &path)
+                        .await
+                        .context("VLESS: H2 connect failed")?;
+
+                    Ok(Box::new(VlessStream::new(h2_stream, header)))
+                }
+                "xhttp" => {
+                    let xhttp_config = self
+                        .xhttp_config
+                        .clone()
+                        .context("VLESS XHTTP: missing normalized configuration")?;
+
+                    if self.tls {
+                        // mihomo NewTransport forces h2 unless ALPN is exactly
+                        // [http/1.1] or [h3], even when the config lists both
+                        // h2 and http/1.1.
+                        let tls_opts = self.tls_options().with_alpn(vec!["h2".to_string()]);
+                        let tls_stream = tls::wrap_tls(tcp_stream, &tls_opts)
+                            .await
+                            .context("VLESS XHTTP: TLS handshake failed")?;
+                        let xhttp_stream = xhttp::connect_h2(tls_stream, xhttp_config)
+                            .await
+                            .context("VLESS XHTTP: HTTP/2 connect failed")?;
+                        Ok(Box::new(VlessStream::new(xhttp_stream, header)))
+                    } else {
+                        let xhttp_stream = xhttp::connect_h2(tcp_stream, xhttp_config)
+                            .await
+                            .context("VLESS XHTTP: h2c connect failed")?;
+                        Ok(Box::new(VlessStream::new(xhttp_stream, header)))
+                    }
+                }
+                _ => {
+                    // Plain TCP or TLS-only transport.
+                    if self.tls {
+                        let tls_opts = self.tls_options();
+                        let tls_stream = tls::wrap_tls(tcp_stream, &tls_opts)
+                            .await
+                            .context("VLESS: TLS handshake failed")?;
+
+                        Ok(Box::new(VlessStream::new(tls_stream, header)))
+                    } else {
+                        Ok(Box::new(VlessStream::new(tcp_stream, header)))
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl VlessOutbound {
+    /// Build a [`RealityConfig`] from the proxy config's `reality_opts`,
+    /// if present.  Returns `Ok(None)` when Reality is not configured.
+    fn build_reality_config(&self) -> Result<Option<RealityConfig>> {
+        let opts = match self.reality_opts {
+            Some(ref o) => o,
+            None => return Ok(None),
+        };
+
+        let public_key = opts
+            .public_key
+            .as_deref()
+            .context("VLESS Reality: missing 'public-key'")?;
+        let short_id = opts.short_id.as_deref().unwrap_or("");
+        let fp = TlsFingerprint::from_str_opt(self.fingerprint.as_deref());
+        let alpn = match self.network.as_str() {
+            "ws" => vec!["http/1.1".to_string()],
+            "grpc" | "h2" | "xhttp" => vec!["h2".to_string()],
+            _ if self.alpn.is_empty() => crate::transport::fingerprint::default_alpn_for(fp),
+            _ => self.alpn.clone(),
+        };
+
+        let config = RealityConfig::from_opts(
+            public_key,
+            short_id,
+            self.sni.clone(),
+            fp,
+            alpn,
+            opts.support_x25519mlkem768,
+        )
+        .context("VLESS Reality: invalid configuration")?;
+
+        Ok(Some(config))
+    }
+
+    /// Build the VLESS request header, including the flow addon if configured.
+    fn build_header(&self, cmd: u8, target: &Address) -> Vec<u8> {
+        encode_request_with_flow(&self.uuid, cmd, target, self.flow.as_deref())
+    }
+
+    /// Build the base TLS options (uses the config's `alpn`; callers override
+    /// via `with_alpn` where the transport dictates a specific ALPN).
+    fn tls_options(&self) -> TlsOptions {
+        TlsOptions {
+            sni: self.sni.clone(),
+            skip_cert_verify: self.skip_cert_verify,
+            alpn: self.alpn.clone(),
+            fingerprint: self.fingerprint.clone(),
+        }
+    }
+
+    fn grpc_service_name(&self) -> String {
+        self.grpc_opts
+            .as_ref()
+            .and_then(|o| o.grpc_service_name.clone())
+            .unwrap_or_else(|| "GunService".to_string())
+    }
+
+    fn h2_host_path(&self) -> (String, String) {
+        let host = self
+            .h2_opts
+            .as_ref()
+            .and_then(|o| o.host.first().cloned())
+            .unwrap_or_else(|| self.sni.clone());
+        let path = self
+            .h2_opts
+            .as_ref()
+            .and_then(|o| o.path.clone())
+            .unwrap_or_else(|| "/".to_string());
+        (host, path)
+    }
+
+    fn build_ws_options(&self) -> WsOptions {
+        let mut ws_options = WsOptions {
+            host: self.sni.clone(),
+            path: "/".to_string(),
+            headers: Vec::new(),
+        };
+
+        if let Some(ref opts) = self.ws_opts {
+            if let Some(ref path) = opts.path {
+                ws_options.path = path.clone();
+            }
+            for (key, value) in &opts.headers {
+                ws_options.headers.push((key.clone(), value.clone()));
+                if key.to_lowercase() == "host" {
+                    ws_options.host = value.clone();
+                }
+            }
+        }
+
+        ws_options
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -171,304 +433,28 @@ xhttp-opts:
         let error = VlessOutbound::new(&config).err().unwrap().to_string();
         assert!(error.contains("HTTP/3 transport is not implemented"));
     }
-}
 
-#[async_trait]
-impl OutboundHandler for VlessOutbound {
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn proto(&self) -> &str {
-        // mihomo compat: AdapterType.String() == "Vless" (adapters.go).
-        "Vless"
-    }
-
-    fn supports_udp(&self) -> bool {
-        self.udp
-    }
-
-    async fn connect_stream(
-        &self,
-        target: &Address,
-        dns: &DnsResolver,
-    ) -> Result<Box<dyn ProxyStream>> {
-        let tcp_stream = self.dial_server(dns).await?;
-
-        // Check if Reality transport is configured.
-        if let Some(reality_config) = self.build_reality_config()? {
-            // Reality transport — perform the Reality handshake which
-            // includes TLS with camouflage SNI + x25519 auth, then
-            // layer the VLESS protocol on top.
-            debug!("VLESS [{}]: using Reality transport", self.name);
-
-            match self.network.as_str() {
-                "ws" => {
-                    let reality_stream = reality::wrap_reality(tcp_stream, &reality_config)
-                        .await
-                        .context("VLESS: Reality handshake failed")?;
-
-                    let ws_opts = self.build_ws_options();
-                    let ws_stream = ws::wrap_ws(reality_stream, &ws_opts)
-                        .await
-                        .context("VLESS: WebSocket upgrade over Reality failed")?;
-
-                    let header = self.build_header(CMD_TCP, target);
-                    let vless_stream = VlessStream::new(ws_stream, header);
-                    Ok(Box::new(vless_stream))
-                }
-                "grpc" => {
-                    let reality_stream = reality::wrap_reality(tcp_stream, &reality_config)
-                        .await
-                        .context("VLESS: Reality handshake failed")?;
-
-                    let service_name = self.grpc_service_name();
-                    let grpc_stream = grpc::connect_grpc(reality_stream, &service_name, &self.sni)
-                        .await
-                        .context("VLESS: gRPC connect over Reality failed")?;
-
-                    let header = self.build_header(CMD_TCP, target);
-                    let vless_stream = VlessStream::new(grpc_stream, header);
-                    Ok(Box::new(vless_stream))
-                }
-                "h2" => {
-                    let reality_stream = reality::wrap_reality(tcp_stream, &reality_config)
-                        .await
-                        .context("VLESS: Reality handshake failed")?;
-
-                    let (host, path) = self.h2_host_path();
-                    let h2_stream = h2_transport::connect_h2(reality_stream, &host, &path)
-                        .await
-                        .context("VLESS: H2 connect over Reality failed")?;
-
-                    let header = self.build_header(CMD_TCP, target);
-                    let vless_stream = VlessStream::new(h2_stream, header);
-                    Ok(Box::new(vless_stream))
-                }
-                "xhttp" => {
-                    // Correct REALITY needs a ClientHello that explicitly
-                    // negotiates h2. The current rustls REALITY shim cannot
-                    // provide mihomo-compatible REALITY wire semantics, so do
-                    // not silently send plain VLESS or malformed XHTTP.
-                    anyhow::bail!(
-                        "VLESS XHTTP over REALITY is unavailable until REALITY ClientHello support is implemented"
-                    )
-                }
-                _ => {
-                    let reality_stream = reality::wrap_reality(tcp_stream, &reality_config)
-                        .await
-                        .context("VLESS: Reality handshake failed")?;
-
-                    let header = self.build_header(CMD_TCP, target);
-                    let vless_stream = VlessStream::new(reality_stream, header);
-                    Ok(Box::new(vless_stream))
-                }
-            }
-        } else {
-            // Standard transport (TLS or plain TCP).
-            match self.network.as_str() {
-                "ws" => {
-                    // WebSocket transport (optionally over TLS).
-                    if self.tls {
-                        // mihomo compat: vless.go:165 forces ALPN http/1.1 for
-                        // WebSocket regardless of the config's `alpn` — a WS
-                        // upgrade cannot run over an h2/h3-negotiated TLS conn.
-                        let tls_opts = TlsOptions {
-                            sni: self.sni.clone(),
-                            skip_cert_verify: self.skip_cert_verify,
-                            alpn: vec!["http/1.1".to_string()],
-                            fingerprint: self.fingerprint.clone(),
-                        };
-                        let tls_stream = tls::wrap_tls(tcp_stream, &tls_opts)
-                            .await
-                            .context("VLESS: TLS handshake failed")?;
-
-                        let ws_opts = self.build_ws_options();
-                        let ws_stream = ws::wrap_ws(tls_stream, &ws_opts)
-                            .await
-                            .context("VLESS: WebSocket upgrade failed")?;
-
-                        let header = self.build_header(CMD_TCP, target);
-                        let vless_stream = VlessStream::new(ws_stream, header);
-                        Ok(Box::new(vless_stream))
-                    } else {
-                        let ws_opts = self.build_ws_options();
-                        let ws_stream = ws::wrap_ws(tcp_stream, &ws_opts)
-                            .await
-                            .context("VLESS: WebSocket upgrade failed")?;
-
-                        let header = self.build_header(CMD_TCP, target);
-                        let vless_stream = VlessStream::new(ws_stream, header);
-                        Ok(Box::new(vless_stream))
-                    }
-                }
-                "grpc" => {
-                    // gRPC requires TLS with ALPN=h2
-                    let tls_opts = TlsOptions {
-                        sni: self.sni.clone(),
-                        skip_cert_verify: self.skip_cert_verify,
-                        alpn: vec!["h2".to_string()],
-                        fingerprint: self.fingerprint.clone(),
-                    };
-                    let tls_stream = tls::wrap_tls(tcp_stream, &tls_opts)
-                        .await
-                        .context("VLESS: TLS handshake for gRPC failed")?;
-
-                    let service_name = self.grpc_service_name();
-                    let grpc_stream = grpc::connect_grpc(tls_stream, &service_name, &self.sni)
-                        .await
-                        .context("VLESS: gRPC connect failed")?;
-
-                    let header = self.build_header(CMD_TCP, target);
-                    let vless_stream = VlessStream::new(grpc_stream, header);
-                    Ok(Box::new(vless_stream))
-                }
-                "h2" => {
-                    // H2 requires TLS with ALPN=h2
-                    let tls_opts = TlsOptions {
-                        sni: self.sni.clone(),
-                        skip_cert_verify: self.skip_cert_verify,
-                        alpn: vec!["h2".to_string()],
-                        fingerprint: self.fingerprint.clone(),
-                    };
-                    let tls_stream = tls::wrap_tls(tcp_stream, &tls_opts)
-                        .await
-                        .context("VLESS: TLS handshake for H2 failed")?;
-
-                    let (host, path) = self.h2_host_path();
-                    let h2_stream = h2_transport::connect_h2(tls_stream, &host, &path)
-                        .await
-                        .context("VLESS: H2 connect failed")?;
-
-                    let header = self.build_header(CMD_TCP, target);
-                    let vless_stream = VlessStream::new(h2_stream, header);
-                    Ok(Box::new(vless_stream))
-                }
-                "xhttp" => {
-                    let xhttp_config = self
-                        .xhttp_config
-                        .clone()
-                        .context("VLESS XHTTP: missing normalized configuration")?;
-
-                    let header = self.build_header(CMD_TCP, target);
-                    if self.tls {
-                        // mihomo NewTransport forces h2 unless ALPN is exactly
-                        // [http/1.1] or [h3], even when the config lists both
-                        // h2 and http/1.1.
-                        let tls_opts = TlsOptions {
-                            sni: self.sni.clone(),
-                            skip_cert_verify: self.skip_cert_verify,
-                            alpn: vec!["h2".to_string()],
-                            fingerprint: self.fingerprint.clone(),
-                        };
-                        let tls_stream = tls::wrap_tls(tcp_stream, &tls_opts)
-                            .await
-                            .context("VLESS XHTTP: TLS handshake failed")?;
-                        let xhttp_stream = xhttp::connect_h2(tls_stream, xhttp_config)
-                            .await
-                            .context("VLESS XHTTP: HTTP/2 connect failed")?;
-                        Ok(Box::new(VlessStream::new(xhttp_stream, header)))
-                    } else {
-                        let xhttp_stream = xhttp::connect_h2(tcp_stream, xhttp_config)
-                            .await
-                            .context("VLESS XHTTP: h2c connect failed")?;
-                        Ok(Box::new(VlessStream::new(xhttp_stream, header)))
-                    }
-                }
-                _ => {
-                    // Plain TCP or TLS-only transport.
-                    if self.tls {
-                        let tls_opts = TlsOptions {
-                            sni: self.sni.clone(),
-                            skip_cert_verify: self.skip_cert_verify,
-                            alpn: self.alpn.clone(),
-                            fingerprint: self.fingerprint.clone(),
-                        };
-                        let tls_stream = tls::wrap_tls(tcp_stream, &tls_opts)
-                            .await
-                            .context("VLESS: TLS handshake failed")?;
-
-                        let header = self.build_header(CMD_TCP, target);
-                        let vless_stream = VlessStream::new(tls_stream, header);
-                        Ok(Box::new(vless_stream))
-                    } else {
-                        let header = self.build_header(CMD_TCP, target);
-                        let vless_stream = VlessStream::new(tcp_stream, header);
-                        Ok(Box::new(vless_stream))
-                    }
-                }
-            }
-        }
-    }
-}
-
-impl VlessOutbound {
-    /// Build a [`RealityConfig`] from the proxy config's `reality_opts`,
-    /// if present.  Returns `Ok(None)` when Reality is not configured.
-    fn build_reality_config(&self) -> Result<Option<RealityConfig>> {
-        let opts = match self.reality_opts {
-            Some(ref o) => o,
-            None => return Ok(None),
-        };
-
-        let public_key = opts
-            .public_key
-            .as_deref()
-            .context("VLESS Reality: missing 'public-key'")?;
-        let short_id = opts.short_id.as_deref().unwrap_or("");
-        let fp = TlsFingerprint::from_str_opt(self.fingerprint.as_deref());
-
-        let config = RealityConfig::from_opts(public_key, short_id, self.sni.clone(), fp)
-            .context("VLESS Reality: invalid configuration")?;
-
-        Ok(Some(config))
-    }
-
-    /// Build the VLESS request header, including the flow addon if configured.
-    fn build_header(&self, cmd: u8, target: &Address) -> Vec<u8> {
-        encode_request_with_flow(&self.uuid, cmd, target, self.flow.as_deref())
-    }
-
-    fn grpc_service_name(&self) -> String {
-        self.grpc_opts
-            .as_ref()
-            .and_then(|o| o.grpc_service_name.clone())
-            .unwrap_or_else(|| "GunService".to_string())
-    }
-
-    fn h2_host_path(&self) -> (String, String) {
-        let host = self
-            .h2_opts
-            .as_ref()
-            .and_then(|o| o.host.first().cloned())
-            .unwrap_or_else(|| self.sni.clone());
-        let path = self
-            .h2_opts
-            .as_ref()
-            .and_then(|o| o.path.clone())
-            .unwrap_or_else(|| "/".to_string());
-        (host, path)
-    }
-
-    fn build_ws_options(&self) -> WsOptions {
-        let mut ws_options = WsOptions {
-            host: self.sni.clone(),
-            path: "/".to_string(),
-            headers: Vec::new(),
-        };
-
-        if let Some(ref opts) = self.ws_opts {
-            if let Some(ref path) = opts.path {
-                ws_options.path = path.clone();
-            }
-            for (key, value) in &opts.headers {
-                ws_options.headers.push((key.clone(), value.clone()));
-                if key.to_lowercase() == "host" {
-                    ws_options.host = value.clone();
-                }
-            }
-        }
-
-        ws_options
+    #[test]
+    fn xhttp_with_reality_is_accepted_for_h2() {
+        let yaml = r#"
+name: test-xhttp-reality
+type: vless
+server: proxy.example.com
+port: 443
+uuid: 11111111-2222-3333-4444-555555555555
+tls: true
+network: xhttp
+client-fingerprint: chrome
+reality-opts:
+  public-key: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+  short-id: 01020304
+xhttp-opts:
+  host: edge.example.com
+  mode: auto
+  path: /tunnel
+"#;
+        let config: ProxyConfig = serde_yaml::from_str(yaml).unwrap();
+        let outbound = VlessOutbound::new(&config).unwrap();
+        assert!(outbound.xhttp_config.is_some());
     }
 }

@@ -64,7 +64,7 @@ pub async fn run_redir_listener(port: u16, conn_manager: Arc<ConnectionManager>)
 
         let cm = conn_manager.clone();
         tokio::spawn(async move {
-            if let Err(e) = cm.handle_tcp(src, orig_dst, stream).await {
+            if let Err(e) = cm.handle_tcp_typed(src, orig_dst, stream, "redir").await {
                 debug!("Redir TCP {} -> {} error: {}", src, orig_dst, e);
             }
         });
@@ -95,22 +95,7 @@ pub async fn run_tproxy_tcp_listener(
     socket.set_reuse_address(true)?;
 
     // Set IP_TRANSPARENT so the kernel delivers TPROXY-redirected packets to us
-    unsafe {
-        let on: libc::c_int = 1;
-        let ret = libc::setsockopt(
-            socket.as_raw_fd(),
-            libc::SOL_IP,
-            libc::IP_TRANSPARENT,
-            &on as *const _ as *const libc::c_void,
-            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-        );
-        if ret != 0 {
-            warn!(
-                "setsockopt IP_TRANSPARENT failed: {}",
-                std::io::Error::last_os_error()
-            );
-        }
-    }
+    crate::stack::system::set_ip_transparent(&socket)?;
 
     socket.bind(&socket2::SockAddr::from(SocketAddr::from((
         [0, 0, 0, 0],
@@ -147,7 +132,7 @@ pub async fn run_tproxy_tcp_listener(
 
         let cm = conn_manager.clone();
         tokio::spawn(async move {
-            if let Err(e) = cm.handle_tcp(src, orig_dst, stream).await {
+            if let Err(e) = cm.handle_tcp_typed(src, orig_dst, stream, "tproxy").await {
                 debug!("TPROXY TCP {} -> {} error: {}", src, orig_dst, e);
             }
         });
@@ -196,10 +181,12 @@ fn get_original_dst(fd: std::os::unix::io::RawFd) -> std::io::Result<SocketAddr>
         let addr6 = unsafe { addr6.assume_init() };
         let ip = std::net::Ipv6Addr::from(addr6.sin6_addr.s6_addr);
         let port = u16::from_be(addr6.sin6_port);
+        // sockaddr_in6.sin6_flowinfo is in network byte order; SocketAddrV6
+        // takes host order.
         return Ok(SocketAddr::V6(std::net::SocketAddrV6::new(
             ip,
             port,
-            addr6.sin6_flowinfo,
+            u32::from_be(addr6.sin6_flowinfo),
             addr6.sin6_scope_id,
         )));
     }

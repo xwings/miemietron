@@ -60,20 +60,85 @@ pub struct ApiState {
     pub conn_manager: Arc<ConnectionManager>,
 }
 
+/// If `request` carries a WebSocket `Upgrade` header, extract the upgrader
+/// (or the rejection converted to a response). `None` means plain HTTP —
+/// mihomo's chi handlers serve both on the same route, so several endpoints
+/// share this sniff-and-upgrade dance.
+pub(crate) async fn websocket_upgrade(
+    request: axum::http::Request<axum::body::Body>,
+) -> Option<Result<axum::extract::WebSocketUpgrade, axum::response::Response>> {
+    use axum::extract::FromRequestParts;
+    use axum::response::IntoResponse;
+
+    let is_ws = request
+        .headers()
+        .get(axum::http::header::UPGRADE)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.eq_ignore_ascii_case("websocket"))
+        .unwrap_or(false);
+    if !is_ws {
+        return None;
+    }
+    let (mut parts, _body) = request.into_parts();
+    Some(
+        axum::extract::WebSocketUpgrade::from_request_parts(&mut parts, &())
+            .await
+            .map_err(IntoResponse::into_response),
+    )
+}
+
 pub async fn start_server(addr: &str, secret: Option<String>, state: ApiState) -> Result<()> {
+    // Bind before the UI download so an unreachable download URL can't block
+    // the whole REST API from coming up.
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+
+    let app = build_app(secret, state).await;
+
+    info!("API server listening on {}", addr);
+    axum::serve(listener, app).await?;
+
+    Ok(())
+}
+
+/// Serve the REST API on a unix socket (`external-controller-unix` /
+/// `--ext-ctl-unix`).
+///
+/// mihomo compat: `hub/route/server.go::startUnix` — create the parent
+/// directory if missing, unlink a stale socket file before bind, chmod the
+/// socket 0666, and serve the router with an EMPTY secret (local socket
+/// access is trusted; authentication is skipped).
+#[cfg(unix)]
+pub async fn start_unix_server(path: &std::path::Path, state: ApiState) -> Result<()> {
+    if let Some(dir) = path.parent() {
+        if !dir.as_os_str().is_empty() && !dir.exists() {
+            std::fs::create_dir_all(dir)?;
+        }
+    }
+    let _ = std::fs::remove_file(path);
+    let listener = tokio::net::UnixListener::bind(path)?;
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o666));
+    }
+
+    let app = build_app(None, state).await;
+
+    info!("RESTful API unix listening at: {}", path.display());
+    axum::serve(listener, app).await?;
+
+    Ok(())
+}
+
+/// Build the API router (shared by the TCP and unix-socket servers).
+async fn build_app(secret: Option<String>, state: ApiState) -> Router {
     // mihomo compat: CORS matching chi cors.Options (server.go:80-88) —
     // external-controller-cors.allow-origins restricts origins (default "*");
     // allow_private_network required for Chrome Private Network Access
     // (dashboard → router IP), default true (config.go:588-591).
     let cors_cfg = state.app.config().external_controller_cors.clone();
-    let (allow_origins, allow_private) = match cors_cfg {
-        Some(c) => {
-            let private = c.allow_private_network;
-            let origins = c.allow_origins;
-            (origins, private)
-        }
-        None => (vec![], true),
-    };
+    let (allow_origins, allow_private) = cors_cfg.map_or((vec![], true), |c| {
+        (c.allow_origins, c.allow_private_network)
+    });
     let cors = if allow_origins.is_empty() || allow_origins.iter().any(|o| o == "*") {
         CorsLayer::new()
             .allow_origin(Any)
@@ -94,9 +159,15 @@ pub async fn start_server(addr: &str, secret: Option<String>, state: ApiState) -
             .max_age(std::time::Duration::from_secs(300))
     };
 
-    // Auto-download UI if external-ui is configured but directory is empty/missing
+    // Auto-download UI if external-ui is configured but directory is empty/missing.
+    // Guarded so the TCP and unix servers (both call build_app concurrently)
+    // don't race two downloads into the same directory.
+    static UI_DOWNLOAD_STARTED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
     let config = state.app.config();
-    if let Some(ui_dir) = ui::resolve_ui_download_dir(&config) {
+    if let Some(ui_dir) = ui::resolve_ui_download_dir(&config)
+        .filter(|_| !UI_DOWNLOAD_STARTED.swap(true, std::sync::atomic::Ordering::SeqCst))
+    {
         let needs_download = !ui_dir.exists()
             || ui_dir
                 .read_dir()
@@ -204,17 +275,10 @@ pub async fn start_server(addr: &str, secret: Option<String>, state: ApiState) -
         }
     }
 
-    let app = app
-        .layer(cors)
+    app.layer(cors)
         .layer(axum::middleware::from_fn_with_state(
             secret.unwrap_or_default(),
             auth::auth_middleware,
         ))
-        .with_state(state);
-
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    info!("API server listening on {}", addr);
-    axum::serve(listener, app).await?;
-
-    Ok(())
+        .with_state(state)
 }

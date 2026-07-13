@@ -181,8 +181,14 @@ impl DomainSet {
 
     /// mihomo compat: `selectIthOne(bm, ranks, selects, i)` — index of the
     /// i-th (0-based) set bit. Binary-search the rank index, then scan the word.
-    fn select_ith_one(&self, i: usize) -> usize {
+    /// Returns `None` when fewer than `i+1` bits are set — a malformed file;
+    /// same guard rationale as `get_bit` (an index panic under panic=abort
+    /// would kill the daemon on a corrupt downloaded provider file).
+    fn select_ith_one(&self, i: usize) -> Option<usize> {
         let target = i as u64;
+        if target >= *self.ranks.last()? {
+            return None;
+        }
         // Find the word containing the (target+1)-th set bit.
         let mut lo = 0usize;
         let mut hi = self.label_bitmap.len();
@@ -200,7 +206,7 @@ impl DomainSet {
         loop {
             let tz = w.trailing_zeros() as usize;
             if remaining == 0 {
-                return (word << 6) + tz;
+                return Some((word << 6) + tz);
             }
             remaining -= 1;
             w &= w - 1;
@@ -240,7 +246,10 @@ impl DomainSet {
             };
             current.push(next_label);
             let next_node_id = self.count_zeros(bm_idx + 1);
-            let next_bm_idx = self.select_ith_one(next_node_id - 1) + 1;
+            let Some(sel) = self.select_ith_one(next_node_id - 1) else {
+                return;
+            };
+            let next_bm_idx = sel + 1;
             self.traverse(next_node_id, next_bm_idx, current, out);
             current.pop();
             bm_idx += 1;
@@ -358,6 +367,18 @@ mod tests {
         let mut want: Vec<String> = patterns.iter().map(|s| s.to_string()).collect();
         want.sort();
         assert_eq!(roundtrip(&patterns), want);
+    }
+
+    #[test]
+    fn malformed_domain_set_does_not_panic() {
+        // Malformed file: the label bitmap claims a child edge (a zero bit at
+        // index 0 with a label), but no set bit exists for select_ith_one to
+        // find. The traversal must abort that branch instead of indexing
+        // label_bitmap out of bounds (panic=abort would kill the daemon).
+        let bin = write_domain_set_bin(&[0], &[0], b"x");
+        let mut cur = Cursor { buf: &bin, pos: 0 };
+        let set = read_domain_set_bin(&mut cur).unwrap();
+        assert!(set.enumerate().is_empty());
     }
 
     #[test]

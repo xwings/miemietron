@@ -1,5 +1,5 @@
 use axum::{
-    extract::{ws, FromRequestParts, Path, State, WebSocketUpgrade},
+    extract::{ws, Path, State},
     http::{Request, StatusCode},
     response::{IntoResponse, Response},
     Json,
@@ -9,6 +9,17 @@ use tokio::time::{interval, Duration};
 
 use super::ApiState;
 
+/// Build the full connections snapshot JSON shared by the HTTP and WS branches.
+fn snapshot_json(state: &ApiState) -> serde_json::Value {
+    let snapshot = state.conn_manager.snapshot();
+    json!({
+        "downloadTotal": snapshot.download_total,
+        "uploadTotal": snapshot.upload_total,
+        "connections": snapshot.connections,
+        "memory": snapshot.memory,
+    })
+}
+
 /// GET /connections — returns JSON snapshot or streams via WebSocket.
 ///
 /// - WebSocket: streams full connection snapshots at `?interval=N` ms (default 1000)
@@ -17,46 +28,28 @@ pub async fn get_connections(
     State(state): State<ApiState>,
     request: Request<axum::body::Body>,
 ) -> Response {
-    let is_ws = request
-        .headers()
-        .get(axum::http::header::UPGRADE)
-        .and_then(|v| v.to_str().ok())
-        .map(|v| v.eq_ignore_ascii_case("websocket"))
-        .unwrap_or(false);
-
-    if is_ws {
-        // mihomo compat: read ?interval=N (milliseconds) before upgrading
-        let interval_ms = request
-            .uri()
-            .query()
-            .and_then(|q| {
-                q.split('&').find_map(|pair| {
-                    let (k, v) = pair.split_once('=')?;
-                    if k == "interval" {
-                        v.parse::<u64>().ok()
-                    } else {
-                        None
-                    }
-                })
+    // mihomo compat: read ?interval=N (milliseconds) before upgrading
+    let interval_ms = request
+        .uri()
+        .query()
+        .and_then(|q| {
+            q.split('&').find_map(|pair| {
+                let (k, v) = pair.split_once('=')?;
+                if k == "interval" {
+                    v.parse::<u64>().ok()
+                } else {
+                    None
+                }
             })
-            .unwrap_or(1000);
+        })
+        .unwrap_or(1000);
 
-        let (mut parts, _body) = request.into_parts();
-        match WebSocketUpgrade::from_request_parts(&mut parts, &state).await {
-            Ok(ws) => {
-                ws.on_upgrade(move |socket| handle_connections_ws(socket, state, interval_ms))
-            }
-            Err(e) => e.into_response(),
+    match super::websocket_upgrade(request).await {
+        Some(Ok(ws)) => {
+            ws.on_upgrade(move |socket| handle_connections_ws(socket, state, interval_ms))
         }
-    } else {
-        let snapshot = state.conn_manager.snapshot();
-        Json(json!({
-            "downloadTotal": snapshot.download_total,
-            "uploadTotal": snapshot.upload_total,
-            "connections": snapshot.connections,
-            "memory": snapshot.memory,
-        }))
-        .into_response()
+        Some(Err(resp)) => resp,
+        None => Json(snapshot_json(&state)).into_response(),
     }
 }
 
@@ -66,14 +59,7 @@ async fn handle_connections_ws(mut socket: ws::WebSocket, state: ApiState, inter
     loop {
         ticker.tick().await;
 
-        let snapshot = state.conn_manager.snapshot();
-        let msg = json!({
-            "downloadTotal": snapshot.download_total,
-            "uploadTotal": snapshot.upload_total,
-            "connections": snapshot.connections,
-            "memory": snapshot.memory,
-        })
-        .to_string();
+        let msg = snapshot_json(&state).to_string();
 
         if socket.send(ws::Message::Text(msg.into())).await.is_err() {
             break;

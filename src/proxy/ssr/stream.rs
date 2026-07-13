@@ -236,8 +236,6 @@ pub struct SsrStream<T> {
     iv_received: bool,
 }
 
-impl<T: Unpin> Unpin for SsrStream<T> {}
-
 impl<T> SsrStream<T> {
     /// Create a new SSR stream wrapping the given inner stream.
     ///
@@ -273,12 +271,6 @@ impl<T> SsrStream<T> {
             iv_buf: Vec::new(),
             iv_received: cipher == SsrCipher::None, // no IV to receive for "none"
         }
-    }
-
-    /// Derive the master key for external use (protocol plugins may need it).
-    #[allow(dead_code)]
-    pub fn key(&self) -> &[u8] {
-        &self.key
     }
 }
 

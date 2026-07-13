@@ -1,3 +1,4 @@
+use super::FlexNumVisitor;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
 
@@ -7,138 +8,21 @@ fn deserialize_flexible_u64<'de, D>(deserializer: D) -> Result<Option<u64>, D::E
 where
     D: Deserializer<'de>,
 {
-    use serde::de;
-
-    struct FlexU64Visitor;
-    impl<'de> de::Visitor<'de> for FlexU64Visitor {
-        type Value = Option<u64>;
-
-        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-            f.write_str("a number or string-encoded number")
-        }
-
-        fn visit_u64<E: de::Error>(self, v: u64) -> Result<Self::Value, E> {
-            Ok(Some(v))
-        }
-
-        fn visit_i64<E: de::Error>(self, v: i64) -> Result<Self::Value, E> {
-            Ok(Some(v as u64))
-        }
-
-        fn visit_f64<E: de::Error>(self, v: f64) -> Result<Self::Value, E> {
-            Ok(Some(v as u64))
-        }
-
-        fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
-            v.parse::<u64>().map(Some).map_err(de::Error::custom)
-        }
-
-        fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
-            Ok(None)
-        }
-
-        fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
-            Ok(None)
-        }
-
-        fn visit_some<D2: Deserializer<'de>>(self, d: D2) -> Result<Self::Value, D2::Error> {
-            d.deserialize_any(FlexU64Visitor)
-        }
-    }
-
-    deserializer.deserialize_any(FlexU64Visitor)
+    deserializer.deserialize_any(FlexNumVisitor::<u64>::new())
 }
 
 fn deserialize_flexible_u32<'de, D>(deserializer: D) -> Result<Option<u32>, D::Error>
 where
     D: Deserializer<'de>,
 {
-    use serde::de;
-
-    struct FlexU32Visitor;
-    impl<'de> de::Visitor<'de> for FlexU32Visitor {
-        type Value = Option<u32>;
-
-        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-            f.write_str("a number or string-encoded number")
-        }
-
-        fn visit_u64<E: de::Error>(self, v: u64) -> Result<Self::Value, E> {
-            Ok(Some(v as u32))
-        }
-
-        fn visit_i64<E: de::Error>(self, v: i64) -> Result<Self::Value, E> {
-            Ok(Some(v as u32))
-        }
-
-        fn visit_f64<E: de::Error>(self, v: f64) -> Result<Self::Value, E> {
-            Ok(Some(v as u32))
-        }
-
-        fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
-            v.parse::<u32>().map(Some).map_err(de::Error::custom)
-        }
-
-        fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
-            Ok(None)
-        }
-
-        fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
-            Ok(None)
-        }
-
-        fn visit_some<D2: Deserializer<'de>>(self, d: D2) -> Result<Self::Value, D2::Error> {
-            d.deserialize_any(FlexU32Visitor)
-        }
-    }
-
-    deserializer.deserialize_any(FlexU32Visitor)
+    deserializer.deserialize_any(FlexNumVisitor::<u32>::new())
 }
 
 fn deserialize_flexible_u16<'de, D>(deserializer: D) -> Result<Option<u16>, D::Error>
 where
     D: Deserializer<'de>,
 {
-    use serde::de;
-
-    struct FlexU16Visitor;
-    impl<'de> de::Visitor<'de> for FlexU16Visitor {
-        type Value = Option<u16>;
-
-        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-            f.write_str("a number or string-encoded number")
-        }
-
-        fn visit_u64<E: de::Error>(self, v: u64) -> Result<Self::Value, E> {
-            Ok(Some(v as u16))
-        }
-
-        fn visit_i64<E: de::Error>(self, v: i64) -> Result<Self::Value, E> {
-            Ok(Some(v as u16))
-        }
-
-        fn visit_f64<E: de::Error>(self, v: f64) -> Result<Self::Value, E> {
-            Ok(Some(v as u16))
-        }
-
-        fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
-            v.parse::<u16>().map(Some).map_err(de::Error::custom)
-        }
-
-        fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
-            Ok(None)
-        }
-
-        fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
-            Ok(None)
-        }
-
-        fn visit_some<D2: Deserializer<'de>>(self, d: D2) -> Result<Self::Value, D2::Error> {
-            d.deserialize_any(FlexU16Visitor)
-        }
-    }
-
-    deserializer.deserialize_any(FlexU16Visitor)
+    deserializer.deserialize_any(FlexNumVisitor::<u16>::new())
 }
 
 fn deserialize_optional_flexible_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
@@ -740,6 +624,26 @@ another-unknown: 42
         // Unknown fields should be in the extra map, not causing parse errors.
         assert!(config.extra.contains_key("some-future-field"));
         assert!(config.extra.contains_key("another-unknown"));
+    }
+
+    #[test]
+    fn out_of_range_numbers_rejected() {
+        // mihomo compat: Go's yaml.v3 errors on overflow/negative into sized
+        // unsigned integer fields — no silent wrapping.
+        let yaml = "name: p\ntype: ss\nserver: 1.2.3.4\nport: 99999\n";
+        assert!(serde_yaml::from_str::<ProxyConfig>(yaml).is_err());
+        let yaml = "name: p\ntype: ss\nserver: 1.2.3.4\nport: -1\n";
+        assert!(serde_yaml::from_str::<ProxyConfig>(yaml).is_err());
+        // u64 field: negative errors instead of wrapping to a huge value.
+        let yaml = "name: g\ntype: url-test\ninterval: -300\n";
+        assert!(serde_yaml::from_str::<ProxyGroupConfig>(yaml).is_err());
+        // u32 field: overflow errors.
+        let yaml = "name: g\ntype: url-test\ntolerance: 4294967296\n";
+        assert!(serde_yaml::from_str::<ProxyGroupConfig>(yaml).is_err());
+        // In-range values (number or quoted string) still parse.
+        let yaml = "name: p\ntype: ss\nserver: 1.2.3.4\nport: \"8388\"\n";
+        let config: ProxyConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.port, Some(8388));
     }
 
     #[test]

@@ -50,8 +50,13 @@ impl FakeIpPool {
         // .1 gateway, .2 and .3 reserved); the broadcast address (last IP of
         // the prefix) is never allocated (pool.go: offset cycles before
         // reaching `last`).
-        let first = base + 4;
-        let last = base + total - 1; // broadcast — excluded from allocation
+        // Checked arithmetic: degenerate ranges (/0 makes `total` overflow to
+        // 0 above) fall through to the "too small" error instead of wrapping.
+        let first = base.saturating_add(4);
+        let last = total
+            .checked_sub(1)
+            .and_then(|t| base.checked_add(t))
+            .unwrap_or(0); // broadcast — excluded from allocation
         if first >= last {
             return Err(anyhow::anyhow!(
                 "fake-ip-range {cidr} is too small (need at least /29, got /{prefix_len})"
@@ -106,11 +111,11 @@ impl FakeIpPool {
             return *ip;
         }
 
-        // Allocate next IP from the ring buffer.
-        // To avoid evicting a mapping that's still in active use, we probe
-        // forward and prefer slots that are either free or whose domain hasn't
-        // been looked up recently. With a /16 pool (65534 IPs), this should
-        // almost never need more than one probe.
+        // Allocate the next IP from the ring buffer: the offset advances
+        // monotonically and wraps modulo the pool size, and whatever mapping
+        // currently occupies the slot is evicted unconditionally. With a
+        // typical /16 pool the ring takes ~65k allocations to wrap, so
+        // evicting a still-active mapping is rare in practice.
         let start = self.offset.fetch_add(1, Ordering::Relaxed);
         let idx = start % self.size;
         let ip_u32 = self.base + idx;
@@ -263,15 +268,14 @@ fn parse_cidr(cidr: &str) -> Result<(u32, u32)> {
     }
     let ip: Ipv4Addr = parts[0].parse()?;
     let prefix_len: u32 = parts[1].parse()?;
+    if prefix_len > 32 {
+        return Err(anyhow::anyhow!("invalid CIDR: {cidr}"));
+    }
 
     // Normalize to network address: mask off host bits.
     // mihomo configs often use "198.18.0.1/16" instead of "198.18.0.0/16".
     let raw = u32::from(ip);
-    let mask = if prefix_len >= 32 {
-        !0u32
-    } else {
-        !((1u32 << (32 - prefix_len)) - 1)
-    };
+    let mask = (!0u32).checked_shl(32 - prefix_len).unwrap_or(0);
     let base = raw & mask;
     Ok((base, prefix_len))
 }
@@ -355,6 +359,19 @@ mod tests {
         assert!(FakeIpPool::new("10.0.0.0/32", &[], "blacklist").is_err());
         // /29 (8 IPs) is the minimum — 3 usable (.4-.6; .7 is broadcast)
         assert!(FakeIpPool::new("10.0.0.0/29", &[], "blacklist").is_ok());
+    }
+
+    #[test]
+    fn oversized_prefix_rejected() {
+        // /33 must be rejected by parse_cidr, not underflow 32 - prefix_len
+        assert!(FakeIpPool::new("10.0.0.0/33", &[], "blacklist").is_err());
+        assert!(FakeIpPool::new("10.0.0.0/128", &[], "blacklist").is_err());
+    }
+
+    #[test]
+    fn zero_prefix_rejected() {
+        // /0 makes the pool-size computation degenerate — must error, not wrap
+        assert!(FakeIpPool::new("0.0.0.0/0", &[], "blacklist").is_err());
     }
 
     #[test]

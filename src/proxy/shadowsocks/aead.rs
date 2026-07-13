@@ -471,18 +471,14 @@ impl<T> SsStream<T> {
     {
         use tokio::io::AsyncWriteExt;
 
-        if let WriteState::Flushing {
-            ref buf,
-            ref mut pos,
-        } = self.write_state
+        if let WriteState::Flushing { buf, pos } =
+            std::mem::replace(&mut self.write_state, WriteState::Ready)
         {
-            if *pos < buf.len() {
-                let data = buf[*pos..].to_vec();
-                self.inner.write_all(&data).await?;
+            if pos < buf.len() {
+                self.inner.write_all(&buf[pos..]).await?;
                 self.inner.flush().await?;
             }
         }
-        self.write_state = WriteState::Ready;
         Ok(())
     }
 }
@@ -566,11 +562,11 @@ fn build_ss2022_request_buffer(
 
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .expect("system time before epoch")
+        .unwrap_or_default()
         .as_secs();
 
     // Data chunk plaintext: [socks_addr][padding_len(2)][padding][first_user_data]
-    // When first_data is non-empty, padding=0. When empty, random 0-900 padding.
+    // When first_data is non-empty, padding=0. When empty, random 1-900 padding.
     let padding_size: u16 = if first_data.is_empty() {
         use rand::Rng;
         rand::thread_rng().gen_range(1..=900)
@@ -628,7 +624,7 @@ fn build_ss2022_request_buffer(
     nonce.increment();
     buf.extend_from_slice(&data_payload);
 
-    tracing::info!(
+    tracing::debug!(
         "SS2022 wire: total={} (salt={} eih={} header={} data={})",
         buf.len(),
         salt.len(),
@@ -748,6 +744,457 @@ pub(super) fn decrypt_in_place_standalone(
             c.decrypt_in_place(nonce_ga, b"", data)
                 .map_err(|e| anyhow::anyhow!("chacha20-poly1305 decrypt: {e}"))
         }
+    }
+}
+
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncRead for SsStream<T> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let mut me = self.project();
+
+        loop {
+            match me.read_state {
+                ReadState::WaitingSalt {
+                    buf: ref mut salt_buf,
+                } => {
+                    let salt_len = me.cipher_type.salt_len();
+                    // Read salt bytes from inner stream
+                    while salt_buf.len() < salt_len {
+                        let mut tmp = [0u8; 64];
+                        let remaining = salt_len - salt_buf.len();
+                        let to_read = std::cmp::min(remaining, tmp.len());
+                        let mut read_buf = ReadBuf::new(&mut tmp[..to_read]);
+                        match me.inner.as_mut().poll_read(cx, &mut read_buf) {
+                            Poll::Ready(Ok(())) => {
+                                let n = read_buf.filled().len();
+                                if n == 0 {
+                                    return Poll::Ready(Err(io::Error::new(
+                                        io::ErrorKind::UnexpectedEof,
+                                        "connection closed while reading salt",
+                                    )));
+                                }
+                                salt_buf.extend_from_slice(read_buf.filled());
+                            }
+                            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                            Poll::Pending => return Poll::Pending,
+                        }
+                    }
+
+                    // Derive decryption subkey from session key + received salt
+                    // For multi-user, session_key is the user_key; for single-user, it's master_key.
+                    let dec_subkey = me.cipher_type.derive_subkey(me.session_key, salt_buf);
+                    *me.dec_cipher = Some(CipherCore::new(*me.cipher_type, dec_subkey));
+
+                    if *me.is_ss2022 {
+                        // SS2022 response format (per shadowsocks-rust):
+                        //   [salt][AEAD_header (nonce=0)][AEAD_data (nonce=1)][standard chunks...]
+                        //
+                        // Header plaintext: [type(1)=0x01][timestamp(8)][request_salt(key_len)][data_length(2)]
+                        // The header is a fixed-size AEAD chunk (no length prefix).
+                        let header_plaintext_len = 1 + 8 + me.cipher_type.salt_len() + 2;
+                        *me.read_state = ReadState::WaitingSs2022ResponseHeader {
+                            buf: Vec::new(),
+                            header_len: header_plaintext_len,
+                        };
+                    } else {
+                        // Legacy: transition to reading length-prefixed chunks
+                        *me.read_state = ReadState::WaitingLength { buf: Vec::new() };
+                    }
+                }
+
+                ReadState::WaitingSs2022ResponseHeader {
+                    buf: ref mut hdr_buf,
+                    header_len,
+                } => {
+                    // SS2022 response: [salt][AEAD_header(nonce=0)][AEAD_data(nonce=1)][std chunks...]
+                    // Header is a fixed-size AEAD block (header_len + TAG_LEN bytes, no length prefix).
+                    // Header plaintext: [type(1)][timestamp(8)][request_salt(key_len)][data_length(2)]
+
+                    let need = *header_len + TAG_LEN;
+                    while hdr_buf.len() < need {
+                        let mut tmp = [0u8; 128];
+                        let remaining = need - hdr_buf.len();
+                        let to_read = std::cmp::min(remaining, tmp.len());
+                        let mut read_buf = ReadBuf::new(&mut tmp[..to_read]);
+                        match me.inner.as_mut().poll_read(cx, &mut read_buf) {
+                            Poll::Ready(Ok(())) => {
+                                let n = read_buf.filled().len();
+                                if n == 0 {
+                                    return Poll::Ready(Err(io::Error::new(
+                                        io::ErrorKind::UnexpectedEof,
+                                        "connection closed reading SS2022 response header",
+                                    )));
+                                }
+                                hdr_buf.extend_from_slice(read_buf.filled());
+                            }
+                            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                            Poll::Pending => return Poll::Pending,
+                        }
+                    }
+
+                    // Decrypt header (nonce=0)
+                    let dec = me
+                        .dec_cipher
+                        .as_ref()
+                        .ok_or_else(|| io::Error::other("decryption cipher not initialized"))?;
+                    dec.decrypt_in_place(me.dec_nonce.current(), hdr_buf)?;
+                    me.dec_nonce.increment();
+
+                    // Validate type byte
+                    if hdr_buf.is_empty() || hdr_buf[0] != 0x01 {
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "ss2022: invalid response header type (expected 0x01)",
+                        )));
+                    }
+
+                    // Validate timestamp (bytes 1..9)
+                    let resp_ts = u64::from_be_bytes(
+                        hdr_buf[1..9].try_into().expect("8 bytes for timestamp"),
+                    );
+                    // A badly-set clock (before epoch) yields now_ts=0, which
+                    // simply fails the diff check below instead of panicking.
+                    let now_ts = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    let ts_diff = now_ts.abs_diff(resp_ts);
+                    if ts_diff > 30 {
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("ss2022: response timestamp too far off (diff={ts_diff}s)"),
+                        )));
+                    }
+
+                    // Validate request salt echo (bytes 9..9+key_len)
+                    let salt_len = me.cipher_type.salt_len();
+                    let echoed_salt = &hdr_buf[9..9 + salt_len];
+                    if echoed_salt != me.request_salt.as_slice() {
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "ss2022: response header request salt mismatch",
+                        )));
+                    }
+
+                    // Read data_length from header (bytes 9+key_len..9+key_len+2)
+                    let dl_offset = 9 + salt_len;
+                    let data_length =
+                        u16::from_be_bytes([hdr_buf[dl_offset], hdr_buf[dl_offset + 1]]) as usize;
+
+                    // Now read the AEAD data chunk (nonce=1): data_length + TAG_LEN bytes.
+                    // This chunk contains the server's initial response payload.
+                    // After this, standard length-prefixed chunks start at nonce=2.
+                    if data_length > 0 {
+                        *me.read_state = ReadState::WaitingPayload {
+                            buf: Vec::new(),
+                            payload_len: data_length,
+                        };
+                    } else {
+                        // data_length == 0: no data chunk sent, standard chunks at nonce=1
+                        *me.read_state = ReadState::WaitingLength { buf: Vec::new() };
+                    }
+                }
+
+                ReadState::WaitingLength {
+                    buf: ref mut len_buf,
+                } => {
+                    let need = 2 + TAG_LEN; // 2 bytes length + 16 bytes tag
+                    while len_buf.len() < need {
+                        let mut tmp = [0u8; 32];
+                        let remaining = need - len_buf.len();
+                        let to_read = std::cmp::min(remaining, tmp.len());
+                        let mut read_buf = ReadBuf::new(&mut tmp[..to_read]);
+                        match me.inner.as_mut().poll_read(cx, &mut read_buf) {
+                            Poll::Ready(Ok(())) => {
+                                let n = read_buf.filled().len();
+                                if n == 0 {
+                                    if len_buf.is_empty() {
+                                        // Clean EOF - no more data
+                                        return Poll::Ready(Ok(()));
+                                    }
+                                    return Poll::Ready(Err(io::Error::new(
+                                        io::ErrorKind::UnexpectedEof,
+                                        "connection closed while reading length",
+                                    )));
+                                }
+                                len_buf.extend_from_slice(read_buf.filled());
+                            }
+                            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                            Poll::Pending => return Poll::Pending,
+                        }
+                    }
+
+                    // Decrypt the length field
+                    let dec = me
+                        .dec_cipher
+                        .as_ref()
+                        .ok_or_else(|| io::Error::other("decryption cipher not initialized"))?;
+                    dec.decrypt_in_place(me.dec_nonce.current(), len_buf)?;
+                    me.dec_nonce.increment();
+
+                    // Parse the 2-byte big-endian length
+                    let payload_len = ((len_buf[0] as usize) << 8) | (len_buf[1] as usize);
+                    let max_payload = if *me.is_ss2022 {
+                        MAX_PAYLOAD_SIZE_2022
+                    } else {
+                        MAX_PAYLOAD_SIZE
+                    };
+                    if payload_len > max_payload {
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("payload length {payload_len} exceeds maximum {max_payload}"),
+                        )));
+                    }
+
+                    // Reuse the read buffer instead of allocating a new Vec
+                    me.read_reuse_buf.clear();
+                    *me.read_state = ReadState::WaitingPayload {
+                        buf: std::mem::take(me.read_reuse_buf),
+                        payload_len,
+                    };
+                }
+
+                ReadState::WaitingPayload {
+                    buf: ref mut payload_buf,
+                    payload_len,
+                } => {
+                    let need = *payload_len + TAG_LEN;
+                    while payload_buf.len() < need {
+                        let mut tmp = [0u8; 4096];
+                        let remaining = need - payload_buf.len();
+                        let to_read = std::cmp::min(remaining, tmp.len());
+                        let mut read_buf = ReadBuf::new(&mut tmp[..to_read]);
+                        match me.inner.as_mut().poll_read(cx, &mut read_buf) {
+                            Poll::Ready(Ok(())) => {
+                                let n = read_buf.filled().len();
+                                if n == 0 {
+                                    return Poll::Ready(Err(io::Error::new(
+                                        io::ErrorKind::UnexpectedEof,
+                                        "connection closed while reading payload",
+                                    )));
+                                }
+                                payload_buf.extend_from_slice(read_buf.filled());
+                            }
+                            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                            Poll::Pending => return Poll::Pending,
+                        }
+                    }
+
+                    // Decrypt payload
+                    let dec = me
+                        .dec_cipher
+                        .as_ref()
+                        .ok_or_else(|| io::Error::other("decryption cipher not initialized"))?;
+                    dec.decrypt_in_place(me.dec_nonce.current(), payload_buf)?;
+                    me.dec_nonce.increment();
+
+                    let decrypted = std::mem::take(payload_buf);
+                    *me.read_state = ReadState::Buffered {
+                        buf: decrypted,
+                        pos: 0,
+                    };
+                }
+
+                ReadState::Buffered {
+                    buf: ref dec_buf,
+                    ref mut pos,
+                } => {
+                    let remaining = &dec_buf[*pos..];
+                    if remaining.is_empty() {
+                        // Reclaim buffer for reuse instead of dropping + allocating
+                        if let ReadState::Buffered { buf, .. } = std::mem::replace(
+                            me.read_state,
+                            ReadState::WaitingLength { buf: Vec::new() },
+                        ) {
+                            *me.read_reuse_buf = buf;
+                        }
+                        // Set up WaitingLength with a small reused buffer
+                        // (the main read_reuse_buf is reserved for the larger payload)
+                        continue;
+                    }
+
+                    let to_copy = std::cmp::min(remaining.len(), buf.remaining());
+                    buf.put_slice(&remaining[..to_copy]);
+                    *pos += to_copy;
+                    return Poll::Ready(Ok(()));
+                }
+            }
+        }
+    }
+}
+
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncWrite for SsStream<T> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        data: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let mut me = self.project();
+
+        // Flush any pending data
+        while let WriteState::Flushing {
+            ref buf,
+            ref mut pos,
+        } = me.write_state
+        {
+            if *pos < buf.len() {
+                match me.inner.as_mut().poll_write(cx, &buf[*pos..]) {
+                    Poll::Ready(Ok(n)) => {
+                        if n == 0 {
+                            return Poll::Ready(Err(io::Error::new(
+                                io::ErrorKind::WriteZero,
+                                "write zero",
+                            )));
+                        }
+                        *pos += n;
+                        if *pos < buf.len() {
+                            continue;
+                        }
+                    }
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                    Poll::Pending => return Poll::Pending,
+                }
+            }
+            // Reclaim the flushed buffer for reuse instead of dropping it
+            if let WriteState::Flushing { buf, .. } =
+                std::mem::replace(me.write_state, WriteState::Ready)
+            {
+                *me.write_out_buf = buf;
+            }
+        }
+
+        // Now encrypt the new data
+        if data.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+
+        let enc = me
+            .enc_cipher
+            .as_ref()
+            .ok_or_else(|| io::Error::other("encryption cipher not initialized"))?;
+
+        // Take at most MAX_PAYLOAD_SIZE bytes (SS2022 allows larger chunks)
+        let max_size = if *me.is_ss2022 {
+            MAX_PAYLOAD_SIZE_2022
+        } else {
+            MAX_PAYLOAD_SIZE
+        };
+        let chunk_len = std::cmp::min(max_size, data.len());
+        let chunk = &data[..chunk_len];
+
+        // Reuse pre-allocated buffers instead of allocating new Vecs per write.
+        // Encrypt length (2 bytes -> 2 + TAG_LEN after encryption)
+        me.write_out_buf.clear();
+        me.write_out_buf.push((chunk_len >> 8) as u8);
+        me.write_out_buf.push((chunk_len & 0xFF) as u8);
+        enc.encrypt_in_place(me.enc_nonce.current(), me.write_out_buf)?;
+        me.enc_nonce.increment();
+
+        // Encrypt payload using reusable buffer
+        me.write_payload_buf.clear();
+        me.write_payload_buf.extend_from_slice(chunk);
+        enc.encrypt_in_place(me.enc_nonce.current(), me.write_payload_buf)?;
+        me.enc_nonce.increment();
+
+        // Build the output: [encrypted_len + tag][encrypted_payload + tag]
+        // Swap out_buf and write_out_buf so out_buf has len prefix, then append payload
+        let out_len = me.write_out_buf.len() + me.write_payload_buf.len();
+        let mut out = std::mem::take(me.write_out_buf);
+        out.reserve(out_len - out.len());
+        out.extend_from_slice(me.write_payload_buf);
+
+        // Write the encrypted chunk. Try to write all of it in a loop.
+        // If the inner stream can't accept all data, buffer the remainder
+        // in Flushing state (will be flushed on next poll_write or poll_flush).
+        let mut pos = 0;
+        while pos < out.len() {
+            match me.inner.as_mut().poll_write(cx, &out[pos..]) {
+                Poll::Ready(Ok(n)) => {
+                    if n == 0 {
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::WriteZero,
+                            "write zero",
+                        )));
+                    }
+                    pos += n;
+                }
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => {
+                    *me.write_state = WriteState::Flushing { buf: out, pos };
+                    return Poll::Ready(Ok(chunk_len));
+                }
+            }
+        }
+        // Write completed fully — reclaim the buffer for reuse
+        *me.write_out_buf = out;
+        Poll::Ready(Ok(chunk_len))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let mut me = self.project();
+
+        // Flush pending encrypted data first
+        if let WriteState::Flushing {
+            ref buf,
+            ref mut pos,
+        } = me.write_state
+        {
+            while *pos < buf.len() {
+                match me.inner.as_mut().poll_write(cx, &buf[*pos..]) {
+                    Poll::Ready(Ok(n)) => {
+                        if n == 0 {
+                            return Poll::Ready(Err(io::Error::new(
+                                io::ErrorKind::WriteZero,
+                                "write zero during flush",
+                            )));
+                        }
+                        *pos += n;
+                    }
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                    Poll::Pending => return Poll::Pending,
+                }
+            }
+        }
+        // Reclaim the flushed buffer for reuse
+        if let WriteState::Flushing { buf, .. } =
+            std::mem::replace(me.write_state, WriteState::Ready)
+        {
+            *me.write_out_buf = buf;
+        } else {
+            *me.write_state = WriteState::Ready;
+        }
+
+        me.inner.as_mut().poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let mut me = self.project();
+
+        // Flush pending data before shutdown
+        if let WriteState::Flushing {
+            ref buf,
+            ref mut pos,
+        } = me.write_state
+        {
+            while *pos < buf.len() {
+                match me.inner.as_mut().poll_write(cx, &buf[*pos..]) {
+                    Poll::Ready(Ok(n)) => {
+                        if n == 0 {
+                            break;
+                        }
+                        *pos += n;
+                    }
+                    Poll::Ready(Err(_)) => break,
+                    Poll::Pending => return Poll::Pending,
+                }
+            }
+        }
+        *me.write_state = WriteState::Ready;
+
+        me.inner.as_mut().poll_shutdown(cx)
     }
 }
 
@@ -1190,454 +1637,5 @@ mod tests {
         let mut expected = [0u8; NONCE_LEN];
         expected[0] = 2;
         assert_eq!(nonce.current(), &expected);
-    }
-}
-
-impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncRead for SsStream<T> {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        let mut me = self.project();
-
-        loop {
-            match me.read_state {
-                ReadState::WaitingSalt {
-                    buf: ref mut salt_buf,
-                } => {
-                    let salt_len = me.cipher_type.salt_len();
-                    // Read salt bytes from inner stream
-                    while salt_buf.len() < salt_len {
-                        let mut tmp = [0u8; 64];
-                        let remaining = salt_len - salt_buf.len();
-                        let to_read = std::cmp::min(remaining, tmp.len());
-                        let mut read_buf = ReadBuf::new(&mut tmp[..to_read]);
-                        match me.inner.as_mut().poll_read(cx, &mut read_buf) {
-                            Poll::Ready(Ok(())) => {
-                                let n = read_buf.filled().len();
-                                if n == 0 {
-                                    return Poll::Ready(Err(io::Error::new(
-                                        io::ErrorKind::UnexpectedEof,
-                                        "connection closed while reading salt",
-                                    )));
-                                }
-                                salt_buf.extend_from_slice(read_buf.filled());
-                            }
-                            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                            Poll::Pending => return Poll::Pending,
-                        }
-                    }
-
-                    // Derive decryption subkey from session key + received salt
-                    // For multi-user, session_key is the user_key; for single-user, it's master_key.
-                    let dec_subkey = me.cipher_type.derive_subkey(me.session_key, salt_buf);
-                    *me.dec_cipher = Some(CipherCore::new(*me.cipher_type, dec_subkey));
-
-                    if *me.is_ss2022 {
-                        // SS2022 response format (per shadowsocks-rust):
-                        //   [salt][AEAD_header (nonce=0)][AEAD_data (nonce=1)][standard chunks...]
-                        //
-                        // Header plaintext: [type(1)=0x01][timestamp(8)][request_salt(key_len)][data_length(2)]
-                        // The header is a fixed-size AEAD chunk (no length prefix).
-                        let header_plaintext_len = 1 + 8 + me.cipher_type.salt_len() + 2;
-                        *me.read_state = ReadState::WaitingSs2022ResponseHeader {
-                            buf: Vec::new(),
-                            header_len: header_plaintext_len,
-                        };
-                    } else {
-                        // Legacy: transition to reading length-prefixed chunks
-                        *me.read_state = ReadState::WaitingLength { buf: Vec::new() };
-                    }
-                }
-
-                ReadState::WaitingSs2022ResponseHeader {
-                    buf: ref mut hdr_buf,
-                    header_len,
-                } => {
-                    // SS2022 response: [salt][AEAD_header(nonce=0)][AEAD_data(nonce=1)][std chunks...]
-                    // Header is a fixed-size AEAD block (header_len + TAG_LEN bytes, no length prefix).
-                    // Header plaintext: [type(1)][timestamp(8)][request_salt(key_len)][data_length(2)]
-
-                    let need = *header_len + TAG_LEN;
-                    while hdr_buf.len() < need {
-                        let mut tmp = [0u8; 128];
-                        let remaining = need - hdr_buf.len();
-                        let to_read = std::cmp::min(remaining, tmp.len());
-                        let mut read_buf = ReadBuf::new(&mut tmp[..to_read]);
-                        match me.inner.as_mut().poll_read(cx, &mut read_buf) {
-                            Poll::Ready(Ok(())) => {
-                                let n = read_buf.filled().len();
-                                if n == 0 {
-                                    return Poll::Ready(Err(io::Error::new(
-                                        io::ErrorKind::UnexpectedEof,
-                                        "connection closed reading SS2022 response header",
-                                    )));
-                                }
-                                hdr_buf.extend_from_slice(read_buf.filled());
-                            }
-                            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                            Poll::Pending => return Poll::Pending,
-                        }
-                    }
-
-                    // Decrypt header (nonce=0)
-                    let dec = me
-                        .dec_cipher
-                        .as_ref()
-                        .ok_or_else(|| io::Error::other("decryption cipher not initialized"))?;
-                    dec.decrypt_in_place(me.dec_nonce.current(), hdr_buf)?;
-                    me.dec_nonce.increment();
-
-                    // Validate type byte
-                    if hdr_buf.is_empty() || hdr_buf[0] != 0x01 {
-                        return Poll::Ready(Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "ss2022: invalid response header type (expected 0x01)",
-                        )));
-                    }
-
-                    // Validate timestamp (bytes 1..9)
-                    let resp_ts = u64::from_be_bytes(
-                        hdr_buf[1..9].try_into().expect("8 bytes for timestamp"),
-                    );
-                    let now_ts = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .expect("system time before epoch")
-                        .as_secs();
-                    let ts_diff = now_ts.abs_diff(resp_ts);
-                    if ts_diff > 30 {
-                        return Poll::Ready(Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!("ss2022: response timestamp too far off (diff={ts_diff}s)"),
-                        )));
-                    }
-
-                    // Validate request salt echo (bytes 9..9+key_len)
-                    let salt_len = me.cipher_type.salt_len();
-                    let echoed_salt = &hdr_buf[9..9 + salt_len];
-                    if echoed_salt != me.request_salt.as_slice() {
-                        return Poll::Ready(Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "ss2022: response header request salt mismatch",
-                        )));
-                    }
-
-                    // Read data_length from header (bytes 9+key_len..9+key_len+2)
-                    let dl_offset = 9 + salt_len;
-                    let data_length =
-                        u16::from_be_bytes([hdr_buf[dl_offset], hdr_buf[dl_offset + 1]]) as usize;
-
-                    // Now read the AEAD data chunk (nonce=1): data_length + TAG_LEN bytes.
-                    // This chunk contains the server's initial response payload.
-                    // After this, standard length-prefixed chunks start at nonce=2.
-                    if data_length > 0 {
-                        *me.read_state = ReadState::WaitingPayload {
-                            buf: Vec::new(),
-                            payload_len: data_length,
-                        };
-                    } else {
-                        // data_length == 0: no data chunk sent, standard chunks at nonce=1
-                        *me.read_state = ReadState::WaitingLength { buf: Vec::new() };
-                    }
-                }
-
-                ReadState::WaitingLength {
-                    buf: ref mut len_buf,
-                } => {
-                    let need = 2 + TAG_LEN; // 2 bytes length + 16 bytes tag
-                    while len_buf.len() < need {
-                        let mut tmp = [0u8; 32];
-                        let remaining = need - len_buf.len();
-                        let to_read = std::cmp::min(remaining, tmp.len());
-                        let mut read_buf = ReadBuf::new(&mut tmp[..to_read]);
-                        match me.inner.as_mut().poll_read(cx, &mut read_buf) {
-                            Poll::Ready(Ok(())) => {
-                                let n = read_buf.filled().len();
-                                if n == 0 {
-                                    if len_buf.is_empty() {
-                                        // Clean EOF - no more data
-                                        return Poll::Ready(Ok(()));
-                                    }
-                                    return Poll::Ready(Err(io::Error::new(
-                                        io::ErrorKind::UnexpectedEof,
-                                        "connection closed while reading length",
-                                    )));
-                                }
-                                len_buf.extend_from_slice(read_buf.filled());
-                            }
-                            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                            Poll::Pending => return Poll::Pending,
-                        }
-                    }
-
-                    // Decrypt the length field
-                    let dec = me
-                        .dec_cipher
-                        .as_ref()
-                        .ok_or_else(|| io::Error::other("decryption cipher not initialized"))?;
-                    dec.decrypt_in_place(me.dec_nonce.current(), len_buf)?;
-                    me.dec_nonce.increment();
-
-                    // Parse the 2-byte big-endian length
-                    let payload_len = ((len_buf[0] as usize) << 8) | (len_buf[1] as usize);
-                    let max_payload = if *me.is_ss2022 {
-                        MAX_PAYLOAD_SIZE_2022
-                    } else {
-                        MAX_PAYLOAD_SIZE
-                    };
-                    if payload_len > max_payload {
-                        return Poll::Ready(Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!("payload length {payload_len} exceeds maximum {max_payload}"),
-                        )));
-                    }
-
-                    // Reuse the read buffer instead of allocating a new Vec
-                    me.read_reuse_buf.clear();
-                    *me.read_state = ReadState::WaitingPayload {
-                        buf: std::mem::take(me.read_reuse_buf),
-                        payload_len,
-                    };
-                }
-
-                ReadState::WaitingPayload {
-                    buf: ref mut payload_buf,
-                    payload_len,
-                } => {
-                    let need = *payload_len + TAG_LEN;
-                    while payload_buf.len() < need {
-                        let mut tmp = [0u8; 4096];
-                        let remaining = need - payload_buf.len();
-                        let to_read = std::cmp::min(remaining, tmp.len());
-                        let mut read_buf = ReadBuf::new(&mut tmp[..to_read]);
-                        match me.inner.as_mut().poll_read(cx, &mut read_buf) {
-                            Poll::Ready(Ok(())) => {
-                                let n = read_buf.filled().len();
-                                if n == 0 {
-                                    return Poll::Ready(Err(io::Error::new(
-                                        io::ErrorKind::UnexpectedEof,
-                                        "connection closed while reading payload",
-                                    )));
-                                }
-                                payload_buf.extend_from_slice(read_buf.filled());
-                            }
-                            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                            Poll::Pending => return Poll::Pending,
-                        }
-                    }
-
-                    // Decrypt payload
-                    let dec = me
-                        .dec_cipher
-                        .as_ref()
-                        .ok_or_else(|| io::Error::other("decryption cipher not initialized"))?;
-                    dec.decrypt_in_place(me.dec_nonce.current(), payload_buf)?;
-                    me.dec_nonce.increment();
-
-                    let decrypted = std::mem::take(payload_buf);
-                    *me.read_state = ReadState::Buffered {
-                        buf: decrypted,
-                        pos: 0,
-                    };
-                }
-
-                ReadState::Buffered {
-                    buf: ref dec_buf,
-                    ref mut pos,
-                } => {
-                    let remaining = &dec_buf[*pos..];
-                    if remaining.is_empty() {
-                        // Reclaim buffer for reuse instead of dropping + allocating
-                        if let ReadState::Buffered { buf, .. } = std::mem::replace(
-                            me.read_state,
-                            ReadState::WaitingLength { buf: Vec::new() },
-                        ) {
-                            *me.read_reuse_buf = buf;
-                        }
-                        // Set up WaitingLength with a small reused buffer
-                        // (the main read_reuse_buf is reserved for the larger payload)
-                        continue;
-                    }
-
-                    let to_copy = std::cmp::min(remaining.len(), buf.remaining());
-                    buf.put_slice(&remaining[..to_copy]);
-                    *pos += to_copy;
-                    return Poll::Ready(Ok(()));
-                }
-            }
-        }
-    }
-}
-
-impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncWrite for SsStream<T> {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        data: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        let mut me = self.project();
-
-        // Flush any pending data
-        while let WriteState::Flushing {
-            ref buf,
-            ref mut pos,
-        } = me.write_state
-        {
-            if *pos < buf.len() {
-                match me.inner.as_mut().poll_write(cx, &buf[*pos..]) {
-                    Poll::Ready(Ok(n)) => {
-                        if n == 0 {
-                            return Poll::Ready(Err(io::Error::new(
-                                io::ErrorKind::WriteZero,
-                                "write zero",
-                            )));
-                        }
-                        *pos += n;
-                        if *pos < buf.len() {
-                            continue;
-                        }
-                    }
-                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                    Poll::Pending => return Poll::Pending,
-                }
-            }
-            // Reclaim the flushed buffer for reuse instead of dropping it
-            if let WriteState::Flushing { buf, .. } =
-                std::mem::replace(me.write_state, WriteState::Ready)
-            {
-                *me.write_out_buf = buf;
-            }
-        }
-
-        // Now encrypt the new data
-        if data.is_empty() {
-            return Poll::Ready(Ok(0));
-        }
-
-        let enc = me
-            .enc_cipher
-            .as_ref()
-            .ok_or_else(|| io::Error::other("encryption cipher not initialized"))?;
-
-        // Take at most MAX_PAYLOAD_SIZE bytes (SS2022 allows larger chunks)
-        let max_size = if *me.is_ss2022 {
-            MAX_PAYLOAD_SIZE_2022
-        } else {
-            MAX_PAYLOAD_SIZE
-        };
-        let chunk_len = std::cmp::min(max_size, data.len());
-        let chunk = &data[..chunk_len];
-
-        // Reuse pre-allocated buffers instead of allocating new Vecs per write.
-        // Encrypt length (2 bytes -> 2 + TAG_LEN after encryption)
-        me.write_out_buf.clear();
-        me.write_out_buf.push((chunk_len >> 8) as u8);
-        me.write_out_buf.push((chunk_len & 0xFF) as u8);
-        enc.encrypt_in_place(me.enc_nonce.current(), me.write_out_buf)?;
-        me.enc_nonce.increment();
-
-        // Encrypt payload using reusable buffer
-        me.write_payload_buf.clear();
-        me.write_payload_buf.extend_from_slice(chunk);
-        enc.encrypt_in_place(me.enc_nonce.current(), me.write_payload_buf)?;
-        me.enc_nonce.increment();
-
-        // Build the output: [encrypted_len + tag][encrypted_payload + tag]
-        // Swap out_buf and write_out_buf so out_buf has len prefix, then append payload
-        let out_len = me.write_out_buf.len() + me.write_payload_buf.len();
-        let mut out = std::mem::take(me.write_out_buf);
-        out.reserve(out_len - out.len());
-        out.extend_from_slice(me.write_payload_buf);
-
-        // Write the encrypted chunk. Try to write all of it in a loop.
-        // If the inner stream can't accept all data, buffer the remainder
-        // in Flushing state (will be flushed on next poll_write or poll_flush).
-        let mut pos = 0;
-        while pos < out.len() {
-            match me.inner.as_mut().poll_write(cx, &out[pos..]) {
-                Poll::Ready(Ok(n)) => {
-                    if n == 0 {
-                        return Poll::Ready(Err(io::Error::new(
-                            io::ErrorKind::WriteZero,
-                            "write zero",
-                        )));
-                    }
-                    pos += n;
-                }
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => {
-                    *me.write_state = WriteState::Flushing { buf: out, pos };
-                    return Poll::Ready(Ok(chunk_len));
-                }
-            }
-        }
-        // Write completed fully — reclaim the buffer for reuse
-        *me.write_out_buf = out;
-        Poll::Ready(Ok(chunk_len))
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let mut me = self.project();
-
-        // Flush pending encrypted data first
-        if let WriteState::Flushing {
-            ref buf,
-            ref mut pos,
-        } = me.write_state
-        {
-            while *pos < buf.len() {
-                match me.inner.as_mut().poll_write(cx, &buf[*pos..]) {
-                    Poll::Ready(Ok(n)) => {
-                        if n == 0 {
-                            return Poll::Ready(Err(io::Error::new(
-                                io::ErrorKind::WriteZero,
-                                "write zero during flush",
-                            )));
-                        }
-                        *pos += n;
-                    }
-                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                    Poll::Pending => return Poll::Pending,
-                }
-            }
-        }
-        // Reclaim the flushed buffer for reuse
-        if let WriteState::Flushing { buf, .. } =
-            std::mem::replace(me.write_state, WriteState::Ready)
-        {
-            *me.write_out_buf = buf;
-        } else {
-            *me.write_state = WriteState::Ready;
-        }
-
-        me.inner.as_mut().poll_flush(cx)
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let mut me = self.project();
-
-        // Flush pending data before shutdown
-        if let WriteState::Flushing {
-            ref buf,
-            ref mut pos,
-        } = me.write_state
-        {
-            while *pos < buf.len() {
-                match me.inner.as_mut().poll_write(cx, &buf[*pos..]) {
-                    Poll::Ready(Ok(n)) => {
-                        if n == 0 {
-                            break;
-                        }
-                        *pos += n;
-                    }
-                    Poll::Ready(Err(_)) => break,
-                    Poll::Pending => return Poll::Pending,
-                }
-            }
-        }
-        *me.write_state = WriteState::Ready;
-
-        me.inner.as_mut().poll_shutdown(cx)
     }
 }

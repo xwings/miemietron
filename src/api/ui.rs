@@ -39,7 +39,12 @@ pub async fn download_ui(ui_dir: &Path, url: Option<&str>) -> Result<()> {
     let url = url.unwrap_or(DEFAULT_UI_URL);
     info!("Downloading UI from {}", url);
 
-    let response = reqwest::get(url).await?;
+    // Bounded timeouts so an unreachable download host can't hang callers.
+    let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(300))
+        .build()?;
+    let response = client.get(url).send().await?;
     if !response.status().is_success() {
         return Err(anyhow::anyhow!(
             "UI download failed: HTTP {}",
@@ -71,6 +76,11 @@ fn extract_zip(data: &[u8], target_dir: &Path) -> Result<()> {
 
     for i in 0..archive.len() {
         let mut file = archive.by_index(i)?;
+        // zip-slip guard: skip entries whose name would resolve outside the
+        // target directory (`../`, absolute paths).
+        if file.enclosed_name().is_none() {
+            continue;
+        }
         let raw_name = file.name().to_string();
 
         // Strip the common prefix if present

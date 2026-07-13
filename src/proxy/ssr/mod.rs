@@ -80,12 +80,7 @@ impl SsrOutbound {
         // unknown names, wrapped by NewShadowSocksR as
         // "ssr <addr> initialize obfs error: ...". Unknown -> reject.
         let obfs = SsrObfs::from_name(obfs_name).ok_or_else(|| {
-            anyhow!(
-                "ssr {}:{} initialize obfs error: Obfs {} not supported",
-                server,
-                port,
-                obfs_name
-            )
+            anyhow!("ssr {server}:{port} initialize obfs error: Obfs {obfs_name} not supported")
         })?;
         // Recognized but unimplemented obfs must FAIL LOUD at load, never
         // silently degrade to plain (CLAUDE.md "never silent fallback").
@@ -115,10 +110,7 @@ impl SsrOutbound {
         // NewShadowSocksR as "ssr <addr> initialize protocol error: ...".
         let protocol = SsrProtocol::from_name(protocol_name).ok_or_else(|| {
             anyhow!(
-                "ssr {}:{} initialize protocol error: protocol {} not supported",
-                server,
-                port,
-                protocol_name
+                "ssr {server}:{port} initialize protocol error: protocol {protocol_name} not supported"
             )
         })?;
         // Recognized but unimplemented protocols must FAIL LOUD at load, never
@@ -214,7 +206,7 @@ impl OutboundHandler for SsrOutbound {
             SsrProtocolStream::new(cipher_stream, self.protocol, &self.protocol_param);
 
         // 4. Wrap in obfuscation plugin.
-        let obfs_stream = SsrObfsStream::new(protocol_stream, self.obfs, self.obfs_param.clone());
+        let obfs_stream = SsrObfsStream::new(protocol_stream, self.obfs, &self.obfs_param);
 
         // 5. Send the target address header through the wrapped stream.
         //    The SS/SSR server expects the first payload to be the address header.

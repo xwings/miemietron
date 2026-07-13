@@ -38,12 +38,13 @@ impl RelayBufPool {
             .unwrap_or_else(|| vec![0u8; RELAY_BUF_SIZE])
     }
 
-    fn put(&self, mut buf: Vec<u8>) {
+    fn put(&self, buf: Vec<u8>) {
+        // Buffers keep len == RELAY_BUF_SIZE for their whole lifetime (read()
+        // never shrinks a Vec), so no re-zeroing or resize is needed.
         if buf.capacity() == RELAY_BUF_SIZE {
-            buf.clear();
+            debug_assert_eq!(buf.len(), RELAY_BUF_SIZE);
             let mut pool = self.pool.lock();
             if pool.len() < 64 {
-                buf.resize(RELAY_BUF_SIZE, 0);
                 pool.push(buf);
             }
         }
@@ -151,6 +152,12 @@ impl<T: AsyncRead + Unpin> AsyncRead for PeekableStream<T> {
             let to_copy = std::cmp::min(remaining.len(), buf.remaining());
             buf.put_slice(&remaining[..to_copy]);
             *this.prefix_pos += to_copy;
+            if *this.prefix_pos == this.prefix.len() {
+                // Fully drained — free the prefix allocation instead of
+                // keeping it around for the connection's lifetime.
+                *this.prefix = Vec::new();
+                *this.prefix_pos = 0;
+            }
             return Poll::Ready(Ok(()));
         }
 
@@ -195,6 +202,48 @@ pub(crate) fn inbound_type_display(conn_type: &'static str) -> &'static str {
     }
 }
 
+/// Inbound listener port for a connection type (mihomo metadata.InPort),
+/// used for IN-PORT rule matching. Shared by the TCP and UDP paths.
+fn inbound_port(config: &crate::config::MiemieConfig, conn_type: &str) -> Option<u16> {
+    match conn_type {
+        "http-proxy" | "http-connect" => Some(config.port),
+        "socks5" => Some(config.socks_port),
+        "tun" | "redir" => Some(config.redir_port),
+        "tproxy" => Some(config.tproxy_port),
+        _ => {
+            if config.mixed_port > 0 {
+                Some(config.mixed_port)
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// mihomo compat: tunnel.go match() — resolve the host to a real IP on
+/// demand when rule evaluation needs it (GEOIP / IP-CIDR / ... without
+/// no-resolve) but dst_ip was blanked for FakeIP. Resolution failure
+/// falls through to matching with dst_ip=None, exactly like mihomo.
+async fn resolve_ip_on_demand(
+    mode: &str,
+    rule_meta: &mut RuleMetadata,
+    rules: &crate::rules::RuleEngine,
+    dns: &crate::dns::DnsResolver,
+) {
+    if mode != "global"
+        && mode != "direct"
+        && rule_meta.dst_ip.is_none()
+        && rule_meta.domain.is_some()
+        && rules.needs_ip_resolution(rule_meta)
+    {
+        if let Some(host) = rule_meta.domain.clone() {
+            if let Ok(ip) = dns.resolve_real_ip(&host).await {
+                rule_meta.dst_ip = Some(ip);
+            }
+        }
+    }
+}
+
 /// mihomo compat: constant/adapters.go Chain.String() — a connection's chain
 /// renders as `last[first]` (e.g. `MyGroup[node]`), or the single element.
 fn chain_display(chains: &[String]) -> String {
@@ -224,7 +273,10 @@ where
     let (mut a_read, mut a_write) = tokio::io::split(a);
     let (mut b_read, mut b_write) = tokio::io::split(b);
 
-    let a_to_b = tokio::spawn(async move {
+    // Both directions run as futures inside THIS task (not detached spawns) so
+    // that aborting the relay task genuinely drops both stream halves and
+    // closes the connections (close_connection / close_all rely on this).
+    let a_to_b = async move {
         let mut buf = RELAY_BUF_POOL.get();
         loop {
             let n = match a_read.read(&mut buf).await {
@@ -241,9 +293,9 @@ where
         }
         let _ = b_write.shutdown().await;
         RELAY_BUF_POOL.put(buf);
-    });
+    };
 
-    let b_to_a = tokio::spawn(async move {
+    let b_to_a = async move {
         let mut buf = RELAY_BUF_POOL.get();
         loop {
             let n = match b_read.read(&mut buf).await {
@@ -260,18 +312,24 @@ where
         }
         let _ = a_write.shutdown().await;
         RELAY_BUF_POOL.put(buf);
-    });
+    };
 
-    let _ = a_to_b.await;
-    let _ = b_to_a.await;
+    tokio::join!(a_to_b, b_to_a);
 }
 
 /// Connection manager — mihomo tunnel/tunnel.go equivalent.
 pub struct ConnectionManager {
     app: Arc<AppState>,
-    connections: DashMap<Arc<str>, ConnectionInfo>,
-    counters: DashMap<Arc<str>, (Arc<AtomicU64>, Arc<AtomicU64>)>,
-    relay_handles: DashMap<Arc<str>, tokio::task::AbortHandle>,
+    connections: DashMap<Arc<str>, ConnEntry>,
+}
+
+/// Everything tracked for one live connection: static info for the API,
+/// live byte counters, and the relay task's abort handle.
+struct ConnEntry {
+    info: ConnectionInfo,
+    upload: Arc<AtomicU64>,
+    download: Arc<AtomicU64>,
+    abort: tokio::task::AbortHandle,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -337,12 +395,13 @@ impl ConnectionManager {
         Self {
             app,
             connections: DashMap::new(),
-            counters: DashMap::new(),
-            relay_handles: DashMap::new(),
         }
     }
 
-    /// Handle a new TCP connection from the TUN stack.
+    /// Handle a new TCP connection from the TUN stack (conn_type "tun").
+    /// Other inbounds (redir, tproxy, HTTP, SOCKS5) must use
+    /// [`Self::handle_tcp_typed`] / [`Self::handle_tcp_with_host`] so IN-TYPE
+    /// rules and the `/connections` type field see the real inbound.
     pub async fn handle_tcp(
         &self,
         src: SocketAddr,
@@ -534,20 +593,22 @@ impl ConnectionManager {
                             .unwrap_or(false);
                     if can_replace {
                         sniff_cache.record_success(dst);
-                        sniff_host = sniffed.clone();
                         let override_dst = sniff_override.unwrap_or(false);
                         if override_dst {
                             debug!(
                                 "[Sniffer] Sniff TCP [{}]-->[{}] success, replace domain [{:?}]-->[{}]",
                                 src, dst, domain, sniffed
                             );
+                            sniff_host = sniffed.clone();
                             domain = Some(sniffed);
                             pre_handle_failed = false;
                             sniff_overrode = true;
+                        } else {
+                            // mihomo compat: override-destination false only
+                            // sets SniffHost — rules keep matching the original
+                            // host/IP, so the sniffed name is NOT adopted.
+                            sniff_host = sniffed;
                         }
-                        // mihomo compat: override-destination false only sets
-                        // SniffHost — rules keep matching the original
-                        // host/IP, so the sniffed name is NOT adopted.
                     } else {
                         debug!("[Sniffer] Skip sni[{}]", sniffed);
                     }
@@ -585,9 +646,10 @@ impl ConnectionManager {
         };
 
         // Process detection: look up the process that owns this source socket.
-        // Only do this if find-process-mode is not "off" (default is to detect).
-        // mihomo compat: default to FindProcessStrict — defers process lookup
-        // until a PROCESS-NAME/PROCESS-PATH rule actually needs it.
+        // Runs eagerly for every connection unless find-process-mode is "off"
+        // (mihomo's FindProcessStrict defers the lookup until a PROCESS-NAME /
+        // PROCESS-PATH rule needs it; we look up up-front, bounded by a 100ms
+        // timeout, so a slow /proc scan can't stall the connection).
         let find_process_mode = config.find_process_mode.as_deref().unwrap_or("strict");
         let (proc_name, proc_path) = if find_process_mode != "off" {
             // Wrap in a timeout to avoid blocking on slow /proc scans
@@ -607,19 +669,7 @@ impl ConnectionManager {
         };
 
         // Determine inbound listener port from connection type and config
-        let in_port = match conn_type {
-            "http-proxy" | "http-connect" => Some(config.port),
-            "socks5" => Some(config.socks_port),
-            "tun" | "redir" => Some(config.redir_port),
-            "tproxy" => Some(config.tproxy_port),
-            _ => {
-                if config.mixed_port > 0 {
-                    Some(config.mixed_port)
-                } else {
-                    None
-                }
-            }
-        };
+        let in_port = inbound_port(&config, conn_type);
 
         // mihomo compat: clear dst_ip when domain is known and IP is a FakeIP
         // or unresolved placeholder (tunnel.go:288-290). preHandleMetadata sets
@@ -634,49 +684,33 @@ impl ConnectionManager {
             Some(dst.ip())
         };
 
+        // mihomo compat: resolveMetadata — a hosts-mapped domain resolves once
+        // here; the IP is used both for rule matching (set BEFORE matching,
+        // tunnel.go:329-332, so IP-CIDR/GEOIP rules match the hosts-mapped
+        // address) and for the dial target override below.
+        let hosts_ip: Option<std::net::IpAddr> = domain.as_deref().and_then(|d| {
+            config
+                .hosts
+                .get(&d.to_lowercase())
+                .and_then(|s| s.parse::<std::net::IpAddr>().ok())
+                .filter(|ip| !dns.is_fake_ip(ip))
+        });
+
         let mut rule_meta = RuleMetadata {
             domain: domain.clone(),
-            dst_ip: rule_dst_ip,
+            dst_ip: hosts_ip.or(rule_dst_ip),
             src_ip: Some(src.ip()),
             dst_port: dst.port(),
             src_port: src.port(),
             network: "tcp",
-            process_name: proc_name.clone(),
+            process_name: proc_name,
             process_path: proc_path.clone(),
             in_port,
             in_type: Some(inbound_type_display(conn_type)),
             ..Default::default()
         };
 
-        // mihomo compat: resolveMetadata — a hosts-mapped domain gets its IP
-        // set BEFORE rule matching (tunnel.go:329-332), so IP-CIDR/GEOIP rules
-        // match the hosts-mapped address.
-        if let Some(ref d) = rule_meta.domain {
-            if let Some(host_ip_str) = config.hosts.get(&d.to_lowercase()) {
-                if let Ok(ip) = host_ip_str.parse::<std::net::IpAddr>() {
-                    if !dns.is_fake_ip(&ip) {
-                        rule_meta.dst_ip = Some(ip);
-                    }
-                }
-            }
-        }
-
-        // mihomo compat: tunnel.go match() — resolve the host to a real IP on
-        // demand when rule evaluation needs it (GEOIP / IP-CIDR / ... without
-        // no-resolve) but dst_ip was blanked for FakeIP. Resolution failure
-        // falls through to matching with dst_ip=None, exactly like mihomo.
-        if mode != "global"
-            && mode != "direct"
-            && rule_meta.dst_ip.is_none()
-            && rule_meta.domain.is_some()
-            && rules.needs_ip_resolution(&rule_meta)
-        {
-            if let Some(host) = rule_meta.domain.clone() {
-                if let Ok(ip) = dns.resolve_real_ip(&host).await {
-                    rule_meta.dst_ip = Some(ip);
-                }
-            }
-        }
+        resolve_ip_on_demand(&mode, &mut rule_meta, &rules, &dns).await;
 
         // Match rules
         // mihomo compat: global mode routes to proxies["GLOBAL"], direct mode to DIRECT
@@ -738,27 +772,16 @@ impl ConnectionManager {
         // display form (e.g. "DomainSuffix", "Match"), not config syntax.
         let rule_str = crate::rules::rule_type_display(&rule_type).to_string();
 
-        // mihomo compat: check hosts map for domain overrides before dialing.
-        // Matches mihomo's resolveMetadata: if host is in DefaultHosts and the
-        // resolved IP is not a FakeIP, override DstIP (domain preserved for SNI).
-        let target = if let Some(ref domain) = domain {
-            if let Some(host_ip_str) = config.hosts.get(&domain.to_lowercase()) {
-                if let Ok(ip) = host_ip_str.parse::<std::net::IpAddr>() {
-                    if !dns.is_fake_ip(&ip) {
-                        debug!("Hosts override: {} -> {}", domain, ip);
-                        // Use domain target so SNI is preserved, but the adapter
-                        // will resolve the domain to this IP via the DNS resolver.
-                        // For DIRECT connections, override to the IP target directly.
-                        Address::ip(SocketAddr::new(ip, dst.port()))
-                    } else {
-                        target
-                    }
-                } else {
-                    target
-                }
-            } else {
-                target
-            }
+        // mihomo compat: apply the hosts override (resolved once above) to the
+        // dial target: if host is in DefaultHosts and the resolved IP is not a
+        // FakeIP, override DstIP.
+        let target = if let Some(ip) = hosts_ip {
+            debug!(
+                "Hosts override: {} -> {}",
+                domain.as_deref().unwrap_or(""),
+                ip
+            );
+            Address::ip(SocketAddr::new(ip, dst.port()))
         } else {
             target
         };
@@ -861,7 +884,7 @@ impl ConnectionManager {
         let remote = match remote_conn {
             Some(r) => r,
             None => {
-                let e = last_err.unwrap();
+                let e = last_err.unwrap_or_else(|| anyhow::anyhow!("connect timeout"));
                 error!(
                     "Proxy connect failed after {} attempts [{}] {} -> {}: {}",
                     MAX_RETRIES, proxy_name, src, target, e
@@ -905,34 +928,29 @@ impl ConnectionManager {
             rule: rule_str,
             rule_payload,
         };
-        self.connections.insert(conn_id.clone(), conn_info);
-        self.counters
-            .insert(conn_id.clone(), (up_counter.clone(), down_counter.clone()));
-        stats.add_connection();
-
         // mihomo compat: single info log per connection, logMetadata format
         // (tunnel.go:633-650): `match Type(payload) using Group[proxy]`,
         // distinct lines for GLOBAL/DIRECT modes and unmatched connections.
-        if let Some(ci) = self.connections.get(&conn_id) {
-            let chains_str = chain_display(&ci.chains);
+        {
+            let chains_str = chain_display(&conn_info.chains);
             if mode == "global" {
                 info!("[TCP] {} --> {} using GLOBAL", src, target);
             } else if mode == "direct" {
                 info!("[TCP] {} --> {} using DIRECT", src, target);
-            } else if ci.rule.is_empty() {
+            } else if conn_info.rule.is_empty() {
                 info!(
                     "[TCP] {} --> {} doesn't match any rule using {}",
                     src, target, chains_str
                 );
-            } else if !ci.rule_payload.is_empty() {
+            } else if !conn_info.rule_payload.is_empty() {
                 info!(
                     "[TCP] {} --> {} match {}({}) using {}",
-                    src, target, ci.rule, ci.rule_payload, chains_str
+                    src, target, conn_info.rule, conn_info.rule_payload, chains_str
                 );
             } else {
                 info!(
                     "[TCP] {} --> {} match {} using {}",
-                    src, target, ci.rule, chains_str
+                    src, target, conn_info.rule, chains_str
                 );
             }
         }
@@ -943,8 +961,16 @@ impl ConnectionManager {
         let relay_handle = tokio::spawn(async move {
             relay_bidirectional(local_plain, remote_counted).await;
         });
-        self.relay_handles
-            .insert(conn_id.clone(), relay_handle.abort_handle());
+        self.connections.insert(
+            conn_id.clone(),
+            ConnEntry {
+                info: conn_info,
+                upload: up_counter.clone(),
+                download: down_counter.clone(),
+                abort: relay_handle.abort_handle(),
+            },
+        );
+        stats.add_connection();
 
         // Wait for the relay to complete (normally or via abort from close_connection)
         let _ = relay_handle.await;
@@ -955,8 +981,6 @@ impl ConnectionManager {
         stats.add_upload(up);
         stats.add_download(down);
         stats.remove_connection();
-        self.relay_handles.remove(&conn_id);
-        self.counters.remove(&conn_id);
         self.connections.remove(&conn_id);
 
         Ok(())
@@ -964,11 +988,18 @@ impl ConnectionManager {
 
     /// Resolve a UDP datagram's destination through the rule engine.
     ///
+    /// `conn_type` is the inbound tag ("socks5" / "tproxy" / "tun") so IN-TYPE
+    /// and IN-PORT rules see the real inbound. `domain_override` carries a
+    /// client-supplied domain target (SOCKS5 UDP ATYP_DOMAIN) so DOMAIN rules
+    /// can match; `dst` is a placeholder 0.0.0.0 in that case.
+    ///
     /// Returns the `Action` to take and the resolved domain (if any).
     pub async fn resolve_udp_action(
         &self,
         src: SocketAddr,
         dst: SocketAddr,
+        conn_type: &'static str,
+        domain_override: Option<String>,
     ) -> (Action, Option<String>) {
         let dns = self.app.dns_resolver();
         let rules = self.app.rule_engine();
@@ -979,14 +1010,17 @@ impl ConnectionManager {
             rt.mode.clone()
         };
 
-        let domain = dns.reverse_lookup(&dst.ip());
+        let domain = domain_override.or_else(|| dns.reverse_lookup(&dst.ip()));
 
-        // mihomo compat: clear FakeIP from dst_ip (same as TCP path)
-        let rule_dst_ip = if dns.is_fake_ip(&dst.ip()) {
-            None
-        } else {
-            Some(dst.ip())
-        };
+        // mihomo compat: clear FakeIP from dst_ip (same as TCP path); an
+        // inbound-supplied domain uses an unspecified placeholder IP that must
+        // not leak into IP rules either.
+        let rule_dst_ip =
+            if dns.is_fake_ip(&dst.ip()) || (domain.is_some() && dst.ip().is_unspecified()) {
+                None
+            } else {
+                Some(dst.ip())
+            };
 
         let mut rule_meta = RuleMetadata {
             domain: domain.clone(),
@@ -997,26 +1031,12 @@ impl ConnectionManager {
             network: "udp",
             process_name: None,
             process_path: None,
-            in_port: Some(config.tproxy_port),
-            in_type: Some("tproxy"),
+            in_port: inbound_port(&config, conn_type),
+            in_type: Some(inbound_type_display(conn_type)),
             ..Default::default()
         };
 
-        // mihomo compat: tunnel.go match() — resolve the host to a real IP on
-        // demand when an IP rule (GEOIP / IP-CIDR / ... without no-resolve) is
-        // reached but dst_ip was blanked for FakeIP. Same as the TCP path.
-        if mode != "global"
-            && mode != "direct"
-            && rule_meta.dst_ip.is_none()
-            && rule_meta.domain.is_some()
-            && rules.needs_ip_resolution(&rule_meta)
-        {
-            if let Some(host) = rule_meta.domain.clone() {
-                if let Ok(ip) = dns.resolve_real_ip(&host).await {
-                    rule_meta.dst_ip = Some(ip);
-                }
-            }
-        }
+        resolve_ip_on_demand(&mode, &mut rule_meta, &rules, &dns).await;
 
         // mihomo compat: global mode routes to proxies["GLOBAL"]
         let proxies = self.app.proxy_manager();
@@ -1116,13 +1136,11 @@ impl ConnectionManager {
             .connections
             .iter()
             .map(|entry| {
-                let mut info = entry.value().clone();
+                let e = entry.value();
+                let mut info = e.info.clone();
                 // Read live counter values instead of the stale zeros stored at insert time
-                if let Some(counters) = self.counters.get(&info.id) {
-                    let (up, down) = counters.value();
-                    info.upload = up.load(Ordering::Relaxed);
-                    info.download = down.load(Ordering::Relaxed);
-                }
+                info.upload = e.upload.load(Ordering::Relaxed);
+                info.download = e.download.load(Ordering::Relaxed);
                 info
             })
             .collect();
@@ -1131,29 +1149,29 @@ impl ConnectionManager {
             download_total: self.app.stats.download_total(),
             upload_total: self.app.stats.upload_total(),
             connections,
-            memory: get_memory_usage(),
+            memory: crate::common::mem::get_memory_usage(),
         }
     }
 
     /// Close all active connections by aborting their relay tasks.
-    /// When aborted, the spawned relay task is cancelled and the underlying
-    /// streams are dropped, closing the TCP connections.
+    /// Both relay directions run inside the aborted task (no detached inner
+    /// spawns), so aborting drops both stream halves and closes the TCP
+    /// connections immediately.
     pub fn close_all(&self) {
-        for entry in self.relay_handles.iter() {
-            entry.value().abort();
+        for entry in self.connections.iter() {
+            entry.value().abort.abort();
         }
-        self.relay_handles.clear();
-        self.counters.clear();
         self.connections.clear();
     }
 
     /// Close a specific connection by ID, aborting its relay task.
     pub fn close_connection(&self, id: &str) -> bool {
-        if let Some((_, handle)) = self.relay_handles.remove(id) {
-            handle.abort();
+        if let Some((_, entry)) = self.connections.remove(id) {
+            entry.abort.abort();
+            true
+        } else {
+            false
         }
-        self.counters.remove(id);
-        self.connections.remove(id).is_some()
     }
 }
 
@@ -1177,11 +1195,7 @@ pub struct StatsManager {
 
 impl StatsManager {
     pub fn new() -> Self {
-        Self {
-            upload_total: AtomicU64::new(0),
-            download_total: AtomicU64::new(0),
-            active_connections: AtomicU64::new(0),
-        }
+        Self::default()
     }
 
     pub fn add_upload(&self, bytes: u64) {
@@ -1211,19 +1225,6 @@ impl StatsManager {
     pub fn active_connections(&self) -> u64 {
         self.active_connections.load(Ordering::Relaxed)
     }
-}
-
-fn get_memory_usage() -> u64 {
-    // Read /proc/self/statm for RSS
-    if let Ok(content) = std::fs::read_to_string("/proc/self/statm") {
-        let parts: Vec<&str> = content.split_whitespace().collect();
-        if parts.len() >= 2 {
-            if let Ok(pages) = parts[1].parse::<u64>() {
-                return pages * 4096; // page size
-            }
-        }
-    }
-    0
 }
 
 #[cfg(test)]
@@ -1314,10 +1315,10 @@ mod tests {
         let mut stream = CountingStream::new(inner, up.clone(), down.clone());
 
         let mut buf = vec![0u8; 10];
-        stream.read(&mut buf).await.unwrap();
-        stream.read(&mut buf).await.unwrap();
-        stream.write(b"12").await.unwrap();
-        stream.write(b"3456").await.unwrap();
+        assert_eq!(stream.read(&mut buf).await.unwrap(), 3);
+        assert_eq!(stream.read(&mut buf).await.unwrap(), 5);
+        assert_eq!(stream.write(b"12").await.unwrap(), 2);
+        assert_eq!(stream.write(b"3456").await.unwrap(), 4);
 
         assert_eq!(down.load(Ordering::Relaxed), 8); // 3 + 5
         assert_eq!(up.load(Ordering::Relaxed), 6); // 2 + 4
@@ -1396,6 +1397,30 @@ mod tests {
         stats.add_download(200);
         assert_eq!(stats.upload_total(), 150);
         assert_eq!(stats.download_total(), 200);
+    }
+
+    /// C1 regression: each inbound type maps to its own listener port and
+    /// mihomo Type.String() — redir/tproxy must not be lumped in as "tun".
+    #[test]
+    fn inbound_port_per_type() {
+        let config: crate::config::MiemieConfig = serde_yaml::from_str(
+            "port: 7890\nsocks-port: 7891\nredir-port: 7892\ntproxy-port: 7895\nmixed-port: 7893\n",
+        )
+        .unwrap();
+        assert_eq!(inbound_port(&config, "http-connect"), Some(7890));
+        assert_eq!(inbound_port(&config, "socks5"), Some(7891));
+        assert_eq!(inbound_port(&config, "redir"), Some(7892));
+        assert_eq!(inbound_port(&config, "tun"), Some(7892));
+        assert_eq!(inbound_port(&config, "tproxy"), Some(7895));
+    }
+
+    #[test]
+    fn inbound_type_display_maps_mihomo_names() {
+        assert_eq!(inbound_type_display("http-connect"), "HTTP");
+        assert_eq!(inbound_type_display("socks5"), "Socks5");
+        assert_eq!(inbound_type_display("redir"), "Redir");
+        assert_eq!(inbound_type_display("tproxy"), "TProxy");
+        assert_eq!(inbound_type_display("tun"), "Tun");
     }
 
     #[test]

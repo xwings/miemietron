@@ -325,7 +325,7 @@ mod tests {
             path: "/".to_string(),
             headers: vec![],
         };
-        let debug_str = format!("{:?}", opts);
+        let debug_str = format!("{opts:?}");
         assert!(debug_str.contains("test.com"));
         assert!(debug_str.contains("WsOptions"));
     }

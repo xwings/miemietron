@@ -6,7 +6,7 @@ Same CLI, same config, same REST API — for the OpenClash runtime surface.
 Anything outside that surface is explicitly carved out below; swap the binary
 for the in-scope set.
 
-**Single static musl binary, ~30k lines of Rust, 490 tests.**
+**Single static musl binary, ~30k lines of Rust, 498 tests.**
 
 This file is the control center: mission, scope, boot/connection flow, the
 OpenClash contract, and an Index of the per-subsystem docs under
@@ -30,7 +30,7 @@ Anything outside the lists below fails the config load with mihomo's verbatim
 |-------|-------|
 | Outbounds | `direct` / `reject` (built-in + user-defined), `ss`, `ssr`, `socks5`, `http`, `vmess`, `vless`, `trojan`, `snell`, `anytls` |
 | Inbounds | http, socks5, mixed, redir, tproxy, tun (system + gvisor). Configured via top-level `port` / `socks-port` / `mixed-port` / `redir-port` / `tproxy-port` / `tun:` only — the mihomo `listeners:` block is out of scope (rejected at load time). |
-| Transports | TCP, TLS, WS, gRPC, H2, XHTTP-over-H2, XTLS-Vision. **Reality is present but non-functional** (needs uTLS ClientHello control rustls can't provide) — see [ARCHITECTURE/transport.md](ARCHITECTURE/transport.md). |
+| Transports | TCP, TLS, WS, gRPC, H2, XHTTP-over-H2, XTLS-Vision, Reality. **Reality is functional** via a pinned rustls fork that carries the auth in the TLS 1.3 ClientHello session ID (`support-x25519mlkem768` is not implemented and errors rather than downgrading) — see [ARCHITECTURE/transport.md](ARCHITECTURE/transport.md). |
 | DNS | UDP, TCP, DoT (`tls://`), DoH (`https://`), system, fakeip, nameserver-policy, fallback with GeoIP anti-poison. `fake-ip-filter` supports plain patterns, `geosite:` and `rule-set:` entries. |
 | Rule providers | yaml + text formats (classical / domain / ipcidr); mrs format for `domain` behavior (OpenClash's meta-rules-dat lists) |
 | REST API | the routes implemented under `src/api/`: `/configs`, `/proxies`, `/group{,s}`, `/rules`, `/connections`, `/providers/proxies`, `/providers/rules`, `/dns/query`, `/logs`, `/traffic`, `/version`, `/memory`, UI. `/providers/rules` is partial-but-honest — see [ARCHITECTURE/api.md](ARCHITECTURE/api.md). |

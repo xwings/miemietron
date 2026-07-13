@@ -9,7 +9,9 @@ use tokio::net::UdpSocket;
 use tracing::{info, warn};
 
 /// Set IP_TRANSPARENT on a socket (allows binding to non-local addresses).
-fn set_ip_transparent(socket: &socket2::Socket) -> Result<()> {
+/// Shared by the TPROXY UDP socket here and the TPROXY TCP listener in
+/// `inbound::redir`.
+pub fn set_ip_transparent(socket: &socket2::Socket) -> Result<()> {
     let fd = socket.as_raw_fd();
     let on: libc::c_int = 1;
     let ret = unsafe {

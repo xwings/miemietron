@@ -75,15 +75,6 @@ pub trait OutboundHandler: Send + Sync {
     }
 }
 
-/// Subscription info parsed from proxy provider HTTP headers.
-#[derive(Debug, Clone, Default, serde::Serialize)]
-pub struct SubscriptionInfo {
-    pub upload: u64,
-    pub download: u64,
-    pub total: u64,
-    pub expire: u64,
-}
-
 /// Global options that apply to all proxies (routing mark, keepalive, etc.).
 /// Bundles related parameters to avoid too-many-arguments warnings.
 pub struct ProxyGlobalOpts {
@@ -97,34 +88,13 @@ pub struct ProxyGlobalOpts {
 /// Manages all configured proxies and provides lookup.
 pub struct ProxyManager {
     proxies: HashMap<String, Arc<dyn OutboundHandler>>,
-    group_configs: Vec<ProxyGroupConfig>,
     live_groups: HashMap<String, Arc<dyn ProxyGroup>>,
     provider_configs: HashMap<String, ProxyProviderConfig>,
-    subscription_info: HashMap<String, SubscriptionInfo>,
     /// Member proxy names for each proxy provider (for `/providers/proxies`).
     provider_proxy_names: HashMap<String, Vec<String>>,
-    /// Centralized per-proxy state store shared with all groups.
-    state_store: Arc<crate::proxy_group::proxy_state::ProxyStateStore>,
 }
 
 impl ProxyManager {
-    pub async fn new(
-        proxy_configs: &[ProxyConfig],
-        group_configs: &[ProxyGroupConfig],
-        providers: &HashMap<String, ProxyProviderConfig>,
-        global_opts: &ProxyGlobalOpts,
-    ) -> Result<Self> {
-        let state_store = Arc::new(crate::proxy_group::proxy_state::ProxyStateStore::new());
-        Self::with_state_store(
-            proxy_configs,
-            group_configs,
-            providers,
-            global_opts,
-            state_store,
-        )
-        .await
-    }
-
     pub async fn with_state_store(
         proxy_configs: &[ProxyConfig],
         group_configs: &[ProxyGroupConfig],
@@ -135,10 +105,6 @@ impl ProxyManager {
         let mut proxies: HashMap<String, Arc<dyn OutboundHandler>> = HashMap::new();
 
         let global_routing_mark = global_opts.routing_mark;
-        let global_tcp_concurrent = global_opts.tcp_concurrent;
-        let keep_alive_idle = global_opts.keep_alive_idle;
-        let keep_alive_interval = global_opts.keep_alive_interval;
-        let disable_keep_alive = global_opts.disable_keep_alive;
 
         // mihomo compat: DefaultRoutingMark starts at 0 in mihomo (dialer/options.go:14).
         // When no routing-mark is configured, mihomo does NOT set SO_MARK on sockets.
@@ -161,48 +127,24 @@ impl ProxyManager {
         // unsupported / invalid proxy for DIRECT (which would leak traffic).
         for (idx, config) in proxy_configs.iter().enumerate() {
             let mut cfg = config.clone();
-            if cfg.routing_mark.is_none() {
-                cfg.routing_mark = global_routing_mark;
-            }
-            if cfg.tcp_concurrent.is_none() && global_tcp_concurrent {
-                cfg.tcp_concurrent = Some(true);
-            }
-            // mihomo compat: inject global keepalive settings
-            if cfg.keep_alive_idle.is_none() {
-                cfg.keep_alive_idle = Some(keep_alive_idle);
-            }
-            if cfg.keep_alive_interval.is_none() {
-                cfg.keep_alive_interval = Some(keep_alive_interval);
-            }
-            if cfg.disable_keep_alive.is_none() {
-                cfg.disable_keep_alive = Some(disable_keep_alive);
-            }
-            let handler = Self::load_proxy_config(&cfg)
-                .map_err(|e| anyhow::anyhow!("proxy {}: {}", idx, e))?;
+            Self::apply_global_defaults(&mut cfg, global_opts);
+            let handler =
+                Self::load_proxy_config(&cfg).map_err(|e| anyhow::anyhow!("proxy {idx}: {e}"))?;
             proxies.insert(cfg.name.clone(), handler);
         }
 
         // Load proxy providers and add their proxies.
         // Track which proxy names come from each provider for group expansion.
         let mut provider_proxy_names: HashMap<String, Vec<String>> = HashMap::new();
-        let mut subscription_info: HashMap<String, SubscriptionInfo> = HashMap::new();
         for (prov_name, prov_config) in providers {
             match Self::load_proxy_provider(prov_name, prov_config).await {
-                Ok((provider_proxies, sub_info)) => {
-                    if let Some(info) = sub_info {
-                        subscription_info.insert(prov_name.clone(), info);
-                    }
+                Ok(provider_proxies) => {
                     let mut names = Vec::new();
                     // mihomo compat: provider.go:436-438 — any per-proxy parse
                     // error fails the provider load with `proxy %d error: %w`.
                     for (idx, pc) in provider_proxies.iter().enumerate() {
                         let mut cfg = pc.clone();
-                        if cfg.routing_mark.is_none() {
-                            cfg.routing_mark = global_routing_mark;
-                        }
-                        if cfg.tcp_concurrent.is_none() && global_tcp_concurrent {
-                            cfg.tcp_concurrent = Some(true);
-                        }
+                        Self::apply_global_defaults(&mut cfg, global_opts);
                         match Self::load_proxy_config(&cfg) {
                             Ok(handler) => {
                                 names.push(cfg.name.clone());
@@ -210,10 +152,7 @@ impl ProxyManager {
                             }
                             Err(e) => {
                                 return Err(anyhow::anyhow!(
-                                    "provider '{}' proxy {} error: {}",
-                                    prov_name,
-                                    idx,
-                                    e
+                                    "provider '{prov_name}' proxy {idx} error: {e}"
                                 ));
                             }
                         }
@@ -241,49 +180,9 @@ impl ProxyManager {
         for gc in group_configs {
             // Parse filter regexes (backtick-separated patterns)
             // mihomo compat: uses regexp2 (RE2-compatible), Rust regex crate is compatible
-            let filter_regs: Vec<Regex> = gc
-                .filter
-                .as_deref()
-                .filter(|s| !s.is_empty())
-                .map(|s| {
-                    s.split('`')
-                        .filter_map(|pat| match Regex::new(pat) {
-                            Ok(re) => Some(re),
-                            Err(e) => {
-                                tracing::warn!(
-                                    "Proxy group '{}': invalid filter regex '{}': {}",
-                                    gc.name,
-                                    pat,
-                                    e
-                                );
-                                None
-                            }
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-
-            let exclude_filter_regs: Vec<Regex> = gc
-                .exclude_filter
-                .as_deref()
-                .filter(|s| !s.is_empty())
-                .map(|s| {
-                    s.split('`')
-                        .filter_map(|pat| match Regex::new(pat) {
-                            Ok(re) => Some(re),
-                            Err(e) => {
-                                tracing::warn!(
-                                    "Proxy group '{}': invalid exclude-filter regex '{}': {}",
-                                    gc.name,
-                                    pat,
-                                    e
-                                );
-                                None
-                            }
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
+            let filter_regs = Self::parse_filter_regs(&gc.name, "filter", gc.filter.as_deref());
+            let exclude_filter_regs =
+                Self::parse_filter_regs(&gc.name, "exclude-filter", gc.exclude_filter.as_deref());
 
             let exclude_type_array: Vec<String> = gc
                 .exclude_type
@@ -403,7 +302,8 @@ impl ProxyManager {
                 });
             }
 
-            // mihomo compat: if no proxies remain after filtering, fall back to COMPATIBLE
+            // Warn when filtering leaves the group empty (mihomo falls back to
+            // a COMPATIBLE placeholder; we only log — no fallback is inserted).
             if all_proxies.is_empty() {
                 tracing::warn!("Proxy group '{}' has no proxies after filtering", gc.name);
             }
@@ -481,7 +381,7 @@ impl ProxyManager {
                     // mihomo compat: parser.go:198-199 — unknown group types
                     // fail the config load; degrading to a selector would
                     // silently change routing.
-                    return Err(anyhow::anyhow!("unsupport proxy group type: {}", other));
+                    return Err(anyhow::anyhow!("unsupport proxy group type: {other}"));
                 }
             };
             info!(
@@ -518,13 +418,57 @@ impl ProxyManager {
 
         Ok(Self {
             proxies,
-            group_configs: group_configs.to_vec(),
             live_groups,
             provider_configs: providers.clone(),
-            subscription_info,
             provider_proxy_names,
-            state_store,
         })
+    }
+
+    /// Apply global proxy options (routing mark, tcp-concurrent, keepalive) to
+    /// a proxy config that doesn't override them. Used for both directly
+    /// configured proxies and provider-sourced proxies.
+    fn apply_global_defaults(cfg: &mut ProxyConfig, global_opts: &ProxyGlobalOpts) {
+        if cfg.routing_mark.is_none() {
+            cfg.routing_mark = global_opts.routing_mark;
+        }
+        if cfg.tcp_concurrent.is_none() && global_opts.tcp_concurrent {
+            cfg.tcp_concurrent = Some(true);
+        }
+        // mihomo compat: inject global keepalive settings
+        if cfg.keep_alive_idle.is_none() {
+            cfg.keep_alive_idle = Some(global_opts.keep_alive_idle);
+        }
+        if cfg.keep_alive_interval.is_none() {
+            cfg.keep_alive_interval = Some(global_opts.keep_alive_interval);
+        }
+        if cfg.disable_keep_alive.is_none() {
+            cfg.disable_keep_alive = Some(global_opts.disable_keep_alive);
+        }
+    }
+
+    /// Parse backtick-separated filter regex patterns for a proxy group,
+    /// warning on (and skipping) any invalid pattern.
+    fn parse_filter_regs(group_name: &str, kind: &str, filter: Option<&str>) -> Vec<Regex> {
+        filter
+            .filter(|s| !s.is_empty())
+            .map(|s| {
+                s.split('`')
+                    .filter_map(|pat| match Regex::new(pat) {
+                        Ok(re) => Some(re),
+                        Err(e) => {
+                            tracing::warn!(
+                                "Proxy group '{}': invalid {} regex '{}': {}",
+                                group_name,
+                                kind,
+                                pat,
+                                e
+                            );
+                            None
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// Load a single proxy from config.
@@ -607,18 +551,26 @@ impl ProxyManager {
             other => {
                 // mihomo compat: parser.go:177 default case error wording
                 // (note the upstream typo "unsupport").
-                Err(anyhow::anyhow!("unsupport proxy type: {}", other))
+                Err(anyhow::anyhow!("unsupport proxy type: {other}"))
             }
         }
     }
 
+    /// Fetch an HTTP provider's URL and return the response body.
+    async fn fetch_provider_url(name: &str, config: &ProxyProviderConfig) -> Result<String> {
+        let url = config
+            .url
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("HTTP provider '{name}' has no URL"))?;
+        let resp = reqwest::get(url).await?;
+        Ok(resp.text().await?)
+    }
+
     /// Load proxies from a proxy provider (file or HTTP).
-    /// Returns proxies and optional subscription info from response headers.
     async fn load_proxy_provider(
         name: &str,
         config: &ProxyProviderConfig,
-    ) -> Result<(Vec<ProxyConfig>, Option<SubscriptionInfo>)> {
-        let mut sub_info = None;
+    ) -> Result<Vec<ProxyConfig>> {
         let content = match config.provider_type.as_str() {
             "file" => {
                 let path = config
@@ -634,18 +586,11 @@ impl ProxyManager {
                 if let Some(ref path) = config.path {
                     let pb = std::path::PathBuf::from(path);
                     if pb.exists() {
-                        tokio::fs::read_to_string(&pb).await.unwrap_or_default()
+                        tokio::fs::read_to_string(&pb).await.map_err(|e| {
+                            anyhow::anyhow!("failed to read proxy provider cache '{path}': {e}")
+                        })?
                     } else {
-                        let url = config
-                            .url
-                            .as_ref()
-                            .ok_or_else(|| anyhow::anyhow!("HTTP provider '{name}' has no URL"))?;
-                        let resp = reqwest::get(url).await?;
-                        // Parse subscription-userinfo header
-                        sub_info = parse_subscription_userinfo(
-                            resp.headers().get("subscription-userinfo"),
-                        );
-                        let text = resp.text().await?;
+                        let text = Self::fetch_provider_url(name, config).await?;
                         // Cache to disk
                         if let Some(parent) = pb.parent() {
                             tokio::fs::create_dir_all(parent).await.ok();
@@ -654,14 +599,7 @@ impl ProxyManager {
                         text
                     }
                 } else {
-                    let url = config
-                        .url
-                        .as_ref()
-                        .ok_or_else(|| anyhow::anyhow!("HTTP provider '{name}' has no URL"))?;
-                    let resp = reqwest::get(url).await?;
-                    sub_info =
-                        parse_subscription_userinfo(resp.headers().get("subscription-userinfo"));
-                    resp.text().await?
+                    Self::fetch_provider_url(name, config).await?
                 }
             }
             other => {
@@ -682,7 +620,7 @@ impl ProxyManager {
         let parsed: ProviderYaml = serde_yaml::from_str(&content)
             .map_err(|e| anyhow::anyhow!("failed to parse proxy provider '{name}' YAML: {e}"))?;
 
-        Ok((parsed.proxies, sub_info))
+        Ok(parsed.proxies)
     }
 
     /// Get an outbound handler by name.
@@ -726,10 +664,9 @@ impl ProxyManager {
                 .ok_or_else(|| anyhow::anyhow!("built-in REJECT-DROP handler missing")),
             Action::Proxy(name) => self.resolve(name).ok_or_else(|| {
                 anyhow::anyhow!(
-                    "rule selected proxy '{}' but it could not be resolved \
+                    "rule selected proxy '{name}' but it could not be resolved \
                      (unknown name, broken group chain, or resolution depth exceeded). \
-                     No silent DIRECT fallback — see ARCHITECTURE.md",
-                    name
+                     No silent DIRECT fallback — see ARCHITECTURE.md"
                 )
             }),
         }
@@ -754,9 +691,9 @@ impl ProxyManager {
     ) -> Result<Arc<dyn OutboundPacketConn>> {
         let handler = self
             .resolve(proxy_name)
-            .ok_or_else(|| anyhow::anyhow!("UDP proxy '{}' not found", proxy_name))?;
+            .ok_or_else(|| anyhow::anyhow!("UDP proxy '{proxy_name}' not found"))?;
         let pc_box = handler.connect_datagram(target, dns).await.map_err(|e| {
-            anyhow::anyhow!("UDP proxy '{}' connect_datagram failed: {}", proxy_name, e)
+            anyhow::anyhow!("UDP proxy '{proxy_name}' connect_datagram failed: {e}")
         })?;
         Ok(Arc::from(pc_box))
     }
@@ -791,23 +728,9 @@ impl ProxyManager {
         None
     }
 
-    /// Select a proxy within a named group. Returns true on success.
-    pub fn select_proxy(&self, group_name: &str, proxy_name: &str) -> bool {
-        if let Some(group) = self.live_groups.get(group_name) {
-            group.select(proxy_name)
-        } else {
-            false
-        }
-    }
-
     /// Get a live proxy group by name.
     pub fn get_group(&self, name: &str) -> Option<Arc<dyn ProxyGroup>> {
         self.live_groups.get(name).cloned()
-    }
-
-    /// Get all proxy names in a group.
-    pub fn group_proxy_names(&self, group_name: &str) -> Option<Vec<String>> {
-        self.live_groups.get(group_name).map(|g| g.all())
     }
 
     /// Get the internal proxies map (for health checks / delay tests).
@@ -829,11 +752,6 @@ impl ProxyManager {
                 udp: handler.supports_udp(),
             })
             .collect()
-    }
-
-    /// List all proxy group configs (for API).
-    pub fn list_groups(&self) -> &[ProxyGroupConfig] {
-        &self.group_configs
     }
 
     /// List all live proxy groups (for API — includes runtime state).
@@ -894,8 +812,9 @@ impl ProxyManager {
             .unwrap_or_default()
     }
 
-    /// Update a proxy provider by fetching its URL and reloading proxies.
-    /// Returns Ok(()) if the provider was found and the update was attempted.
+    /// Update a proxy provider by fetching its URL and caching the result to
+    /// disk. Takes effect on the next config reload — running proxies are not
+    /// swapped in place.
     pub async fn update_provider(&self, name: &str) -> Result<()> {
         let config = self
             .provider_configs
@@ -920,47 +839,14 @@ impl ProxyManager {
         if let Some(ref path) = config.path {
             let path = std::path::Path::new(path);
             if let Some(parent) = path.parent() {
-                let _ = std::fs::create_dir_all(parent);
+                let _ = tokio::fs::create_dir_all(parent).await;
             }
-            std::fs::write(path, &body)?;
+            tokio::fs::write(path, &body).await?;
             info!("Proxy provider '{}' saved to {}", name, path.display());
         }
 
         Ok(())
     }
-
-    /// Get subscription info for a provider.
-    pub fn get_subscription_info(&self, provider_name: &str) -> Option<&SubscriptionInfo> {
-        self.subscription_info.get(provider_name)
-    }
-
-    /// Get the shared proxy state store (for API and health checks).
-    pub fn state_store(&self) -> &Arc<crate::proxy_group::proxy_state::ProxyStateStore> {
-        &self.state_store
-    }
-}
-
-/// Parse the subscription-userinfo header value.
-/// Format: "upload=N; download=N; total=N; expire=N"
-fn parse_subscription_userinfo(
-    header: Option<&reqwest::header::HeaderValue>,
-) -> Option<SubscriptionInfo> {
-    let value = header?.to_str().ok()?;
-    let mut info = SubscriptionInfo::default();
-    for part in value.split(';') {
-        let part = part.trim();
-        if let Some((key, val)) = part.split_once('=') {
-            let val = val.trim().parse::<u64>().unwrap_or(0);
-            match key.trim() {
-                "upload" => info.upload = val,
-                "download" => info.download = val,
-                "total" => info.total = val,
-                "expire" => info.expire = val,
-                _ => {}
-            }
-        }
-    }
-    Some(info)
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -1103,12 +989,9 @@ type: dns
     fn make_test_manager(handlers: HashMap<String, Arc<dyn OutboundHandler>>) -> ProxyManager {
         ProxyManager {
             proxies: handlers,
-            group_configs: Vec::new(),
             live_groups: HashMap::new(),
             provider_configs: HashMap::new(),
-            subscription_info: HashMap::new(),
             provider_proxy_names: HashMap::new(),
-            state_store: Arc::new(crate::proxy_group::proxy_state::ProxyStateStore::new()),
         }
     }
 

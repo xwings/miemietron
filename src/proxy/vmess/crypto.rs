@@ -12,12 +12,11 @@
 //!
 //! For AES-128-GCM:
 //! - Key: body_key (16 bytes)
-//! - Nonce: count (2 bytes LE) + body_iv[2..12] (10 bytes) = 12 bytes
+//! - Nonce: count (2 bytes BE) + body_iv[2..12] (10 bytes) = 12 bytes
 //!
 //! For ChaCha20-Poly1305:
-//! - Key: MD5(body_key) + MD5(body_key) = 32 bytes (two MD5 hashes concatenated)
-//!   Actually V2Ray uses: generateChaChaKey(body_key) = MD5(body_key) + MD5(MD5(body_key))
-//!   Then nonce: count (2 bytes LE) + body_iv[2..12] (10 bytes) = 12 bytes
+//! - Key: MD5(body_key) + MD5(MD5(body_key)) = 32 bytes (two MD5 hashes concatenated)
+//! - Nonce: count (2 bytes BE) + body_iv[2..12] (10 bytes) = 12 bytes
 
 use aes_gcm::aead::Aead;
 use aes_gcm::{Aes128Gcm, KeyInit, Nonce as AesNonce};
@@ -31,8 +30,10 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use super::header::{resp_header_keys, sha256_16, RespHeaderKeys, VmessSecurity};
 
-/// Maximum VMess chunk payload size (V2Ray uses 2^14 - 1 = 16383, but we
-/// align to common practice of 16384 bytes).
+/// Maximum VMess chunk payload size. mihomo compat: the chunk length prefix is
+/// a 2-byte field, so a chunk carries at most 2^14 bytes of payload before the
+/// AEAD tag overhead; larger writes are split across chunks. Any server reading
+/// the length-prefixed AEAD chunk stream accepts this framing.
 const MAX_CHUNK_SIZE: usize = 16384;
 
 /// Build a 12-byte nonce from a counter and the body IV.
@@ -138,6 +139,18 @@ enum WriteState {
     NeedHeader(Vec<u8>),
     /// Ready to accept data for encryption.
     Ready,
+    /// Draining a previously-encrypted chunk to the inner stream.
+    ///
+    /// The chunk was encrypted exactly once (advancing the nonce counters) into
+    /// `buf`; `pos` tracks how much ciphertext has been handed to the inner
+    /// stream. `plaintext_len` is the plaintext byte count reported to the
+    /// caller once the whole chunk is flushed. mihomo compat: re-encrypting a
+    /// chunk would advance the nonce counters twice and desync the AEAD stream.
+    Flushing {
+        buf: Vec<u8>,
+        pos: usize,
+        plaintext_len: usize,
+    },
 }
 
 pin_project! {
@@ -400,8 +413,16 @@ impl<T: AsyncRead + AsyncWrite + Unpin> AsyncRead for VmessStream<T> {
                     match try_fill(this.inner.as_mut(), cx, this.read_raw, length_block_size) {
                         Poll::Ready(Ok(true)) => {}
                         Poll::Ready(Ok(false)) => {
-                            // Clean EOF between chunks.
-                            return Poll::Ready(Ok(()));
+                            // mihomo compat: a clean EOF between chunks is normal
+                            // end-of-stream, but EOF mid-length-header is a
+                            // truncation (io.EOF vs io.ErrUnexpectedEOF).
+                            if this.read_raw.is_empty() {
+                                return Poll::Ready(Ok(()));
+                            }
+                            return Poll::Ready(Err(io::Error::new(
+                                io::ErrorKind::UnexpectedEof,
+                                "VMess chunk length truncated",
+                            )));
                         }
                         Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                         Poll::Pending => return Poll::Pending,
@@ -505,7 +526,37 @@ impl<T: AsyncRead + AsyncWrite + Unpin> AsyncWrite for VmessStream<T> {
             *this.write_state = WriteState::Ready;
         }
 
-        // Encrypt and write the data chunk.
+        // Drain any chunk that was already encrypted on a prior call. The chunk
+        // is encrypted exactly once (see WriteState::Flushing); we only report
+        // its plaintext length once the whole ciphertext has been handed over.
+        if let WriteState::Flushing {
+            ref buf,
+            ref mut pos,
+            plaintext_len,
+        } = this.write_state
+        {
+            let plaintext_len = *plaintext_len;
+            while *pos < buf.len() {
+                match this.inner.as_mut().poll_write(cx, &buf[*pos..]) {
+                    Poll::Ready(Ok(n)) => {
+                        if n == 0 {
+                            return Poll::Ready(Err(io::Error::new(
+                                io::ErrorKind::WriteZero,
+                                "VMess chunk write returned 0",
+                            )));
+                        }
+                        *pos += n;
+                    }
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                    Poll::Pending => return Poll::Pending,
+                }
+            }
+            *this.write_state = WriteState::Ready;
+            return Poll::Ready(Ok(plaintext_len));
+        }
+
+        // Encrypt the data chunk exactly once into a persistent buffer, then
+        // drain it. Nonce counters advance here and only here per chunk.
         let chunk_size = buf.len().min(MAX_CHUNK_SIZE);
         let data = &buf[..chunk_size];
 
@@ -527,7 +578,9 @@ impl<T: AsyncRead + AsyncWrite + Unpin> AsyncWrite for VmessStream<T> {
         combined.extend_from_slice(&encrypted_length);
         combined.extend_from_slice(&encrypted_payload);
 
-        // Write the combined chunk. We need to write all of it.
+        // Write the combined chunk. On a Pending mid-write, park the remainder
+        // in Flushing and return Pending — the executor re-polls when the inner
+        // stream is writable, so we never re-encrypt or busy-spin.
         let mut pos = 0;
         while pos < combined.len() {
             match this.inner.as_mut().poll_write(cx, &combined[pos..]) {
@@ -542,13 +595,11 @@ impl<T: AsyncRead + AsyncWrite + Unpin> AsyncWrite for VmessStream<T> {
                 }
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 Poll::Pending => {
-                    if pos > 0 {
-                        // Partial write of encrypted data -- we can't recover partially.
-                        // This is a fundamental limitation: the whole chunk must go out.
-                        // In practice, this loop will complete because TCP buffers are
-                        // large enough for our chunks.
-                        continue;
-                    }
+                    *this.write_state = WriteState::Flushing {
+                        buf: combined,
+                        pos,
+                        plaintext_len: chunk_size,
+                    };
                     return Poll::Pending;
                 }
             }
@@ -629,6 +680,33 @@ mod tests {
         assert_eq!(&encrypted, plaintext);
         let decrypted = cipher.decrypt(&nonce, &encrypted).unwrap();
         assert_eq!(&decrypted, plaintext);
+    }
+
+    #[tokio::test]
+    async fn poll_write_survives_pending_mid_chunk() {
+        use tokio::io::AsyncWriteExt;
+
+        // With VmessSecurity::None the ciphertext equals the plaintext (no tag),
+        // so a "hello" write frames as [len_be(2)] + "hello" = 7 wire bytes.
+        // The mock accepts 5 bytes, then returns Pending, then the remaining 2.
+        // If poll_write re-encrypted after Pending it would advance the nonce
+        // counters twice and corrupt the framing; this asserts it does not.
+        let mock = tokio_test::io::Builder::new()
+            .write(b"\x00\x05hel")
+            .wait(std::time::Duration::from_millis(1))
+            .write(b"lo")
+            .build();
+
+        let mut stream = VmessStream::new(
+            mock,
+            Vec::new(),
+            [0u8; 16],
+            [0u8; 16],
+            0,
+            VmessSecurity::None,
+        );
+
+        stream.write_all(b"hello").await.unwrap();
     }
 
     #[test]

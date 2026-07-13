@@ -145,14 +145,13 @@ async fn handle_socks5(
     let (host, port) = read_address(&mut stream, atyp).await?;
 
     // Build dst SocketAddr and host_override (for domain targets)
-    let (dst, host_override) = if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-        (SocketAddr::new(ip, port), None)
-    } else {
+    let (dst, host_override) = match host.parse::<std::net::IpAddr>() {
+        Ok(ip) => (SocketAddr::new(ip, port), None),
         // Domain target — use placeholder IP, pass domain via host_override
-        (
+        Err(_) => (
             SocketAddr::new(std::net::IpAddr::V4(Ipv4Addr::UNSPECIFIED), port),
-            Some(host.clone()),
-        )
+            Some(host),
+        ),
     };
 
     match cmd {
@@ -187,7 +186,7 @@ async fn handle_socks5(
                     interval.tick().await;
                     let now = Instant::now();
                     reaper_table.retain(|_key, session: &mut SocksUdpSession| {
-                        now.duration_since(session.last_active) < Duration::from_secs(60)
+                        now.duration_since(session.last_active) < timeout_dur
                     });
                 }
             });
@@ -213,12 +212,16 @@ async fn handle_socks5(
                         continue; // Fragmentation not supported
                     }
 
+                    // Parse the header once into the target Address plus the
+                    // SocketAddr used for rule-engine resolution (UNSPECIFIED
+                    // placeholder for domain targets).
                     let atyp = buf[3];
-                    let (host, port, data_offset) = match atyp {
+                    let (target, dst_sockaddr, data_offset) = match atyp {
                         ATYP_IPV4 if n >= 10 => {
                             let ip = Ipv4Addr::new(buf[4], buf[5], buf[6], buf[7]);
                             let port = u16::from_be_bytes([buf[8], buf[9]]);
-                            (ip.to_string(), port, 10)
+                            let sa = SocketAddr::new(ip.into(), port);
+                            (Address::ip(sa), sa, 10)
                         }
                         ATYP_DOMAIN if n > 5 => {
                             let dlen = buf[4] as usize;
@@ -227,7 +230,11 @@ async fn handle_socks5(
                             }
                             let host = String::from_utf8_lossy(&buf[5..5 + dlen]).to_string();
                             let port = u16::from_be_bytes([buf[5 + dlen], buf[6 + dlen]]);
-                            (host, port, 7 + dlen)
+                            (
+                                Address::Domain(host, port),
+                                SocketAddr::new(std::net::IpAddr::V4(Ipv4Addr::UNSPECIFIED), port),
+                                7 + dlen,
+                            )
                         }
                         ATYP_IPV6 if n >= 22 => {
                             let ip = Ipv6Addr::from([
@@ -236,38 +243,20 @@ async fn handle_socks5(
                                 buf[19],
                             ]);
                             let port = u16::from_be_bytes([buf[20], buf[21]]);
-                            (ip.to_string(), port, 22)
+                            let sa = SocketAddr::new(ip.into(), port);
+                            (Address::ip(sa), sa, 22)
                         }
                         _ => continue,
                     };
 
                     let data = buf[data_offset..n].to_vec();
-                    // Save the raw SOCKS5 header (atyp + addr portion) for building
-                    // response headers on the reverse path.
-                    let header_bytes = buf[3..data_offset].to_vec();
 
                     debug!(
-                        "SOCKS5 UDP relay: {} -> {}:{} ({} bytes)",
+                        "SOCKS5 UDP relay: {} -> {} ({} bytes)",
                         src,
-                        host,
-                        port,
+                        target,
                         data.len()
                     );
-
-                    // Build target Address from parsed host/port
-                    let target = if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-                        Address::ip(SocketAddr::new(ip, port))
-                    } else {
-                        Address::domain(&host, port)
-                    };
-
-                    // Build a SocketAddr for rule engine resolution.
-                    // For domain targets, use UNSPECIFIED as placeholder IP.
-                    let dst_sockaddr = if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-                        SocketAddr::new(ip, port)
-                    } else {
-                        SocketAddr::new(std::net::IpAddr::V4(Ipv4Addr::UNSPECIFIED), port)
-                    };
 
                     let nat_key = (src, target.clone());
 
@@ -284,6 +273,11 @@ async fn handle_socks5(
                         continue;
                     }
 
+                    // Save the raw SOCKS5 header (atyp + addr portion) for
+                    // building response headers on the reverse path — only
+                    // needed when creating a new session.
+                    let header_bytes = buf[3..data_offset].to_vec();
+
                     // New session: resolve action through rule engine and create
                     // OutboundPacketConn
                     let cm_ref = cm.clone();
@@ -296,13 +290,20 @@ async fn handle_socks5(
                         {
                             Ok(outbound) => {
                                 let pc_rev = outbound.clone();
-                                nat_ref.insert(
-                                    nat_key.clone(),
-                                    SocksUdpSession {
-                                        outbound,
-                                        last_active: Instant::now(),
-                                    },
-                                );
+                                // Re-check under the entry lock: a concurrent
+                                // datagram may have registered a session for
+                                // this key while we were dialing. Keep the
+                                // registered one and drop ours (the datagram
+                                // already went out through our outbound).
+                                match nat_ref.entry(nat_key.clone()) {
+                                    dashmap::mapref::entry::Entry::Occupied(_) => return,
+                                    dashmap::mapref::entry::Entry::Vacant(v) => {
+                                        v.insert(SocksUdpSession {
+                                            outbound,
+                                            last_active: Instant::now(),
+                                        });
+                                    }
+                                }
 
                                 // Spawn reverse-path relay: outbound -> client
                                 let nat_rev = nat_ref.clone();
@@ -346,20 +347,25 @@ async fn handle_socks5(
                                             }
                                             Err(_) => {
                                                 debug!(
-                                                    "SOCKS5 UDP session {} -> {}:{} timed out",
-                                                    src, host, port
+                                                    "SOCKS5 UDP session {} -> {} timed out",
+                                                    src, nat_key_rev.1
                                                 );
                                                 break;
                                             }
                                         }
                                     }
-                                    nat_rev.remove(&nat_key_rev);
+                                    // Remove only OUR session — a session
+                                    // recreated for this key after we exit
+                                    // must not be torn down by us.
+                                    nat_rev.remove_if(&nat_key_rev, |_, s| {
+                                        Arc::ptr_eq(&s.outbound, &pc_rev)
+                                    });
                                 });
                             }
                             Err(e) => {
                                 debug!(
-                                    "SOCKS5 UDP session creation failed for {} -> {}:{}: {}",
-                                    src, host, port, e
+                                    "SOCKS5 UDP session creation failed for {} -> {}: {}",
+                                    src, target, e
                                 );
                             }
                         }
@@ -402,8 +408,15 @@ async fn create_socks_udp_session(
     target: &Address,
     conn_manager: &ConnectionManager,
 ) -> Result<Arc<dyn OutboundPacketConn>> {
-    // Run rule engine to decide action
-    let (action, domain) = conn_manager.resolve_udp_action(src, dst).await;
+    // Run rule engine to decide action. Domain targets pass the parsed host
+    // through so DOMAIN rules can match (dst is a 0.0.0.0 placeholder then).
+    let domain_override = match target {
+        Address::Domain(host, _) => Some(host.clone()),
+        Address::Ip(_) => None,
+    };
+    let (action, domain) = conn_manager
+        .resolve_udp_action(src, dst, "socks5", domain_override)
+        .await;
 
     let dns = conn_manager.dns_resolver();
     let proxies = conn_manager.proxy_manager();

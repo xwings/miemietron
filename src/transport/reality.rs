@@ -1,308 +1,360 @@
-//! VLESS Reality transport.
+//! Mihomo-compatible REALITY client transport.
 //!
-//! Reality makes proxy traffic indistinguishable from a legitimate TLS
-//! connection to a camouflage website (e.g. `www.microsoft.com`).  The
-//! client performs a real TLS handshake with the proxy server using the
-//! camouflage SNI.  Authentication is performed out-of-band via an
-//! x25519 shared secret embedded in the TLS session ID.
-//!
-//! After the TLS connection is established the client sends a Reality
-//! authentication header in the first application-data record.  The
-//! server verifies the HMAC and then proxies data normally.
-//!
-//! # Wire format of the Reality auth header
-//!
-//! ```text
-//! [ client_public_key: 32 bytes ]
-//! [ timestamp:          8 bytes (big-endian unix seconds) ]
-//! [ short_id_len:       1 byte  ]
-//! [ short_id:           variable ]
-//! [ hmac:              32 bytes (HMAC-SHA256) ]
-//! ```
+//! REALITY authentication is carried inside the TLS 1.3 ClientHello session
+//! ID. It is not an application-data header and has no acknowledgement byte.
+//! The TLS implementation used here exposes the key-share and ClientHello hook
+//! needed to implement the same wire flow as mihomo/Xray.
 
 use anyhow::{Context, Result};
-use hmac::{Hmac, Mac};
-use sha2::Sha256;
+use base64::Engine as _;
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::client::RealityConfig as RustlsRealityConfig;
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::{CertificateError, DigitallySignedStruct, Error as TlsError, SignatureScheme};
 use std::sync::Arc;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_rustls::client::TlsStream;
 use tracing::debug;
-use x25519_dalek::{EphemeralSecret, PublicKey};
 
 use super::fingerprint::{self, TlsFingerprint};
-use super::tls::TlsOptions;
 
-type HmacSha256 = Hmac<Sha256>;
+/// REALITY protocol version sent by current mihomo Meta.
+const MIHOMO_REALITY_VERSION: [u8; 3] = [1, 8, 2];
+const MAX_SHORT_ID_LEN: usize = 8;
 
-/// Configuration for a Reality connection, parsed from proxy config.
+/// Runtime-only configuration for a REALITY connection.
 #[derive(Debug, Clone)]
 pub struct RealityConfig {
-    /// Server's x25519 public key (32 bytes).
+    /// Server's X25519 public key.
     pub public_key: [u8; 32],
-    /// Short ID used to identify the client to the server (hex-decoded).
-    pub short_id: Vec<u8>,
-    /// Camouflage SNI (e.g. "www.microsoft.com").
+    /// Client short ID, zero-padded exactly as mihomo does.
+    pub short_id: [u8; MAX_SHORT_ID_LEN],
+    /// Camouflage SNI.
     pub server_name: String,
-    /// TLS fingerprint to use for the ClientHello.
+    /// Requested ClientHello fingerprint family.
     pub fingerprint: TlsFingerprint,
+    /// ALPN values to place in the ClientHello.
+    pub alpn: Vec<String>,
 }
 
 impl RealityConfig {
-    /// Parse a `RealityConfig` from proxy configuration fields.
-    ///
-    /// `public_key_b64` is base64-encoded, `short_id_hex` is hex-encoded,
-    /// `server_name` is the camouflage SNI, and `fingerprint` is the
-    /// browser fingerprint string.
+    /// Parse mihomo `reality-opts` without retaining encoded config strings.
     pub fn from_opts(
         public_key_b64: &str,
         short_id_hex: &str,
         server_name: String,
         fingerprint: TlsFingerprint,
+        alpn: Vec<String>,
+        support_x25519mlkem768: bool,
     ) -> Result<Self> {
-        // The public key is typically base64-encoded in config files.
-        let pk_bytes = base64::Engine::decode(
-            &base64::engine::general_purpose::STANDARD,
-            public_key_b64.trim(),
-        )
-        .context("Reality: invalid base64 public key")?;
-
-        if pk_bytes.len() != 32 {
+        if support_x25519mlkem768 {
             anyhow::bail!(
-                "Reality: public key must be 32 bytes, got {}",
-                pk_bytes.len()
+                "REALITY: support-x25519mlkem768 is not implemented; refusing to downgrade silently"
             );
         }
-        let mut public_key = [0u8; 32];
-        public_key.copy_from_slice(&pk_bytes);
+        if fingerprint == TlsFingerprint::None {
+            anyhow::bail!("REALITY: a supported client-fingerprint is required");
+        }
 
-        let short_id = hex::decode(short_id_hex.trim()).context("Reality: invalid hex short_id")?;
+        // Mihomo uses base64.RawURLEncoding: URL-safe alphabet, no padding.
+        let pk_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(public_key_b64.trim())
+            .context("REALITY: invalid raw URL-safe Base64 public key")?;
+        let public_key: [u8; 32] = pk_bytes.try_into().map_err(|bytes: Vec<u8>| {
+            anyhow::anyhow!(
+                "REALITY: public key must decode to 32 bytes, got {}",
+                bytes.len()
+            )
+        })?;
+
+        let decoded_short_id =
+            hex::decode(short_id_hex.trim()).context("REALITY: invalid hexadecimal short-id")?;
+        if decoded_short_id.len() > MAX_SHORT_ID_LEN {
+            anyhow::bail!(
+                "REALITY: short-id must be at most {MAX_SHORT_ID_LEN} bytes, got {}",
+                decoded_short_id.len()
+            );
+        }
+        let mut short_id = [0u8; MAX_SHORT_ID_LEN];
+        short_id[..decoded_short_id.len()].copy_from_slice(&decoded_short_id);
 
         Ok(Self {
             public_key,
             short_id,
             server_name,
             fingerprint,
+            alpn,
         })
     }
 }
 
-/// Build the Reality authentication header.
+/// Inner verifier used by rustls's REALITY verifier.
 ///
-/// This is sent as the first application-data record after the TLS
-/// handshake completes.  The server verifies the HMAC to authenticate
-/// the client without any additional round-trip.
-fn build_auth_header(
-    client_public: &[u8; 32],
-    shared_secret: &[u8; 32],
-    short_id: &[u8],
-) -> Vec<u8> {
-    let timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-
-    // Derive auth key: HMAC-SHA256(shared_secret, "Reality")
-    let mut auth_mac =
-        HmacSha256::new_from_slice(shared_secret).expect("HMAC accepts any key size");
-    auth_mac.update(b"Reality");
-    let auth_key = auth_mac.finalize().into_bytes();
-
-    // Compute HMAC over (client_public || timestamp || short_id)
-    let mut hmac = HmacSha256::new_from_slice(&auth_key).expect("HMAC accepts any key size");
-    hmac.update(client_public);
-    hmac.update(&timestamp.to_be_bytes());
-    hmac.update(short_id);
-    let tag = hmac.finalize().into_bytes();
-
-    // Assemble the header
-    let mut header = Vec::with_capacity(32 + 8 + 1 + short_id.len() + 32);
-    header.extend_from_slice(client_public);
-    header.extend_from_slice(&timestamp.to_be_bytes());
-    header.push(short_id.len() as u8);
-    header.extend_from_slice(short_id);
-    header.extend_from_slice(&tag);
-    header
+/// The fork first authenticates a REALITY certificate using
+/// HMAC-SHA512(auth_key, Ed25519 public key), then delegates non-REALITY
+/// certificates to this verifier. Always rejecting here makes successful TLS
+/// synonymous with successful REALITY authentication; a camouflage site's
+/// ordinary valid certificate must never be accepted as the proxy server.
+#[derive(Debug)]
+struct RealityOnlyVerifier {
+    schemes: Vec<SignatureScheme>,
 }
 
-/// Establish a Reality connection over a raw TCP stream.
-///
-/// 1. Performs a genuine TLS handshake with the camouflage SNI and the
-///    configured browser fingerprint.
-/// 2. Generates an ephemeral x25519 keypair and computes the shared
-///    secret with the server's public key.
-/// 3. Sends the Reality authentication header in the first TLS record.
-/// 4. Returns the authenticated TLS stream ready for proxy protocol
-///    framing (VLESS/Trojan).
+impl ServerCertVerifier for RealityOnlyVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> std::result::Result<ServerCertVerified, TlsError> {
+        Err(TlsError::InvalidCertificate(
+            CertificateError::UnknownIssuer,
+        ))
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, TlsError> {
+        Err(TlsError::InvalidCertificate(CertificateError::BadSignature))
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, TlsError> {
+        Err(TlsError::InvalidCertificate(CertificateError::BadSignature))
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.schemes.clone()
+    }
+}
+
+/// Establish a REALITY-authenticated TLS 1.3 stream.
 pub async fn wrap_reality<S>(stream: S, config: &RealityConfig) -> Result<TlsStream<S>>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     debug!(
-        "Reality: connecting with SNI={}, fingerprint={}",
+        "REALITY: connecting with SNI={}, fingerprint={}",
         config.server_name, config.fingerprint
     );
 
-    let client_secret = EphemeralSecret::random_from_rng(rand::thread_rng());
-    let client_public = PublicKey::from(&client_secret);
-    let server_public = PublicKey::from(config.public_key);
-    let shared_secret = client_secret.diffie_hellman(&server_public);
+    let provider = fingerprint::make_crypto_provider(config.fingerprint);
+    let schemes = provider
+        .signature_verification_algorithms
+        .supported_schemes();
+    let reality = RustlsRealityConfig::new(config.public_key, config.short_id.to_vec())
+        .context("REALITY: invalid protocol configuration")?
+        .with_client_version(MIHOMO_REALITY_VERSION);
 
-    let fp = config.fingerprint;
-    let provider = fingerprint::make_crypto_provider(fp);
-
-    // Determine ALPN: use browser-matching defaults for Reality since
-    // the camouflage site expects normal browser behaviour.
-    let alpn = fingerprint::default_alpn_for(fp);
-
-    let tls_opts = TlsOptions {
-        sni: config.server_name.clone(),
-        skip_cert_verify: true, // Server uses camouflage cert, not its own
-        alpn,
-        fingerprint: Some(config.fingerprint.to_string()),
-    };
-
-    // Build rustls ClientConfig with the fingerprinted provider
-    let mut root_store = rustls::RootCertStore::empty();
-    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-
-    let tls_config = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
+    let mut tls_config = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
         .with_safe_default_protocol_versions()
-        .map_err(|e| anyhow::anyhow!("Reality: TLS version config error: {e}"))?
+        .map_err(|error| anyhow::anyhow!("REALITY: TLS version configuration failed: {error}"))?
         .dangerous()
-        .with_custom_certificate_verifier(Arc::new(super::tls::NoVerifier::new()))
+        .with_custom_certificate_verifier(Arc::new(RealityOnlyVerifier { schemes }))
+        .with_reality(reality)
         .with_no_client_auth();
 
-    let mut tls_config = tls_config;
-    if !tls_opts.alpn.is_empty() {
-        tls_config.alpn_protocols = tls_opts
-            .alpn
-            .iter()
-            .map(|s| s.as_bytes().to_vec())
-            .collect();
-    }
+    tls_config.alpn_protocols = config
+        .alpn
+        .iter()
+        .map(|protocol| protocol.as_bytes().to_vec())
+        .collect();
+    tls_config.resumption = rustls::client::Resumption::disabled();
 
-    let server_name = rustls::pki_types::ServerName::try_from(config.server_name.clone())
-        .map_err(|e| anyhow::anyhow!("Reality: invalid SNI '{}': {}", config.server_name, e))?
+    let server_name = ServerName::try_from(config.server_name.clone())
+        .map_err(|error| anyhow::anyhow!("REALITY: invalid SNI: {error}"))?
         .to_owned();
 
-    let connector = tokio_rustls::TlsConnector::from(Arc::new(tls_config));
-    let mut tls_stream = connector
+    let tls_stream = tokio_rustls::TlsConnector::from(Arc::new(tls_config))
         .connect(server_name, stream)
         .await
-        .map_err(|e| anyhow::anyhow!("Reality: TLS handshake failed: {e}"))?;
+        .map_err(|error| {
+            anyhow::anyhow!("REALITY: TLS handshake/authentication failed: {error}")
+        })?;
 
-    let auth_header = build_auth_header(
-        client_public.as_bytes(),
-        shared_secret.as_bytes(),
-        &config.short_id,
-    );
-
-    tls_stream
-        .write_all(&auth_header)
-        .await
-        .context("Reality: failed to send auth header")?;
-    tls_stream
-        .flush()
-        .await
-        .context("Reality: failed to flush auth header")?;
-
-    // The server responds with a single byte: 0x00 = success.
-    let mut ack = [0u8; 1];
-    tls_stream
-        .read_exact(&mut ack)
-        .await
-        .context("Reality: failed to read server acknowledgment")?;
-
-    if ack[0] != 0x00 {
-        anyhow::bail!(
-            "Reality: server rejected authentication (code: 0x{:02x})",
-            ack[0]
-        );
-    }
-
-    debug!("Reality: authenticated successfully");
+    debug!("REALITY: authentication succeeded");
     Ok(tls_stream)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aes_gcm::aead::{Aead, Payload};
+    use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use sha2::Sha256;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use tokio::io::AsyncReadExt;
+    use x25519_dalek::{PublicKey, StaticSecret};
 
-    #[test]
-    fn auth_header_structure() {
-        let client_pub = [0xAA; 32];
-        let shared_secret = [0xBB; 32];
-        let short_id = vec![0x01, 0x02, 0x03, 0x04];
-
-        let header = build_auth_header(&client_pub, &shared_secret, &short_id);
-
-        // client_public (32) + timestamp (8) + short_id_len (1) + short_id (4) + hmac (32)
-        assert_eq!(header.len(), 32 + 8 + 1 + 4 + 32);
-
-        // Verify client public key is at the start
-        assert_eq!(&header[..32], &[0xAA; 32]);
-
-        // Verify short_id_len
-        assert_eq!(header[40], 4);
-
-        // Verify short_id
-        assert_eq!(&header[41..45], &[0x01, 0x02, 0x03, 0x04]);
+    fn encoded_key(bytes: [u8; 32]) -> String {
+        URL_SAFE_NO_PAD.encode(bytes)
     }
 
-    #[test]
-    fn auth_header_empty_short_id() {
-        let client_pub = [0x00; 32];
-        let shared_secret = [0xFF; 32];
-        let short_id = vec![];
-
-        let header = build_auth_header(&client_pub, &shared_secret, &short_id);
-        // 32 + 8 + 1 + 0 + 32 = 73
-        assert_eq!(header.len(), 73);
-        assert_eq!(header[40], 0); // short_id_len = 0
-    }
-
-    #[test]
-    fn config_from_opts_valid() {
-        // 32 zero bytes base64-encoded
-        let pk_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &[0u8; 32]);
-        let config = RealityConfig::from_opts(
-            &pk_b64,
-            "aabbccdd",
-            "www.example.com".to_string(),
+    fn config(public_key: [u8; 32], short_id: &str) -> RealityConfig {
+        RealityConfig::from_opts(
+            &encoded_key(public_key),
+            short_id,
+            "example.com".to_string(),
             TlsFingerprint::Chrome,
+            vec!["h2".to_string(), "http/1.1".to_string()],
+            false,
         )
-        .unwrap();
-
-        assert_eq!(config.public_key, [0u8; 32]);
-        assert_eq!(config.short_id, vec![0xaa, 0xbb, 0xcc, 0xdd]);
-        assert_eq!(config.server_name, "www.example.com");
-        assert_eq!(config.fingerprint, TlsFingerprint::Chrome);
+        .unwrap()
     }
 
     #[test]
-    fn config_from_opts_bad_key_length() {
-        let pk_b64 = base64::Engine::encode(
-            &base64::engine::general_purpose::STANDARD,
-            &[0u8; 16], // wrong length
-        );
-        let result = RealityConfig::from_opts(
-            &pk_b64,
-            "00",
-            "example.com".to_string(),
-            TlsFingerprint::None,
-        );
-        assert!(result.is_err());
+    fn parses_raw_urlsafe_public_key_and_pads_short_id() {
+        let parsed = config([0xff; 32], "a1b2c3");
+        assert_eq!(parsed.public_key, [0xff; 32]);
+        assert_eq!(parsed.short_id, [0xa1, 0xb2, 0xc3, 0, 0, 0, 0, 0]);
     }
 
     #[test]
-    fn config_from_opts_bad_hex() {
-        let pk_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &[0u8; 32]);
-        let result = RealityConfig::from_opts(
-            &pk_b64,
-            "ZZZZ", // invalid hex
+    fn rejects_padded_or_standard_base64() {
+        let padded = format!("{}=", encoded_key([0xff; 32]));
+        assert!(RealityConfig::from_opts(
+            &padded,
+            "",
             "example.com".to_string(),
-            TlsFingerprint::None,
-        );
-        assert!(result.is_err());
+            TlsFingerprint::Chrome,
+            vec![],
+            false,
+        )
+        .is_err());
+
+        let standard = base64::engine::general_purpose::STANDARD.encode([0xff; 32]);
+        assert!(RealityConfig::from_opts(
+            &standard,
+            "",
+            "example.com".to_string(),
+            TlsFingerprint::Chrome,
+            vec![],
+            false,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn validates_short_id_and_hybrid_option() {
+        assert!(RealityConfig::from_opts(
+            &encoded_key([1; 32]),
+            "001122334455667788",
+            "example.com".to_string(),
+            TlsFingerprint::Chrome,
+            vec![],
+            false,
+        )
+        .is_err());
+        assert!(RealityConfig::from_opts(
+            &encoded_key([1; 32]),
+            "not-hex",
+            "example.com".to_string(),
+            TlsFingerprint::Chrome,
+            vec![],
+            false,
+        )
+        .is_err());
+        assert!(RealityConfig::from_opts(
+            &encoded_key([1; 32]),
+            "",
+            "example.com".to_string(),
+            TlsFingerprint::Chrome,
+            vec![],
+            true,
+        )
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn client_hello_contains_mihomo_reality_session_id() {
+        let server_secret = StaticSecret::from([0x42; 32]);
+        let server_public = PublicKey::from(&server_secret).to_bytes();
+        let config = config(server_public, "01020304");
+        let (client_io, mut server_io) = tokio::io::duplex(4096);
+
+        let client = tokio::spawn(async move { wrap_reality(client_io, &config).await });
+
+        let mut record_header = [0u8; 5];
+        server_io.read_exact(&mut record_header).await.unwrap();
+        assert_eq!(record_header[0], 0x16);
+        let record_len = u16::from_be_bytes([record_header[3], record_header[4]]) as usize;
+        let mut hello = vec![0u8; record_len];
+        server_io.read_exact(&mut hello).await.unwrap();
+
+        assert_eq!(hello[0], 0x01);
+        assert_eq!(hello[38], 32);
+        let client_random: [u8; 32] = hello[6..38].try_into().unwrap();
+        let encrypted_session_id = &hello[39..71];
+        assert_ne!(encrypted_session_id, &[0u8; 32]);
+
+        let client_public = extract_x25519_key_share(&hello).unwrap();
+        let shared_secret = server_secret
+            .diffie_hellman(&PublicKey::from(client_public))
+            .to_bytes();
+        let auth_key = hkdf::Hkdf::<Sha256>::new(Some(&client_random[..20]), &shared_secret);
+        let mut key = [0u8; 32];
+        auth_key.expand(b"REALITY", &mut key).unwrap();
+
+        let mut aad = hello.clone();
+        aad[39..71].fill(0);
+        let plaintext = Aes256Gcm::new_from_slice(&key)
+            .unwrap()
+            .decrypt(
+                Nonce::from_slice(&client_random[20..]),
+                Payload {
+                    msg: encrypted_session_id,
+                    aad: &aad,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(&plaintext[..3], &MIHOMO_REALITY_VERSION);
+        let timestamp = u32::from_be_bytes(plaintext[4..8].try_into().unwrap()) as u64;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert!(timestamp.abs_diff(now) <= 5);
+        assert_eq!(&plaintext[8..], &[1, 2, 3, 4, 0, 0, 0, 0]);
+
+        drop(server_io);
+        assert!(client.await.unwrap().is_err());
+    }
+
+    fn extract_x25519_key_share(hello: &[u8]) -> Option<[u8; 32]> {
+        let mut offset = 39 + hello[38] as usize;
+        let suites_len = u16::from_be_bytes([hello[offset], hello[offset + 1]]) as usize;
+        offset += 2 + suites_len;
+        let compression_len = hello[offset] as usize;
+        offset += 1 + compression_len;
+        let extensions_len = u16::from_be_bytes([hello[offset], hello[offset + 1]]) as usize;
+        offset += 2;
+        let extensions_end = offset + extensions_len;
+
+        while offset + 4 <= extensions_end {
+            let extension_type = u16::from_be_bytes([hello[offset], hello[offset + 1]]);
+            let extension_len = u16::from_be_bytes([hello[offset + 2], hello[offset + 3]]) as usize;
+            offset += 4;
+            if extension_type == 0x0033 && extension_len >= 38 {
+                let data = &hello[offset..offset + extension_len];
+                if u16::from_be_bytes([data[2], data[3]]) == 0x001d
+                    && u16::from_be_bytes([data[4], data[5]]) == 32
+                {
+                    return data[6..38].try_into().ok();
+                }
+            }
+            offset += extension_len;
+        }
+        None
     }
 }

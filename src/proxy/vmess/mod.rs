@@ -198,6 +198,8 @@ impl OutboundHandler for VmessOutbound {
     }
 
     fn supports_udp(&self) -> bool {
+        // UDP relay (connect_datagram) is not yet implemented for VMess; this
+        // flag only mirrors config, so requesting UDP errors at runtime.
         self.udp
     }
 

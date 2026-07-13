@@ -48,30 +48,6 @@ pub struct AnytlsOutbound {
     session_counter: AtomicU64,
     idle_sessions: Arc<PlMutex<VecDeque<Arc<Session>>>>,
     idle_timeout: Duration,
-    /// mihomo compat (`MinIdleSession`): keep at least this many sessions
-    /// "warm" in the idle pool even if they would otherwise be expired by
-    /// `idle_timeout`. Useful for high-frequency traffic where the cost of
-    /// a fresh TLS handshake matters. The runtime value is consulted by the
-    /// `sweep_idle_sessions` task; the field is also exposed for tests via
-    /// `min_idle_sessions()` so the YAML wiring can be verified.
-    min_idle_sessions: usize,
-}
-
-impl AnytlsOutbound {
-    /// Idle-session timeout. Sessions older than this are evicted by the
-    /// background sweeper unless the live count is below
-    /// `min_idle_sessions()`.
-    #[allow(dead_code)]
-    pub fn idle_timeout(&self) -> Duration {
-        self.idle_timeout
-    }
-
-    /// Minimum number of warm idle sessions the sweeper will preserve.
-    /// `0` (the default) means "evict by timeout only".
-    #[allow(dead_code)]
-    pub fn min_idle_sessions(&self) -> usize {
-        self.min_idle_sessions
-    }
 }
 
 impl AnytlsOutbound {
@@ -162,7 +138,6 @@ impl AnytlsOutbound {
             session_counter: AtomicU64::new(0),
             idle_sessions,
             idle_timeout,
-            min_idle_sessions,
         })
     }
 
@@ -228,7 +203,6 @@ impl AnytlsOutbound {
             reader,
             writer,
             Arc::clone(&self.padding),
-            seq,
         ));
 
         // mihomo sends cmdSettings first (buffered), then cmdSYN on OpenStream,
@@ -248,7 +222,6 @@ impl AnytlsOutbound {
 
 /// Ensure [`ReadHalf`]/[`WriteHalf`] are actually named to keep the generics
 /// visible in error messages. Not used at runtime.
-#[allow(dead_code)]
 fn _typecheck<S: AsyncRead + AsyncWrite + Unpin>(s: S) -> (ReadHalf<S>, WriteHalf<S>) {
     tokio_split(s)
 }
@@ -458,14 +431,12 @@ password: hunter2
     }
 
     /// Defaults match mihomo's `transport/anytls/session/client.go::NewClient`
-    /// floor logic: anything ≤ 5 s gets normalised to 30 s, and `MinIdleSession`
-    /// defaults to 0 ("evict purely by timeout").
+    /// floor logic: anything ≤ 5 s gets normalised to 30 s.
     #[tokio::test]
-    async fn anytls_idle_knobs_default_to_30s_and_zero_min() {
+    async fn anytls_idle_knobs_default_to_30s() {
         let cfg = cfg_with("");
         let outbound = AnytlsOutbound::from_config(&cfg).expect("config must load");
-        assert_eq!(outbound.idle_timeout(), Duration::from_secs(30));
-        assert_eq!(outbound.min_idle_sessions(), 0);
+        assert_eq!(outbound.idle_timeout, Duration::from_secs(30));
     }
 
     /// Configured non-trivial values flow through to the runtime fields and
@@ -477,8 +448,7 @@ password: hunter2
             "idle-session-timeout: 60\nidle-session-check-interval: 45\nmin-idle-session: 2\n",
         );
         let outbound = AnytlsOutbound::from_config(&cfg).expect("config must load");
-        assert_eq!(outbound.idle_timeout(), Duration::from_secs(60));
-        assert_eq!(outbound.min_idle_sessions(), 2);
+        assert_eq!(outbound.idle_timeout, Duration::from_secs(60));
     }
 
     /// Floor: timeouts ≤ 5 s get pulled up to 30 s (matches the upstream
@@ -487,6 +457,6 @@ password: hunter2
     async fn anytls_idle_timeout_floors_at_5_seconds() {
         let cfg = cfg_with("idle-session-timeout: 3\n");
         let outbound = AnytlsOutbound::from_config(&cfg).expect("config must load");
-        assert_eq!(outbound.idle_timeout(), Duration::from_secs(30));
+        assert_eq!(outbound.idle_timeout, Duration::from_secs(30));
     }
 }

@@ -10,8 +10,6 @@ use crate::proxy::vless::header::encode_address;
 
 /// Trojan command types.
 pub const CMD_TCP: u8 = 0x01;
-#[allow(dead_code)]
-pub const CMD_UDP: u8 = 0x03;
 
 const CRLF: &[u8] = b"\r\n";
 
@@ -50,6 +48,122 @@ pub fn encode_request(password_hash: &str, cmd: u8, addr: &Address) -> Vec<u8> {
     buf.extend_from_slice(CRLF);
 
     buf
+}
+
+/// State machine for the write side.
+enum WriteState {
+    /// Need to prepend the Trojan request header to the first write.
+    NeedHeader(Vec<u8>),
+    /// Header has been sent; pass through.
+    Streaming,
+}
+
+pin_project! {
+    /// A stream wrapper that handles the Trojan handshake transparently.
+    ///
+    /// - On the first `write`, prepends the Trojan request header + first payload.
+    /// - Reads pass through immediately (Trojan has no response header).
+    /// - After the first write, acts as a zero-overhead passthrough.
+    pub struct TrojanStream<T> {
+        #[pin]
+        inner: T,
+        write_state: WriteState,
+    }
+}
+
+impl<T> TrojanStream<T> {
+    /// Create a new Trojan stream.
+    ///
+    /// `header` is the pre-encoded Trojan request header (from `encode_request`).
+    pub fn new(inner: T, header: Vec<u8>) -> Self {
+        Self {
+            inner,
+            write_state: WriteState::NeedHeader(header),
+        }
+    }
+}
+
+impl<T: AsyncRead + Unpin> AsyncRead for TrojanStream<T> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        // Trojan has no response header. Pure passthrough.
+        self.project().inner.poll_read(cx, buf)
+    }
+}
+
+impl<T: AsyncRead + AsyncWrite + Unpin> AsyncWrite for TrojanStream<T> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let mut this = self.project();
+
+        match this.write_state {
+            WriteState::Streaming => {
+                // Passthrough
+                this.inner.poll_write(cx, buf)
+            }
+            WriteState::NeedHeader(ref mut header) => {
+                // Combine header + first payload into a single write.
+                // This is important: Trojan expects header + payload in one segment
+                // to avoid detection by DPI.
+                let mut combined = std::mem::take(header);
+                let header_len = combined.len();
+                combined.extend_from_slice(buf);
+
+                // Drain the combined buffer. We must never return Ok(0) on a
+                // partial header write: tokio's write_all treats Ok(0) as a
+                // fatal WriteZero and kills the connection. Loop until the
+                // header is fully sent, parking the remainder on Pending.
+                let mut pos = 0;
+                loop {
+                    if pos >= combined.len() {
+                        // Header (and any user bytes) fully sent.
+                        *this.write_state = WriteState::Streaming;
+                        return Poll::Ready(Ok(pos - header_len));
+                    }
+                    match this.inner.as_mut().poll_write(cx, &combined[pos..]) {
+                        Poll::Ready(Ok(0)) => {
+                            return Poll::Ready(Err(io::Error::new(
+                                io::ErrorKind::WriteZero,
+                                "Trojan header write returned 0",
+                            )));
+                        }
+                        Poll::Ready(Ok(n)) => {
+                            pos += n;
+                            if pos >= header_len {
+                                // Header fully sent; report the user bytes written.
+                                *this.write_state = WriteState::Streaming;
+                                return Poll::Ready(Ok(pos - header_len));
+                            }
+                        }
+                        Poll::Ready(Err(e)) => {
+                            *this.write_state =
+                                WriteState::NeedHeader(combined[pos..header_len].to_vec());
+                            return Poll::Ready(Err(e));
+                        }
+                        Poll::Pending => {
+                            *this.write_state =
+                                WriteState::NeedHeader(combined[pos..header_len].to_vec());
+                            return Poll::Pending;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.project().inner.poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.project().inner.poll_shutdown(cx)
+    }
 }
 
 #[cfg(test)]
@@ -109,111 +223,11 @@ mod tests {
         let password_hash = hex_sha224("pw");
         let sock = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(8, 8, 8, 8), 53));
         let addr = Address::Ip(sock);
-        let header = encode_request(&password_hash, CMD_UDP, &addr);
+        let header = encode_request(&password_hash, CMD_TCP, &addr);
 
         assert_eq!(&header[..56], password_hash.as_bytes());
-        assert_eq!(header[58], CMD_UDP);
+        assert_eq!(header[58], CMD_TCP);
         // IPv4 address type
         assert_eq!(header[59], 0x01);
-    }
-}
-
-/// State machine for the write side.
-enum WriteState {
-    /// Need to prepend the Trojan request header to the first write.
-    NeedHeader(Vec<u8>),
-    /// Header has been sent; pass through.
-    Streaming,
-}
-
-pin_project! {
-    /// A stream wrapper that handles the Trojan handshake transparently.
-    ///
-    /// - On the first `write`, prepends the Trojan request header + first payload.
-    /// - Reads pass through immediately (Trojan has no response header).
-    /// - After the first write, acts as a zero-overhead passthrough.
-    pub struct TrojanStream<T> {
-        #[pin]
-        inner: T,
-        write_state: WriteState,
-    }
-}
-
-impl<T> TrojanStream<T> {
-    /// Create a new Trojan stream.
-    ///
-    /// `header` is the pre-encoded Trojan request header (from `encode_request`).
-    pub fn new(inner: T, header: Vec<u8>) -> Self {
-        Self {
-            inner,
-            write_state: WriteState::NeedHeader(header),
-        }
-    }
-}
-
-impl<T: AsyncRead + Unpin> AsyncRead for TrojanStream<T> {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        // Trojan has no response header. Pure passthrough.
-        self.project().inner.poll_read(cx, buf)
-    }
-}
-
-impl<T: AsyncRead + AsyncWrite + Unpin> AsyncWrite for TrojanStream<T> {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        let this = self.project();
-
-        match this.write_state {
-            WriteState::Streaming => {
-                // Passthrough
-                this.inner.poll_write(cx, buf)
-            }
-            WriteState::NeedHeader(ref mut header) => {
-                // Combine header + first payload into a single write.
-                // This is important: Trojan expects header + payload in one segment
-                // to avoid detection by DPI.
-                let mut combined = std::mem::take(header);
-                combined.extend_from_slice(buf);
-
-                match this.inner.poll_write(cx, &combined) {
-                    Poll::Ready(Ok(n)) => {
-                        let header_len = combined.len() - buf.len();
-                        if n < header_len {
-                            // Partial header write: keep unsent remainder.
-                            *header = combined[n..header_len].to_vec();
-                            Poll::Ready(Ok(0))
-                        } else {
-                            // Header fully sent.
-                            *this.write_state = WriteState::Streaming;
-                            let user_bytes = n - header_len;
-                            Poll::Ready(Ok(user_bytes))
-                        }
-                    }
-                    Poll::Ready(Err(e)) => {
-                        *header = combined[..combined.len() - buf.len()].to_vec();
-                        Poll::Ready(Err(e))
-                    }
-                    Poll::Pending => {
-                        *header = combined[..combined.len() - buf.len()].to_vec();
-                        Poll::Pending
-                    }
-                }
-            }
-        }
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.project().inner.poll_flush(cx)
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.project().inner.poll_shutdown(cx)
     }
 }

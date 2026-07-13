@@ -26,10 +26,6 @@ pub const DEFAULT_PADDING_SCHEME: &[u8] = b"stop=8
 
 #[derive(Debug)]
 pub struct PaddingFactory {
-    /// Raw scheme bytes, kept around so server-pushed updates can
-    /// roundtrip it back to peers (matches mihomo).
-    #[allow(dead_code)]
-    pub raw_scheme: Vec<u8>,
     pub stop: u32,
     pub md5_hex: String,
     scheme: HashMap<String, String>,
@@ -54,7 +50,6 @@ impl PaddingFactory {
         let stop = scheme.get("stop")?.parse::<u32>().ok()?;
         let md5_hex = format!("{:x}", Md5::digest(raw_scheme));
         Some(Self {
-            raw_scheme: raw_scheme.to_vec(),
             stop,
             md5_hex,
             scheme,

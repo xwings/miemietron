@@ -103,15 +103,9 @@ impl UrlTestGroup {
     }
 
     /// The configured test URL.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn test_url(&self) -> &str {
         &self.test_url
-    }
-
-    /// Get a reference to the state store (for API reporting).
-    #[allow(dead_code)]
-    pub fn state_store(&self) -> &Arc<ProxyStateStore> {
-        &self.state_store
     }
 
     /// Run a health check against all proxies concurrently.
@@ -138,19 +132,6 @@ impl UrlTestGroup {
             &self.state_store,
         )
         .await;
-    }
-
-    /// Get the current delay results (for API reporting).
-    #[allow(dead_code)]
-    pub fn get_delays(&self) -> HashMap<String, u64> {
-        let mut result = HashMap::new();
-        for name in &self.proxy_names {
-            let delay = self.state_store.last_delay_for_url(name, &self.test_url);
-            if delay != 0xFFFF {
-                result.insert(name.clone(), delay as u64);
-            }
-        }
-        result
     }
 
     /// Compute the best proxy name.
@@ -345,6 +326,10 @@ impl ProxyGroup for UrlTestGroup {
             .as_millis() as u64;
         self.last_touch.store(now, Ordering::Relaxed);
     }
+
+    fn as_any_arc(self: Arc<Self>) -> Arc<dyn std::any::Any + Send + Sync> {
+        self
+    }
 }
 
 /// Parse the HTTP status code from a response status line ("HTTP/1.1 204 ...").
@@ -356,12 +341,43 @@ fn parse_status_line(buf: &[u8]) -> Option<u16> {
     s.get(9..12)?.trim().parse().ok()
 }
 
+/// No-verify TLS client config for HTTPS health probes, built once.
+static PROBE_TLS_CONFIG: std::sync::LazyLock<Arc<rustls::ClientConfig>> =
+    std::sync::LazyLock::new(|| {
+        let provider = rustls::crypto::ring::default_provider();
+        Arc::new(
+            rustls::ClientConfig::builder_with_provider(Arc::new(provider))
+                .with_safe_default_protocol_versions()
+                .expect("tls config")
+                .dangerous()
+                .with_custom_certificate_verifier(
+                    Arc::new(crate::transport::tls::NoVerifier::new()),
+                )
+                .with_no_client_auth(),
+        )
+    });
+
+/// Send an HTTP HEAD request, read the status line, and shut the stream down.
+async fn head_status<S>(stream: &mut S, req: &str) -> anyhow::Result<Option<u16>>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    stream.write_all(req.as_bytes()).await?;
+    let mut buf = [0u8; 256];
+    let n = stream.read(&mut buf).await?;
+    let status = parse_status_line(&buf[..n]);
+    let _ = stream.shutdown().await;
+    Ok(status)
+}
+
 /// Measure latency by connecting through a proxy and sending an HTTP HEAD request.
 /// Returns the total elapsed time in milliseconds and the HTTP status code.
 ///
 /// mihomo compat: matches adapter.go URLTest() which uses a 30s HTTP client timeout,
 /// dials through the proxy, sends HEAD, reads the status line. The status code
 /// is returned so callers can apply expected-status "satisfied" semantics.
+/// The caller (run_health_check) wraps this with the configurable per-check
+/// timeout (default 5000ms, healthcheck.go:202).
 pub(crate) async fn measure_unified_delay(
     handler: &Arc<dyn OutboundHandler>,
     url: &str,
@@ -381,60 +397,32 @@ pub(crate) async fn measure_unified_delay(
     let target = Address::domain(&host, port);
     let start = Instant::now();
 
-    // mihomo compat: per-proxy timeout defaults to 5s (healthcheck.go:202: timeout = 5000).
-    // The caller (health_check) wraps with its own configurable timeout, so this is a safety net.
-    let result = tokio::time::timeout(Duration::from_secs(5), async {
-        // Connect through the proxy
-        let stream = handler.connect_stream(&target, dns).await?;
+    // Connect through the proxy
+    let stream = handler.connect_stream(&target, dns).await?;
 
-        // mihomo compat: adapter.go URLTest uses a real net/http client that
-        // performs the TLS handshake for https:// test URLs. Sending a plaintext
-        // HEAD to a :443 endpoint makes the TLS server reply with an alert, which
-        // we would misread as "dead" and mark every node down. So for https we
-        // must wrap the proxied stream in TLS before the HEAD.
-        let req = format!(
-            "HEAD {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: clash\r\nConnection: close\r\n\r\n"
-        );
-        let status = if is_https {
-            let provider = rustls::crypto::ring::default_provider();
-            let tls_connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(
-                rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(provider))
-                    .with_safe_default_protocol_versions()
-                    .expect("tls config")
-                    .dangerous()
-                    .with_custom_certificate_verifier(std::sync::Arc::new(
-                        crate::transport::tls::NoVerifier::new(),
-                    ))
-                    .with_no_client_auth(),
-            ));
-            let server_name =
-                rustls::pki_types::ServerName::try_from(host.clone()).unwrap_or_else(|_| {
-                    rustls::pki_types::ServerName::try_from("localhost".to_string()).unwrap()
-                });
-            let mut tls_stream = tls_connector.connect(server_name, stream).await?;
-            tls_stream.write_all(req.as_bytes()).await?;
-            let mut buf = [0u8; 256];
-            let n = tls_stream.read(&mut buf).await?;
-            let status = parse_status_line(&buf[..n]);
-            let _ = tls_stream.shutdown().await;
-            status
-        } else {
-            let mut stream = stream;
-            stream.write_all(req.as_bytes()).await?;
-            let mut buf = [0u8; 256];
-            let n = stream.read(&mut buf).await?;
-            let status = parse_status_line(&buf[..n]);
-            let _ = stream.shutdown().await;
-            status
-        };
+    // mihomo compat: adapter.go URLTest uses a real net/http client that
+    // performs the TLS handshake for https:// test URLs. Sending a plaintext
+    // HEAD to a :443 endpoint makes the TLS server reply with an alert, which
+    // we would misread as "dead" and mark every node down. So for https we
+    // must wrap the proxied stream in TLS before the HEAD.
+    let req = format!(
+        "HEAD {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: clash\r\nConnection: close\r\n\r\n"
+    );
+    let status = if is_https {
+        let tls_connector = tokio_rustls::TlsConnector::from(PROBE_TLS_CONFIG.clone());
+        let server_name =
+            rustls::pki_types::ServerName::try_from(host.clone()).unwrap_or_else(|_| {
+                rustls::pki_types::ServerName::try_from("localhost".to_string()).unwrap()
+            });
+        let mut tls_stream = tls_connector.connect(server_name, stream).await?;
+        head_status(&mut tls_stream, &req).await?
+    } else {
+        let mut stream = stream;
+        head_status(&mut stream, &req).await?
+    };
 
-        let status = status.ok_or_else(|| anyhow::anyhow!("invalid HTTP response"))?;
-        Ok::<(u64, u16), anyhow::Error>((start.elapsed().as_millis() as u64, status))
-    })
-    .await
-    .map_err(|_| anyhow::anyhow!("connect timeout"))??;
-
-    Ok(result)
+    let status = status.ok_or_else(|| anyhow::anyhow!("invalid HTTP response"))?;
+    Ok((start.elapsed().as_millis() as u64, status))
 }
 
 #[cfg(test)]
@@ -654,7 +642,7 @@ mod tests {
                 !extras.is_empty(),
                 "proxy-{i} should have extra URL histories"
             );
-            for (_url, val) in &extras {
+            for val in extras.values() {
                 let h = val.get("history").and_then(|v| v.as_array());
                 assert!(h.is_some(), "proxy-{i} extra should have history array");
                 assert!(h.unwrap().len() <= 10, "proxy-{i} extra history unbounded");

@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -37,7 +37,6 @@ pub(crate) struct SelectorHealthCheck {
 pub struct SelectorGroup {
     group_name: String,
     proxy_names: Vec<String>,
-    proxy_name_set: HashSet<String>,
     current: RwLock<String>,
     health: Option<SelectorHealthCheck>,
 }
@@ -45,11 +44,9 @@ pub struct SelectorGroup {
 impl SelectorGroup {
     pub fn new(name: String, proxies: Vec<String>) -> Self {
         let initial = proxies.first().cloned().unwrap_or_default();
-        let proxy_name_set: HashSet<String> = proxies.iter().cloned().collect();
         Self {
             group_name: name,
             proxy_names: proxies,
-            proxy_name_set,
             current: RwLock::new(initial),
             health: None,
         }
@@ -122,7 +119,7 @@ impl ProxyGroup for SelectorGroup {
     }
 
     fn select(&self, name: &str) -> bool {
-        if self.proxy_name_set.contains(name) {
+        if self.proxy_names.iter().any(|n| n == name) {
             *self.current.write() = name.to_string();
             true
         } else {
@@ -147,6 +144,10 @@ impl ProxyGroup for SelectorGroup {
                 .as_millis() as u64;
             hc.last_touch.store(now, Ordering::Relaxed);
         }
+    }
+
+    fn as_any_arc(self: Arc<Self>) -> Arc<dyn std::any::Any + Send + Sync> {
+        self
     }
 }
 

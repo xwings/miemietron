@@ -64,11 +64,13 @@ impl SsUdpSocket {
         let salt_len = self.cipher.salt_len();
 
         // Single allocation: [salt | addr_header + data (plaintext, encrypted in-place + tag)]
-        let mut plaintext = Vec::with_capacity(data.len() + 32); // 32 covers max addr header
+        // Capacity hint only — a domain addr header can be up to 259 bytes,
+        // in which case the Vec grows once.
+        let mut plaintext = Vec::with_capacity(data.len() + 32);
         encode_address_into(target, &mut plaintext);
         plaintext.extend_from_slice(data);
 
-        // Generate salt into a stack buffer and derive subkey
+        // Generate a random salt and derive the per-packet subkey
         let mut salt = vec![0u8; salt_len];
         rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut salt);
         let subkey = self.cipher.derive_subkey(&self.master_key, &salt);

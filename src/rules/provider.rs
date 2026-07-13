@@ -1,7 +1,5 @@
 use anyhow::Result;
 use std::path::PathBuf;
-use std::sync::Arc;
-use tokio::sync::RwLock;
 
 /// Rule provider that fetches rules from HTTP URLs or local files.
 ///
@@ -10,6 +8,9 @@ use tokio::sync::RwLock;
 /// - "yaml": A YAML file with a `payload` list
 /// - "mrs": mihomo's zstd-compressed binary rule-set (domain behavior only —
 ///   see `rules::mrs`)
+///
+/// Providers are consumed once at engine construction; runtime reload is out
+/// of scope (`PUT /providers/rules/:name` returns 503).
 pub struct RuleProvider {
     name: String,
     provider_type: ProviderType,
@@ -19,9 +20,6 @@ pub struct RuleProvider {
     behavior: String,
     url: Option<String>,
     path: Option<PathBuf>,
-    #[allow(dead_code)]
-    interval: u64,
-    rules: Arc<RwLock<Vec<String>>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -44,7 +42,6 @@ impl RuleProvider {
         provider_type: &str,
         url: Option<String>,
         path: Option<PathBuf>,
-        interval: u64,
         format: Option<&str>,
         behavior: &str,
     ) -> Self {
@@ -67,13 +64,11 @@ impl RuleProvider {
             behavior: behavior.to_string(),
             url,
             path,
-            interval,
-            rules: Arc::new(RwLock::new(Vec::new())),
         }
     }
 
     /// Load rules from the configured source (file or cached HTTP response).
-    pub async fn load(&self) -> Result<()> {
+    pub async fn load(&self) -> Result<Vec<String>> {
         // Read raw bytes: MRS providers are binary (zstd), not UTF-8 text.
         let content = match self.provider_type {
             ProviderType::File => {
@@ -99,80 +94,12 @@ impl RuleProvider {
         };
 
         let parsed = self.parse_content(&content)?;
-        let mut rules = self.rules.write().await;
-        *rules = parsed;
-        tracing::info!("Rule provider '{}' loaded {} rules", self.name, rules.len());
-        Ok(())
-    }
-
-    /// Update rules by fetching from the remote URL (HTTP providers only).
-    #[allow(dead_code)]
-    pub async fn update(&self) -> Result<()> {
-        if self.provider_type != ProviderType::Http {
-            return Ok(());
-        }
-
-        let content = self.fetch_remote().await?;
-
-        // Save to local cache
-        if let Some(ref path) = self.path {
-            if let Some(parent) = path.parent() {
-                tokio::fs::create_dir_all(parent).await.ok();
-            }
-            tokio::fs::write(path, &content).await.ok();
-        }
-
-        let parsed = self.parse_content(&content)?;
-        let mut rules = self.rules.write().await;
-        *rules = parsed;
         tracing::info!(
-            "Rule provider '{}' updated with {} rules",
+            "Rule provider '{}' loaded {} rules",
             self.name,
-            rules.len()
+            parsed.len()
         );
-        Ok(())
-    }
-
-    /// Get the current list of rule payloads.
-    pub async fn rules(&self) -> Vec<String> {
-        self.rules.read().await.clone()
-    }
-
-    /// Start a background task that auto-updates on the configured interval.
-    /// Returns a JoinHandle that can be used to cancel the task.
-    #[allow(dead_code)]
-    pub fn start_auto_update(self: Arc<Self>) -> tokio::task::JoinHandle<()> {
-        let interval_secs = if self.interval > 0 {
-            self.interval
-        } else {
-            86400 // default: 24 hours
-        };
-
-        tokio::spawn(async move {
-            let mut interval =
-                tokio::time::interval(tokio::time::Duration::from_secs(interval_secs));
-            // Skip the first tick (fires immediately)
-            interval.tick().await;
-
-            loop {
-                interval.tick().await;
-                if let Err(e) = self.update().await {
-                    tracing::warn!("Failed to update rule provider '{}': {}", self.name, e);
-                }
-            }
-        })
-    }
-
-    /// Get the provider name.
-    #[allow(dead_code)]
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-
-    /// Get the configured update interval in seconds.
-    #[allow(dead_code)]
-    pub fn interval(&self) -> u64 {
-        self.interval
+        Ok(parsed)
     }
 
     async fn fetch_remote(&self) -> Result<Vec<u8>> {
@@ -227,7 +154,7 @@ impl RuleProvider {
 
 fn as_utf8<'a>(content: &'a [u8], name: &str) -> Result<&'a str> {
     std::str::from_utf8(content)
-        .map_err(|_| anyhow::anyhow!("rule provider '{}' content is not valid UTF-8", name))
+        .map_err(|_| anyhow::anyhow!("rule provider '{name}' content is not valid UTF-8"))
 }
 
 /// Parse text format: one rule payload per line, ignoring comments and blank lines.
@@ -437,12 +364,11 @@ payload:
             "http",
             Some("https://example.com/rules.txt".to_string()),
             Some(PathBuf::from("/tmp/rules.txt")),
-            3600,
             Some("text"),
             "domain",
         );
-        assert_eq!(provider.name(), "test");
-        assert_eq!(provider.interval(), 3600);
+        assert_eq!(provider.name, "test");
+        assert_eq!(provider.provider_type, ProviderType::Http);
     }
 
     #[test]
@@ -452,17 +378,16 @@ payload:
             "file",
             None,
             Some(PathBuf::from("/etc/rules.txt")),
-            0,
             Some("yaml"),
             "domain",
         );
-        assert_eq!(provider.name(), "local");
-        assert_eq!(provider.interval(), 0);
+        assert_eq!(provider.name, "local");
+        assert_eq!(provider.provider_type, ProviderType::File);
     }
 
     #[test]
     fn rule_provider_default_format_is_text() {
-        let provider = RuleProvider::new("def".to_string(), "file", None, None, 0, None, "domain");
+        let provider = RuleProvider::new("def".to_string(), "file", None, None, None, "domain");
         // We can indirectly verify by parsing through the provider's parse_content
         let result = provider.parse_content(b"example.com\ngoogle.com").unwrap();
         assert_eq!(result, vec!["example.com", "google.com"]);
@@ -472,15 +397,8 @@ payload:
     fn mrs_garbage_input_errors_not_silent_garbage() {
         // Invalid zstd input MUST surface as an explicit error instead of
         // producing junk text "rules".
-        let provider = RuleProvider::new(
-            "mrs".to_string(),
-            "file",
-            None,
-            None,
-            0,
-            Some("mrs"),
-            "domain",
-        );
+        let provider =
+            RuleProvider::new("mrs".to_string(), "file", None, None, Some("mrs"), "domain");
         let err = provider
             .parse_content(&[0x28, 0xB5, 0x2F, 0xFD, 0x00, 0x01, 0x02, 0x03])
             .expect_err("must error on invalid zstd MRS");
@@ -495,7 +413,6 @@ payload:
             "file",
             None,
             None,
-            0,
             Some("mrs"),
             "ipcidr",
         );

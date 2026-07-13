@@ -278,14 +278,14 @@ impl<T> SnellStream<T> {
         T: AsyncWrite + Unpin,
     {
         use tokio::io::AsyncWriteExt;
-        if let WriteState::Flushing { ref buf, ref pos } = self.write_state {
-            if *pos < buf.len() {
-                let data = buf[*pos..].to_vec();
-                self.inner.write_all(&data).await?;
+        if let WriteState::Flushing { buf, pos } =
+            std::mem::replace(&mut self.write_state, WriteState::Ready)
+        {
+            if pos < buf.len() {
+                self.inner.write_all(&buf[pos..]).await?;
                 self.inner.flush().await?;
             }
         }
-        self.write_state = WriteState::Ready;
         Ok(())
     }
 }
@@ -685,6 +685,7 @@ pub struct SnellOutbound {
     port: u16,
     psk: Vec<u8>,
     version: u8,
+    /// Invariantly false: v2 (implicit reuse) and v4-with-reuse are rejected at load.
     reuse: bool,
     udp: bool,
     obfs: Option<ObfsOption>,
@@ -846,23 +847,27 @@ impl OutboundHandler for SnellOutbound {
         // mihomo `snellStreamConn`.
         match &self.obfs {
             Some(o) if o.mode == "tls" => {
-                let obfs_stream = ObfsStream::new_tls(stream, o.host.clone());
-                let mut ss = SnellStream::new(obfs_stream, self.cipher, self.psk.clone(), header);
-                ss.flush_handshake().await?;
-                Ok(Box::new(ss))
+                self.wrap_snell(ObfsStream::new_tls(stream, o.host.clone()), header)
+                    .await
             }
             Some(o) if o.mode == "http" => {
-                let obfs_stream = ObfsStream::new_http(stream, o.host.clone());
-                let mut ss = SnellStream::new(obfs_stream, self.cipher, self.psk.clone(), header);
-                ss.flush_handshake().await?;
-                Ok(Box::new(ss))
+                self.wrap_snell(ObfsStream::new_http(stream, o.host.clone()), header)
+                    .await
             }
-            _ => {
-                let mut ss = SnellStream::new(stream, self.cipher, self.psk.clone(), header);
-                ss.flush_handshake().await?;
-                Ok(Box::new(ss))
-            }
+            _ => self.wrap_snell(stream, header).await,
         }
+    }
+}
+
+impl SnellOutbound {
+    /// Wrap a transport stream in the Snell AEAD layer and flush the handshake.
+    async fn wrap_snell<S>(&self, stream: S, header: Vec<u8>) -> Result<Box<dyn ProxyStream>>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let mut ss = SnellStream::new(stream, self.cipher, self.psk.clone(), header);
+        ss.flush_handshake().await?;
+        Ok(Box::new(ss))
     }
 }
 

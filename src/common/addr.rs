@@ -135,21 +135,21 @@ mod tests {
     #[test]
     fn display_domain() {
         let addr = Address::domain("example.com", 443);
-        assert_eq!(format!("{}", addr), "example.com:443");
+        assert_eq!(format!("{addr}"), "example.com:443");
     }
 
     #[test]
     fn display_ipv4() {
         let sock = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(1, 2, 3, 4), 80));
         let addr = Address::ip(sock);
-        assert_eq!(format!("{}", addr), "1.2.3.4:80");
+        assert_eq!(format!("{addr}"), "1.2.3.4:80");
     }
 
     #[test]
     fn display_ipv6() {
         let sock = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 443, 0, 0));
         let addr = Address::ip(sock);
-        assert_eq!(format!("{}", addr), "[::1]:443");
+        assert_eq!(format!("{addr}"), "[::1]:443");
     }
 
     #[test]

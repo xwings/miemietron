@@ -75,20 +75,40 @@ where
 /// Visitor that writes field values into the msg string.
 struct MessageVisitor<'a, W: std::fmt::Write>(&'a mut W);
 
+impl<'a, W: std::fmt::Write> MessageVisitor<'a, W> {
+    /// mihomo compat: everything the visitor writes lands inside `msg="..."`,
+    /// so `"`, `\`, and newlines must be escaped (logrus escapes quoted
+    /// values) or a proxy name/error breaks the line OpenClash parses.
+    fn write_escaped(&mut self, s: &str) {
+        for c in s.chars() {
+            let _ = match c {
+                '"' => self.0.write_str("\\\""),
+                '\\' => self.0.write_str("\\\\"),
+                '\n' => self.0.write_str("\\n"),
+                '\r' => self.0.write_str("\\r"),
+                _ => self.0.write_char(c),
+            };
+        }
+    }
+}
+
 impl<'a, W: std::fmt::Write> tracing::field::Visit for MessageVisitor<'a, W> {
     fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        let s = format!("{value:?}");
         if field.name() == "message" {
-            let _ = write!(self.0, "{value:?}");
+            self.write_escaped(&s);
         } else {
-            let _ = write!(self.0, " {}={:?}", field.name(), value);
+            let _ = write!(self.0, " {}=", field.name());
+            self.write_escaped(&s);
         }
     }
 
     fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
         if field.name() == "message" {
-            let _ = write!(self.0, "{value}");
+            self.write_escaped(value);
         } else {
-            let _ = write!(self.0, " {}={}", field.name(), value);
+            let _ = write!(self.0, " {}=", field.name());
+            self.write_escaped(value);
         }
     }
 }
@@ -153,9 +173,8 @@ struct Cli {
 }
 
 fn default_home_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("CLASH_HOME_DIR") {
-        return PathBuf::from(dir);
-    }
+    // CLASH_HOME_DIR is handled by clap (`env` attr on -d), so callers only
+    // reach here when neither the flag nor the env var is set.
     let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
     PathBuf::from(home).join(".config").join("mihomo")
 }
@@ -190,6 +209,85 @@ fn version_string() -> String {
     let arch = std::env::consts::ARCH;
     let os = std::env::consts::OS;
     format!("Mihomo Meta v{VERSION} {os}/{arch} (miemietron)")
+}
+
+/// Build the core components from a config: DNS resolver, rule engine (with
+/// geosite + rule-set checkers wired into the resolver for fake-ip-filter
+/// bypass), and proxy manager (with saved selections restored when
+/// store-selected is on). Shared by `Engine::run`, `Engine::validate`, and
+/// `AppState::reload_from_config`.
+async fn build_components(
+    config: &MiemieConfig,
+    home_dir: &std::path::Path,
+    state_store: Arc<proxy_group::proxy_state::ProxyStateStore>,
+) -> Result<(
+    dns::DnsResolver,
+    Arc<rules::RuleEngine>,
+    proxy::ProxyManager,
+)> {
+    let mut dns_resolver = dns::DnsResolver::with_hosts(&config.dns, &config.hosts).await?;
+
+    let mut rule_engine = rules::RuleEngine::with_home_dir_geox(
+        &config.rules,
+        &config.rule_providers,
+        home_dir,
+        config.geox_url.as_ref(),
+    )
+    .await?;
+    rule_engine.set_sub_rules(&config.sub_rules);
+    let rule_engine = Arc::new(rule_engine);
+
+    // Wire geosite + rule-set checkers into the DNS resolver so
+    // "geosite:cn" / "rule-set:..." entries in fake-ip-filter correctly
+    // bypass FakeIP, resolving those domains to real IPs instead.
+    {
+        let re = rule_engine.clone();
+        dns_resolver
+            .set_geosite_checker(move |domain, code| re.geosite_matcher().lookup(domain, code));
+        let re = rule_engine.clone();
+        dns_resolver
+            .set_ruleset_checker(move |domain, name| re.provider_domain_match(name, domain));
+        for name in dns_resolver.fakeip_ruleset_names() {
+            if !rule_engine.has_provider(name) {
+                error!(
+                    "dns.fake-ip-filter references rule-set '{}' but the provider did not load; entry is inert (mihomo fails the config load here)",
+                    name
+                );
+            }
+        }
+    }
+
+    let proxy_manager = proxy::ProxyManager::with_state_store(
+        &config.proxies,
+        &config.proxy_groups,
+        &config.proxy_providers,
+        &proxy::ProxyGlobalOpts {
+            routing_mark: config.routing_mark,
+            tcp_concurrent: config.tcp_concurrent,
+            keep_alive_idle: config.keep_alive_idle,
+            keep_alive_interval: config.keep_alive_interval,
+            disable_keep_alive: config.disable_keep_alive,
+        },
+        state_store,
+    )
+    .await?;
+
+    // Restore saved proxy selections if store-selected is enabled.
+    // mihomo compat: store-selected defaults to true when unset (config.go:568).
+    let store_selected = config
+        .profile
+        .as_ref()
+        .map(|p| p.store_selected)
+        .unwrap_or(true);
+    if store_selected {
+        let saved = store::load_selected(home_dir);
+        if !saved.is_empty() {
+            proxy_manager.apply_saved_selections(&saved);
+            info!("Restored {} saved proxy selections", saved.len());
+        }
+    }
+
+    Ok((dns_resolver, rule_engine, proxy_manager))
 }
 
 /// Shared application state that supports hot-reload.
@@ -245,65 +343,10 @@ impl AppState {
     /// Perform a full hot-reload from a new config.
     /// Builds new RuleEngine, ProxyManager, and DnsResolver, then swaps them in.
     pub async fn reload_from_config(&self, new_config: MiemieConfig) -> Result<()> {
-        let home_dir = &self.home_dir;
-
-        // Build new components from the new config
-        let mut new_dns = dns::DnsResolver::with_hosts(&new_config.dns, &new_config.hosts).await?;
-        let mut new_rules = rules::RuleEngine::with_home_dir_geox(
-            &new_config.rules,
-            &new_config.rule_providers,
-            home_dir,
-            new_config.geox_url.as_ref(),
-        )
-        .await?;
-        new_rules.set_sub_rules(&new_config.sub_rules);
-        let new_rules = Arc::new(new_rules);
-        // Wire geosite + rule-set checkers for fake-ip-filter bypass
-        {
-            let re = new_rules.clone();
-            new_dns
-                .set_geosite_checker(move |domain, code| re.geosite_matcher().lookup(domain, code));
-            let re = new_rules.clone();
-            new_dns.set_ruleset_checker(move |domain, name| re.provider_domain_match(name, domain));
-            for name in new_dns.fakeip_ruleset_names() {
-                if !new_rules.has_provider(name) {
-                    tracing::error!(
-                        "dns.fake-ip-filter references rule-set '{}' but the provider did not load; entry is inert (mihomo fails the config load here)",
-                        name
-                    );
-                }
-            }
-        }
-        // Reuse the existing proxy state store so delay history survives reloads
-        let new_proxies = proxy::ProxyManager::with_state_store(
-            &new_config.proxies,
-            &new_config.proxy_groups,
-            &new_config.proxy_providers,
-            &proxy::ProxyGlobalOpts {
-                routing_mark: new_config.routing_mark,
-                tcp_concurrent: new_config.tcp_concurrent,
-                keep_alive_idle: new_config.keep_alive_idle,
-                keep_alive_interval: new_config.keep_alive_interval,
-                disable_keep_alive: new_config.disable_keep_alive,
-            },
-            self.proxy_state_store.clone(),
-        )
-        .await?;
-
-        // If store-selected is enabled, restore saved selections
-        // mihomo compat: store-selected defaults to true when unset (config.go:568).
-        let store_selected = new_config
-            .profile
-            .as_ref()
-            .map(|p| p.store_selected)
-            .unwrap_or(true);
-        if store_selected {
-            let saved = store::load_selected(home_dir);
-            if !saved.is_empty() {
-                new_proxies.apply_saved_selections(&saved);
-                info!("Restored {} saved proxy selections", saved.len());
-            }
-        }
+        // Build new components from the new config, reusing the existing proxy
+        // state store so delay history survives reloads.
+        let (new_dns, new_rules, new_proxies) =
+            build_components(&new_config, &self.home_dir, self.proxy_state_store.clone()).await?;
 
         let rule_count = new_rules.rule_count();
         let proxy_count = new_proxies.proxy_count();
@@ -449,7 +492,7 @@ async fn async_main() -> Result<()> {
     let config_path = resolve_config_path(&cli);
     let mut config = if let Some(ref s) = cli.config_string {
         decode_base64_config(s)?
-    } else if cli.config_file.as_deref().map(|p| p.to_str()) == Some(Some("-")) {
+    } else if cli.config_file.as_deref() == Some(std::path::Path::new("-")) {
         use std::io::Read;
         let mut buf = String::new();
         std::io::stdin()
@@ -532,11 +575,18 @@ async fn async_main() -> Result<()> {
     if let Some(ref s) = cli.secret {
         config.secret = Some(s.clone());
     }
+    if let Some(ref dir) = cli.ext_ui {
+        config.external_ui = Some(dir.clone());
+    }
+    // mihomo compat: -m only overrides to true (main.go: `if geodataMode { ... }`)
+    if cli.geodata_mode {
+        config.geodata_mode = true;
+    }
 
     // Store home_dir for GeoIP/GeoSite loading
     let home_dir = cli.home_dir.clone().unwrap_or_else(default_home_dir);
 
-    let engine = Engine::new(config, home_dir, config_path).await?;
+    let engine = Engine::new(config, home_dir, config_path);
 
     // -t: mihomo compat — run the full parse (proxies, groups, rules, providers,
     // DNS), not just a YAML shape check, then exit. This is the pre-switch safety
@@ -571,42 +621,23 @@ pub struct Engine {
 }
 
 impl Engine {
-    async fn new(config: MiemieConfig, home_dir: PathBuf, config_path: PathBuf) -> Result<Self> {
-        Ok(Self {
+    fn new(config: MiemieConfig, home_dir: PathBuf, config_path: PathBuf) -> Self {
+        Self {
             config,
             home_dir,
             config_path,
-        })
+        }
     }
 
     /// Full semantic validation for `-t`: build the DNS resolver, rule engine,
     /// and proxy manager (the fallible parsers that catch unsupported proxy
     /// types, bad group references, malformed rules and providers) without
     /// starting any listeners or servers. Mirrors mihomo's `executor.Parse`.
+    /// Uses the same `build_components` as startup so `-t` fails iff startup
+    /// would (including geox-url provider downloads).
     async fn validate(&self) -> Result<()> {
-        let _dns = dns::DnsResolver::with_hosts(&self.config.dns, &self.config.hosts).await?;
-        let mut rule_engine = rules::RuleEngine::with_home_dir(
-            &self.config.rules,
-            &self.config.rule_providers,
-            &self.home_dir,
-        )
-        .await?;
-        rule_engine.set_sub_rules(&self.config.sub_rules);
         let state_store = Arc::new(proxy_group::proxy_state::ProxyStateStore::new());
-        let _pm = proxy::ProxyManager::with_state_store(
-            &self.config.proxies,
-            &self.config.proxy_groups,
-            &self.config.proxy_providers,
-            &proxy::ProxyGlobalOpts {
-                routing_mark: self.config.routing_mark,
-                tcp_concurrent: self.config.tcp_concurrent,
-                keep_alive_idle: self.config.keep_alive_idle,
-                keep_alive_interval: self.config.keep_alive_interval,
-                disable_keep_alive: self.config.disable_keep_alive,
-            },
-            state_store,
-        )
-        .await?;
+        let _ = build_components(&self.config, &self.home_dir, state_store).await?;
         Ok(())
     }
 
@@ -618,10 +649,14 @@ impl Engine {
         // (keepalive.SetDisableKeepAlive applies to inbound ListenConfig too).
         transport::tcp::set_inbound_keepalive_disabled(self.config.disable_keep_alive);
 
-        // Start DNS resolver (without Arc yet — we need to set geosite checker after rule engine)
-        let mut dns_resolver_inner =
-            dns::DnsResolver::with_hosts(&self.config.dns, &self.config.hosts).await?;
+        // Build proxy state store (shared between ProxyManager and AppState)
+        let proxy_state_store = Arc::new(proxy_group::proxy_state::ProxyStateStore::new());
+
+        // Build DNS resolver, rule engine (checkers wired), and proxy manager
+        let (dns_resolver_inner, rule_engine, proxy_manager) =
+            build_components(&self.config, &home_dir, proxy_state_store.clone()).await?;
         info!("DNS resolver started");
+        info!("Rule engine loaded with {} rules", rule_engine.rule_count());
 
         // Load FakeIP persistence if enabled
         let store_fake_ip = self
@@ -639,77 +674,8 @@ impl Engine {
                 warn!("Failed to load FakeIP cache: {}", e);
             }
         }
-
-        // Build rule engine
-        let mut rule_engine_inner = rules::RuleEngine::with_home_dir_geox(
-            &self.config.rules,
-            &self.config.rule_providers,
-            &home_dir,
-            self.config.geox_url.as_ref(),
-        )
-        .await?;
-        rule_engine_inner.set_sub_rules(&self.config.sub_rules);
-        let rule_engine = Arc::new(rule_engine_inner);
-        info!("Rule engine loaded with {} rules", rule_engine.rule_count());
-
-        // Wire geosite + rule-set checkers into DNS resolver for fake-ip-filter
-        // bypass. This allows "geosite:cn" / "rule-set:oc-cn-domain" in
-        // fake-ip-filter to correctly bypass FakeIP for Chinese domains,
-        // resolving them to real IPs instead.
-        {
-            let re = rule_engine.clone();
-            dns_resolver_inner
-                .set_geosite_checker(move |domain, code| re.geosite_matcher().lookup(domain, code));
-            let re = rule_engine.clone();
-            dns_resolver_inner
-                .set_ruleset_checker(move |domain, name| re.provider_domain_match(name, domain));
-            for name in dns_resolver_inner.fakeip_ruleset_names() {
-                if !rule_engine.has_provider(name) {
-                    error!(
-                        "dns.fake-ip-filter references rule-set '{}' but the provider did not load; entry is inert (mihomo fails the config load here)",
-                        name
-                    );
-                }
-            }
-        }
         let dns_resolver = Arc::new(dns_resolver_inner);
-
-        // Build proxy state store (shared between ProxyManager and AppState)
-        let proxy_state_store = Arc::new(proxy_group::proxy_state::ProxyStateStore::new());
-
-        // Build proxy manager
-        let proxy_manager = Arc::new(
-            proxy::ProxyManager::with_state_store(
-                &self.config.proxies,
-                &self.config.proxy_groups,
-                &self.config.proxy_providers,
-                &proxy::ProxyGlobalOpts {
-                    routing_mark: self.config.routing_mark,
-                    tcp_concurrent: self.config.tcp_concurrent,
-                    keep_alive_idle: self.config.keep_alive_idle,
-                    keep_alive_interval: self.config.keep_alive_interval,
-                    disable_keep_alive: self.config.disable_keep_alive,
-                },
-                proxy_state_store.clone(),
-            )
-            .await?,
-        );
-
-        // Restore saved proxy selections if store-selected is enabled.
-        // mihomo compat: store-selected defaults to true when unset (config.go:568).
-        let store_selected = self
-            .config
-            .profile
-            .as_ref()
-            .map(|p| p.store_selected)
-            .unwrap_or(true);
-        if store_selected {
-            let saved = store::load_selected(&home_dir);
-            if !saved.is_empty() {
-                proxy_manager.apply_saved_selections(&saved);
-                info!("Restored {} saved proxy selections", saved.len());
-            }
-        }
+        let proxy_manager = Arc::new(proxy_manager);
 
         info!(
             "Proxy manager loaded with {} proxies",
@@ -743,13 +709,12 @@ impl Engine {
         // Start connection manager
         let conn_manager = Arc::new(conn::ConnectionManager::new(app_state.clone()));
 
-        // Build runtime config reference for backward compat
+        // Config snapshot for listener setup below
         let config = app_state.config();
 
-        // Start API server
-        let ext_ctl_addr = config.external_controller.clone();
+        // Start API server (logs "API server listening on ..." after bind)
         let api_secret = config.secret.clone();
-        let api_handle = if let Some(ref addr) = ext_ctl_addr {
+        let api_handle = if let Some(ref addr) = config.external_controller {
             let addr = addr.clone();
             let api_state = api::ApiState {
                 app: app_state.clone(),
@@ -763,9 +728,31 @@ impl Engine {
         } else {
             None
         };
-        if let Some(ref addr) = ext_ctl_addr {
-            info!("API server listening on {}", addr);
-        }
+
+        // Start API server on a unix socket (external-controller-unix /
+        // --ext-ctl-unix). mihomo compat: `hub/route/server.go::startUnix` —
+        // relative paths resolve against the home dir (`C.Path.Resolve`).
+        let api_unix_handle = if let Some(ref path) = config.external_controller_unix {
+            let path = {
+                let p = PathBuf::from(path);
+                if p.is_absolute() {
+                    p
+                } else {
+                    home_dir.join(p)
+                }
+            };
+            let api_state = api::ApiState {
+                app: app_state.clone(),
+                conn_manager: conn_manager.clone(),
+            };
+            Some(tokio::spawn(async move {
+                if let Err(e) = api::start_unix_server(&path, api_state).await {
+                    error!("API unix server error: {}", e);
+                }
+            }))
+        } else {
+            None
+        };
 
         // Start TUN device
         let tun_handle = if config.tun.enable {
@@ -949,10 +936,14 @@ impl Engine {
 
         info!("Miemietron started successfully");
 
-        // Wait for shutdown, reload signal, or API-triggered restart
+        // Wait for shutdown, reload signal, or API-triggered restart.
+        // Signal streams are installed once, outside the loop: a stream
+        // created per-iteration would drop signals delivered while a reload
+        // is in progress (reloads can take seconds).
+        let mut signals = Signals::install();
         loop {
             tokio::select! {
-                sig = shutdown_or_reload_signal() => {
+                sig = signals.recv() => {
                     match sig {
                         Signal::Shutdown => {
                             info!("Shutting down...");
@@ -1002,6 +993,9 @@ impl Engine {
         if let Some(h) = api_handle {
             h.abort();
         }
+        if let Some(h) = api_unix_handle {
+            h.abort();
+        }
         if let Some(h) = dns_handle {
             h.abort();
         }
@@ -1023,48 +1017,65 @@ enum Signal {
     Reload,
 }
 
-async fn shutdown_or_reload_signal() -> Signal {
-    let ctrl_c = async {
-        signal::ctrl_c()
-            .await
-            .expect("failed to install Ctrl+C handler");
-        Signal::Shutdown
-    };
-
+/// Signal streams installed once at startup and polled from the main loop.
+struct Signals {
     #[cfg(unix)]
-    let terminate = async {
-        signal::unix::signal(signal::unix::SignalKind::terminate())
-            .expect("failed to install SIGTERM handler")
-            .recv()
-            .await;
-        Signal::Shutdown
-    };
-
+    interrupt: signal::unix::Signal,
     #[cfg(unix)]
-    let hangup = async {
-        signal::unix::signal(signal::unix::SignalKind::hangup())
-            .expect("failed to install SIGHUP handler")
-            .recv()
-            .await;
-        Signal::Reload
-    };
+    terminate: signal::unix::Signal,
+    #[cfg(unix)]
+    hangup: signal::unix::Signal,
+}
 
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<Signal>();
+impl Signals {
+    fn install() -> Self {
+        #[cfg(unix)]
+        {
+            Self {
+                interrupt: signal::unix::signal(signal::unix::SignalKind::interrupt())
+                    .expect("failed to install SIGINT handler"),
+                terminate: signal::unix::signal(signal::unix::SignalKind::terminate())
+                    .expect("failed to install SIGTERM handler"),
+                hangup: signal::unix::signal(signal::unix::SignalKind::hangup())
+                    .expect("failed to install SIGHUP handler"),
+            }
+        }
+        #[cfg(not(unix))]
+        Self {}
+    }
 
-    #[cfg(not(unix))]
-    let hangup = std::future::pending::<Signal>();
-
-    tokio::select! {
-        s = ctrl_c => s,
-        s = terminate => s,
-        s = hangup => s,
+    async fn recv(&mut self) -> Signal {
+        #[cfg(unix)]
+        {
+            tokio::select! {
+                _ = self.interrupt.recv() => Signal::Shutdown,
+                _ = self.terminate.recv() => Signal::Shutdown,
+                _ = self.hangup.recv() => Signal::Reload,
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            signal::ctrl_c()
+                .await
+                .expect("failed to install Ctrl+C handler");
+            Signal::Shutdown
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn log_msg_escapes_logrus_breakers() {
+        // A `"`, `\`, or newline inside msg="..." would break the logrus
+        // line OpenClash parses.
+        let mut out = String::new();
+        let mut v = MessageVisitor(&mut out);
+        v.write_escaped("proxy \"A\\B\"\nline2\r");
+        assert_eq!(out, "proxy \\\"A\\\\B\\\"\\nline2\\r");
+    }
 
     #[test]
     fn config_base64_roundtrip_loads_yaml() {

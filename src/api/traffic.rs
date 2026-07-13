@@ -1,5 +1,5 @@
 use axum::{
-    extract::{ws, FromRequestParts, State, WebSocketUpgrade},
+    extract::{ws, State},
     http::Request,
     response::{IntoResponse, Response},
     Json,
@@ -20,32 +20,23 @@ pub async fn get_traffic(
     State(state): State<ApiState>,
     request: Request<axum::body::Body>,
 ) -> Response {
-    let is_ws = request
-        .headers()
-        .get(axum::http::header::UPGRADE)
-        .and_then(|v| v.to_str().ok())
-        .map(|v| v.eq_ignore_ascii_case("websocket"))
-        .unwrap_or(false);
-
-    if is_ws {
-        let (mut parts, _body) = request.into_parts();
-        match WebSocketUpgrade::from_request_parts(&mut parts, &state).await {
-            Ok(ws) => ws.on_upgrade(move |socket| handle_traffic_ws(socket, state)),
-            Err(e) => e.into_response(),
+    match super::websocket_upgrade(request).await {
+        Some(Ok(ws)) => ws.on_upgrade(move |socket| handle_traffic_ws(socket, state)),
+        Some(Err(resp)) => resp,
+        None => {
+            let prev_up = state.app.stats.upload_total();
+            let prev_down = state.app.stats.download_total();
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let up = state.app.stats.upload_total();
+            let down = state.app.stats.download_total();
+            Json(json!({
+                "up": up.saturating_sub(prev_up),
+                "down": down.saturating_sub(prev_down),
+                "upTotal": up,
+                "downTotal": down,
+            }))
+            .into_response()
         }
-    } else {
-        let prev_up = state.app.stats.upload_total();
-        let prev_down = state.app.stats.download_total();
-        tokio::time::sleep(Duration::from_secs(1)).await;
-        let up = state.app.stats.upload_total();
-        let down = state.app.stats.download_total();
-        Json(json!({
-            "up": up.saturating_sub(prev_up),
-            "down": down.saturating_sub(prev_down),
-            "upTotal": up,
-            "downTotal": down,
-        }))
-        .into_response()
     }
 }
 

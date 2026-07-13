@@ -1,8 +1,7 @@
 use axum::{
-    extract::{ws, FromRequestParts, Request, State},
+    extract::{ws, Request, State},
     response::{IntoResponse, Response},
 };
-use std::collections::VecDeque;
 use std::sync::Arc;
 use tokio::sync::broadcast;
 use tracing_subscriber::Layer;
@@ -18,22 +17,15 @@ pub struct LogEntry {
 }
 
 /// Shared log channel for broadcasting log entries.
-/// Also keeps a ring buffer of recent entries for non-WS clients.
 #[derive(Clone)]
 pub struct LogBroadcast {
     sender: broadcast::Sender<LogEntry>,
-    recent: Arc<parking_lot::RwLock<VecDeque<LogEntry>>>,
-    max_recent: usize,
 }
 
 impl LogBroadcast {
     pub fn new(capacity: usize) -> Self {
         let (sender, _) = broadcast::channel(capacity);
-        Self {
-            sender,
-            recent: Arc::new(parking_lot::RwLock::new(VecDeque::with_capacity(capacity))),
-            max_recent: capacity,
-        }
+        Self { sender }
     }
 
     pub fn send(&self, level: &str, message: &str) {
@@ -41,14 +33,6 @@ impl LogBroadcast {
             level: level.to_string(),
             payload: message.to_string(),
         };
-        // Store in recent buffer
-        {
-            let mut recent = self.recent.write();
-            if recent.len() >= self.max_recent {
-                recent.pop_front();
-            }
-            recent.push_back(entry.clone());
-        }
         let _ = self.sender.send(entry);
     }
 
@@ -132,41 +116,29 @@ impl tracing::field::Visit for MessageVisitor {
 ///
 /// Checks for WebSocket upgrade headers manually and dispatches accordingly.
 /// - WebSocket: streams log entries as JSON objects `{"type":"info","payload":"..."}`
-/// - HTTP GET: returns the last 100 log entries as a JSON array
+/// - HTTP GET: streams the same entries live as NDJSON (one JSON object per
+///   line), matching mihomo's Go behavior
 pub async fn get_logs(State(state): State<ApiState>, request: Request) -> Response {
     // Extract query parameters from the URI before consuming the request
     let query_string = request.uri().query().unwrap_or("").to_string();
     let min_level = extract_level_param(&query_string);
 
-    // Check if this is a WebSocket upgrade request
-    let is_ws = request
-        .headers()
-        .get(axum::http::header::UPGRADE)
-        .and_then(|v| v.to_str().ok())
-        .map(|v| v.eq_ignore_ascii_case("websocket"))
-        .unwrap_or(false);
+    match super::websocket_upgrade(request).await {
+        Some(Ok(ws)) => ws.on_upgrade(move |socket| handle_log_ws(socket, min_level, state)),
+        Some(Err(resp)) => resp,
+        None => {
+            // Plain HTTP: stream log entries as NDJSON (newline-delimited JSON),
+            // matching mihomo's Go behavior which streams individual JSON objects
+            // with a newline after each, flushing after each write.
+            let broadcast = global_log_broadcast();
+            let rx = broadcast.subscribe();
+            let min_num = level_to_num(&min_level);
 
-    if is_ws {
-        // Try WebSocket upgrade via FromRequestParts
-        let (mut parts, _body) = request.into_parts();
-        match axum::extract::WebSocketUpgrade::from_request_parts(&mut parts, &state).await {
-            Ok(ws) => ws.on_upgrade(move |socket| handle_log_ws(socket, min_level, state)),
-            Err(e) => e.into_response(),
-        }
-    } else {
-        // Plain HTTP: stream log entries as NDJSON (newline-delimited JSON),
-        // matching mihomo's Go behavior which streams individual JSON objects
-        // with a newline after each, flushing after each write.
-        let broadcast = global_log_broadcast();
-        let rx = broadcast.subscribe();
-
-        let stream = futures_util::stream::unfold(rx, move |mut rx| {
-            let min_level = min_level.clone();
-            async move {
+            let stream = futures_util::stream::unfold(rx, move |mut rx| async move {
                 loop {
                     match rx.recv().await {
                         Ok(entry) => {
-                            if !level_passes(&entry.level, &min_level) {
+                            if level_to_num(&entry.level) > min_num {
                                 continue;
                             }
                             if let Ok(json) = serde_json::to_string(&entry) {
@@ -182,15 +154,14 @@ pub async fn get_logs(State(state): State<ApiState>, request: Request) -> Respon
                         Err(broadcast::error::RecvError::Closed) => return None,
                     }
                 }
-            }
-        });
+            });
 
-        let body = axum::body::Body::from_stream(stream);
-        Response::builder()
-            .header(axum::http::header::CONTENT_TYPE, "application/json")
-            .body(body)
-            .unwrap()
-            .into_response()
+            (
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                axum::body::Body::from_stream(stream),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -206,11 +177,12 @@ fn extract_level_param(query: &str) -> String {
 async fn handle_log_ws(mut socket: ws::WebSocket, min_level: String, _state: ApiState) {
     let broadcast = global_log_broadcast();
     let mut rx = broadcast.subscribe();
+    let min_num = level_to_num(&min_level);
 
     loop {
         match rx.recv().await {
             Ok(entry) => {
-                if !level_passes(&entry.level, &min_level) {
+                if level_to_num(&entry.level) > min_num {
                     continue;
                 }
                 let msg = match serde_json::to_string(&entry) {
@@ -228,13 +200,6 @@ async fn handle_log_ws(mut socket: ws::WebSocket, min_level: String, _state: Api
             Err(broadcast::error::RecvError::Closed) => break,
         }
     }
-}
-
-/// Check if a log level passes the minimum level filter.
-fn level_passes(level: &str, min_level: &str) -> bool {
-    let level_num = level_to_num(level);
-    let min_num = level_to_num(min_level);
-    level_num <= min_num
 }
 
 fn level_to_num(level: &str) -> u8 {

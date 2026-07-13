@@ -239,20 +239,16 @@ pub async fn patch_configs(State(state): State<ApiState>, Json(body): Json<Value
 /// mihomo compat: hub/route/configs.go:438-448 → updater.UpdateGeoDatabases;
 /// failure returns 500 with the message, success 204. A reload afterwards
 /// re-opens the databases (mihomo's updater reloads the config on success).
-pub async fn post_configs_geo(
-    State(state): State<ApiState>,
-) -> (StatusCode, axum::Json<serde_json::Value>) {
+pub async fn post_configs_geo(State(state): State<ApiState>) -> Response {
     let home_dir = state.app.home_dir.clone();
     let geox = state.app.config().geox_url.clone();
     match crate::rules::geodata::update_geo_databases(&home_dir, geox.as_ref()).await {
         Ok(()) => {
             tracing::info!("Geo databases updated, reloading config to apply");
             let _ = state.app.restart_tx.try_send(());
-            (StatusCode::NO_CONTENT, axum::Json(serde_json::json!(null)))
+            // mihomo compat: 204 with an EMPTY body (see put_configs).
+            StatusCode::NO_CONTENT.into_response()
         }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            axum::Json(serde_json::json!({"message": e.to_string()})),
-        ),
+        Err(e) => config_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
 }

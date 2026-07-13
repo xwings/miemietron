@@ -16,7 +16,7 @@ use crate::config::DnsConfig;
 use cache::DnsCache;
 use fakeip::FakeIpPool;
 
-type GeositeCheckerFn = Arc<dyn Fn(&str, &str) -> bool + Send + Sync>;
+type DomainCheckerFn = Arc<dyn Fn(&str, &str) -> bool + Send + Sync>;
 
 pub struct DnsResolver {
     config: DnsConfig,
@@ -27,13 +27,13 @@ pub struct DnsResolver {
     fakeip_geosite_codes: Vec<String>,
     /// Callback to check if a domain matches a geosite code.
     /// Set after construction via `set_geosite_checker()`.
-    geosite_checker: Option<GeositeCheckerFn>,
+    geosite_checker: Option<DomainCheckerFn>,
     /// Rule-provider names from fake-ip-filter (e.g. "rule-set:oc-cn-domain"
     /// → "oc-cn-domain"). mihomo config.go parseFakeIPRules.
     fakeip_ruleset_names: Vec<String>,
     /// Callback to check if a domain matches a rule provider's domain rules.
     /// Set after construction via `set_ruleset_checker()`.
-    ruleset_checker: Option<GeositeCheckerFn>,
+    ruleset_checker: Option<DomainCheckerFn>,
     /// Reverse IP→domain mapping for redir-host mode and traffic logging.
     /// Records every DNS resolution result (both FakeIP and real IPs).
     /// Matches mihomo's dns/enhancer.go mapping LRU.
@@ -45,6 +45,8 @@ pub struct DnsResolver {
     proxy_dns_cache: DashMap<String, (IpAddr, Instant)>,
     /// Per-domain singleflight for proxy server DNS to dedup concurrent queries.
     /// Key: domain, Value: mutex guarding the in-flight resolution.
+    /// Entries are never removed — the key set is bounded by the proxy server
+    /// hostnames in the config, so this is not a leak.
     proxy_dns_inflight: DashMap<String, Arc<TokioMutex<()>>>,
 }
 
@@ -196,10 +198,12 @@ impl DnsResolver {
     /// mihomo's withMapping() middleware in dns/middleware.go.
     pub async fn resolve(&self, domain: &str) -> Result<IpAddr> {
         // Check hosts map first (highest priority, like /etc/hosts)
-        if let Some(ip) = self.hosts.get(&domain.to_lowercase()) {
-            // mihomo compat: withHosts() also records into the mapping
-            self.record_ip_mapping(*ip, domain, 10);
-            return Ok(*ip);
+        if !self.hosts.is_empty() {
+            if let Some(ip) = self.hosts.get(&domain.to_lowercase()) {
+                // mihomo compat: withHosts() also records into the mapping
+                self.record_ip_mapping(*ip, domain, 10);
+                return Ok(*ip);
+            }
         }
 
         // Check cache
@@ -257,8 +261,10 @@ impl DnsResolver {
         }
 
         // Hosts map first (highest priority, like /etc/hosts).
-        if let Some(ip) = self.hosts.get(&domain.to_lowercase()) {
-            return Ok(*ip);
+        if !self.hosts.is_empty() {
+            if let Some(ip) = self.hosts.get(&domain.to_lowercase()) {
+                return Ok(*ip);
+            }
         }
 
         // DNS cache — but never trust a cached FakeIP for rule matching.
@@ -319,7 +325,8 @@ impl DnsResolver {
     }
 
     /// Manually insert an IP→domain mapping.
-    /// mihomo compat: matches enhancer.go InsertHostByIP().
+    /// mihomo compat: sniffer's InsertHostByIP hook; not yet wired.
+    #[allow(dead_code)]
     pub fn insert_host_by_ip(&self, ip: IpAddr, host: &str) {
         // Use DNS_DEFAULT_TTL (600s) for manually inserted entries
         self.record_ip_mapping(ip, host, DNS_DEFAULT_TTL);
@@ -353,9 +360,11 @@ impl DnsResolver {
     /// (no fake-ip-range6 pool — the server answers NODATA for non-bypassed
     /// domains before calling this).
     pub async fn resolve_v6(&self, domain: &str) -> Result<IpAddr> {
-        if let Some(ip) = self.hosts.get(&domain.to_lowercase()) {
-            if ip.is_ipv6() {
-                return Ok(*ip);
+        if !self.hosts.is_empty() {
+            if let Some(ip) = self.hosts.get(&domain.to_lowercase()) {
+                if ip.is_ipv6() {
+                    return Ok(*ip);
+                }
             }
         }
         let cache_key = format!("AAAA:{domain}");
@@ -398,39 +407,51 @@ impl DnsResolver {
         if self.config.nameserver_policy.is_empty() {
             return None;
         }
-        let domain_lower = domain.to_lowercase();
-        for (key, value) in &self.config.nameserver_policy {
-            let Some(pattern_raw) = key.as_str() else {
-                continue;
-            };
-            let matched = pattern_raw.split(',').any(|pattern| {
-                let pattern = pattern.trim().to_lowercase();
+        upstream::find_nameserver_policy(
+            domain,
+            &self.config.nameserver_policy,
+            |pattern, domain| {
                 if let Some(code) = pattern.strip_prefix("geosite:") {
                     self.geosite_checker
                         .as_ref()
-                        .is_some_and(|c| c(&domain_lower, code))
+                        .is_some_and(|c| c(domain, code))
                 } else if let Some(name) = pattern.strip_prefix("rule-set:") {
                     self.ruleset_checker
                         .as_ref()
-                        .is_some_and(|c| c(&domain_lower, name))
+                        .is_some_and(|c| c(domain, name))
                 } else {
-                    upstream::domain_pattern_match(&pattern, &domain_lower)
+                    upstream::domain_pattern_match(pattern, domain)
                 }
-            });
-            if matched {
-                let servers: Vec<String> = match value {
-                    serde_yaml::Value::String(s) => vec![s.clone()],
-                    serde_yaml::Value::Sequence(seq) => seq
-                        .iter()
-                        .filter_map(|v| v.as_str().map(String::from))
-                        .collect(),
-                    _ => vec![],
-                };
-                if !servers.is_empty() {
-                    return Some(servers);
-                }
+            },
+        )
+    }
+
+    /// Look up `domain` in the proxy-DNS cache. Returns `Some(Ok)` on a live
+    /// positive entry, `Some(Err)` on a live negative entry, `None` on a miss
+    /// (stale entries are removed). `label` distinguishes the debug logs.
+    fn proxy_dns_cache_lookup(&self, domain: &str, label: &str) -> Option<Result<IpAddr>> {
+        const PROXY_DNS_TTL_OK: Duration = Duration::from_secs(120);
+        const PROXY_DNS_TTL_FAIL: Duration = Duration::from_secs(10);
+
+        let entry = self.proxy_dns_cache.get(domain)?;
+        let (ip, created) = *entry;
+        let ttl = if ip.is_unspecified() {
+            PROXY_DNS_TTL_FAIL // negative cache entry
+        } else {
+            PROXY_DNS_TTL_OK
+        };
+        if created.elapsed() < ttl {
+            if ip.is_unspecified() {
+                return Some(Err(anyhow::anyhow!(
+                    "DNS resolution for proxy server '{domain}' failed (cached negative result)"
+                )));
             }
+            debug!("DNS proxy-server cache hit{}: {} -> {}", label, domain, ip);
+            return Some(Ok(ip));
         }
+        // Expired — remove stale entry
+        drop(entry);
+        self.proxy_dns_cache.remove(domain);
         None
     }
 
@@ -449,29 +470,9 @@ impl DnsResolver {
             return Ok(ip);
         }
 
-        const PROXY_DNS_TTL_OK: Duration = Duration::from_secs(120);
-        const PROXY_DNS_TTL_FAIL: Duration = Duration::from_secs(10);
-
         // Check cache first
-        if let Some(entry) = self.proxy_dns_cache.get(domain) {
-            let (ip, created) = *entry;
-            let ttl = if ip.is_unspecified() {
-                PROXY_DNS_TTL_FAIL // negative cache entry
-            } else {
-                PROXY_DNS_TTL_OK
-            };
-            if created.elapsed() < ttl {
-                if ip.is_unspecified() {
-                    return Err(anyhow::anyhow!(
-                        "DNS resolution for proxy server '{domain}' failed (cached negative result)"
-                    ));
-                }
-                debug!("DNS proxy-server cache hit: {} -> {}", domain, ip);
-                return Ok(ip);
-            }
-            // Expired — remove stale entry
-            drop(entry);
-            self.proxy_dns_cache.remove(domain);
+        if let Some(result) = self.proxy_dns_cache_lookup(domain, "") {
+            return result;
         }
 
         // Singleflight: acquire per-domain mutex to dedup concurrent queries.
@@ -485,25 +486,8 @@ impl DnsResolver {
         let _guard = mutex.lock().await;
 
         // Re-check cache after acquiring lock (another task may have populated it)
-        if let Some(entry) = self.proxy_dns_cache.get(domain) {
-            let (ip, created) = *entry;
-            let ttl = if ip.is_unspecified() {
-                PROXY_DNS_TTL_FAIL
-            } else {
-                PROXY_DNS_TTL_OK
-            };
-            if created.elapsed() < ttl {
-                if ip.is_unspecified() {
-                    return Err(anyhow::anyhow!(
-                        "DNS resolution for proxy server '{domain}' failed (cached negative result)"
-                    ));
-                }
-                debug!(
-                    "DNS proxy-server cache hit (after dedup): {} -> {}",
-                    domain, ip
-                );
-                return Ok(ip);
-            }
+        if let Some(result) = self.proxy_dns_cache_lookup(domain, " (after dedup)") {
+            return result;
         }
 
         // Actually resolve
@@ -547,7 +531,7 @@ impl DnsResolver {
     /// Flush the IP→domain reverse mapping.
     /// mihomo compat: clearing the mapping alongside the cache ensures
     /// stale reverse lookups don't persist after a cache flush.
-    pub fn flush_mapping(&self) {
+    fn flush_mapping(&self) {
         self.ip_to_host.clear();
     }
 
@@ -575,7 +559,6 @@ impl DnsResolver {
     }
 }
 
-/// Run a DNS server that listens for queries on both UDP and TCP.
 /// Process a raw DNS query packet and produce a raw DNS response packet.
 ///
 /// Shared by the embedded UDP/TCP DNS servers and the TUN dns-hijack path
@@ -645,10 +628,11 @@ pub async fn process_dns_query(data: &[u8], resolver: &DnsResolver) -> Option<Ve
     }
 }
 
+/// Run a DNS server that listens for queries on both UDP and TCP.
 pub async fn run_dns_server(listen: &str, resolver: Arc<DnsResolver>) -> Result<()> {
     let addr: SocketAddr = listen
         .parse()
-        .unwrap_or_else(|_| SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 1053));
+        .map_err(|e| anyhow::anyhow!("invalid dns.listen address {listen}: {e}"))?;
 
     let udp_socket = Arc::new(UdpSocket::bind(addr).await?);
     let tcp_listener = TcpListener::bind(addr).await?;
@@ -731,7 +715,7 @@ async fn handle_dns_tcp_connection(
         }
 
         let msg_len = u16::from_be_bytes(len_buf) as usize;
-        if msg_len == 0 || msg_len > 65535 {
+        if msg_len == 0 {
             return Ok(()); // Invalid length, close connection
         }
 
@@ -825,13 +809,7 @@ fn build_dns_response(id: u16, domain: &str, ip: IpAddr, qtype: u16, ttl: u32) -
     response.extend_from_slice(&[0x00, 0x00]); // Additional: 0
 
     // Question section — must echo back the ORIGINAL query type
-    for part in domain.split('.') {
-        response.push(part.len() as u8);
-        response.extend_from_slice(part.as_bytes());
-    }
-    response.push(0);
-    response.extend_from_slice(&qtype.to_be_bytes()); // Original query type
-    response.extend_from_slice(&[0x00, 0x01]); // Class IN
+    append_dns_question(&mut response, domain, qtype);
 
     // Answer section — only if types match
     if !type_mismatch {
@@ -868,13 +846,12 @@ fn append_dns_question(response: &mut Vec<u8>, domain: &str, qtype: u16) {
     response.extend_from_slice(&[0x00, 0x01]); // Class IN
 }
 
-/// Build a DNS SERVFAIL response.
-/// mihomo compat: server.go — the reply echoes the question section (some
-/// stub resolvers discard question-less replies and retry until timeout).
-fn build_dns_servfail(id: u16, domain: &str, qtype: u16) -> Vec<u8> {
+/// Build an answer-less response with the given second flags byte, echoing
+/// the question section.
+fn build_dns_empty_response(id: u16, flags2: u8, domain: &str, qtype: u16) -> Vec<u8> {
     let mut response = Vec::with_capacity(32);
     response.extend_from_slice(&id.to_be_bytes());
-    response.extend_from_slice(&[0x81, 0x82]); // Response + SERVFAIL
+    response.extend_from_slice(&[0x81, flags2]);
     response.extend_from_slice(&[0x00, 0x01]); // 1 question
     response.extend_from_slice(&[0x00, 0x00]); // 0 answers
     response.extend_from_slice(&[0x00, 0x00]);
@@ -883,17 +860,16 @@ fn build_dns_servfail(id: u16, domain: &str, qtype: u16) -> Vec<u8> {
     response
 }
 
+/// Build a DNS SERVFAIL response.
+/// mihomo compat: server.go — the reply echoes the question section (some
+/// stub resolvers discard question-less replies and retry until timeout).
+fn build_dns_servfail(id: u16, domain: &str, qtype: u16) -> Vec<u8> {
+    build_dns_empty_response(id, 0x82, domain, qtype) // Response + SERVFAIL
+}
+
 /// Build an empty-answer (NODATA) response echoing the question.
 fn build_dns_nodata(id: u16, domain: &str, qtype: u16) -> Vec<u8> {
-    let mut response = Vec::with_capacity(32);
-    response.extend_from_slice(&id.to_be_bytes());
-    response.extend_from_slice(&[0x81, 0x80]); // Response, RD+RA, NOERROR
-    response.extend_from_slice(&[0x00, 0x01]); // 1 question
-    response.extend_from_slice(&[0x00, 0x00]); // 0 answers
-    response.extend_from_slice(&[0x00, 0x00]);
-    response.extend_from_slice(&[0x00, 0x00]);
-    append_dns_question(&mut response, domain, qtype);
-    response
+    build_dns_empty_response(id, 0x80, domain, qtype) // Response, RD+RA, NOERROR
 }
 
 #[cfg(test)]

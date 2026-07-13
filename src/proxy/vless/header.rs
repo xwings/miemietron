@@ -12,8 +12,6 @@ const VLESS_VERSION: u8 = 0x00;
 
 /// VLESS command types.
 pub const CMD_TCP: u8 = 0x01;
-#[allow(dead_code)]
-pub const CMD_UDP: u8 = 0x02;
 
 /// VLESS address types (SOCKS5 compatible).
 const ATYP_IPV4: u8 = 0x01;
@@ -93,19 +91,13 @@ fn encode_address_vless(addr: &Address) -> Vec<u8> {
     buf
 }
 
-/// Encode a VLESS request header (without flow addon).
+/// Encode a VLESS request header with an optional flow addon.
 ///
 /// Format:
 /// ```text
 /// [version: 1]  [uuid: 16]  [addon_len: 1]  [addons: variable]
 /// [command: 1]  [address: variable]
 /// ```
-#[allow(dead_code)]
-pub fn encode_request(uuid: &[u8; 16], cmd: u8, addr: &Address) -> Vec<u8> {
-    encode_request_with_flow(uuid, cmd, addr, None)
-}
-
-/// Encode a VLESS request header with an optional flow addon.
 ///
 /// When `flow` is `Some("xtls-rprx-vision")`, the addon is encoded as a
 /// minimal protobuf message:
@@ -155,6 +147,181 @@ pub fn encode_request_with_flow(
     buf.extend_from_slice(&addr_bytes);
 
     buf
+}
+
+/// State machine for the VLESS stream wrapper.
+enum ReadState {
+    /// Waiting to read the VLESS response header.
+    WaitingResponse,
+    /// Response header has been consumed; pass through.
+    Streaming,
+}
+
+enum WriteState {
+    /// Need to prepend the VLESS request header to the first write.
+    NeedHeader(Vec<u8>),
+    /// Header has been sent; pass through.
+    Streaming,
+}
+
+pin_project! {
+    /// A stream wrapper that handles the VLESS handshake transparently.
+    ///
+    /// - On the first `write`, prepends the VLESS request header.
+    /// - On the first `read`, consumes the VLESS response header.
+    /// - After handshake, acts as a zero-overhead passthrough.
+    pub struct VlessStream<T> {
+        #[pin]
+        inner: T,
+        read_state: ReadState,
+        write_state: WriteState,
+        // Buffer for response header bytes being read.
+        resp_buf: Vec<u8>,
+    }
+}
+
+impl<T> VlessStream<T> {
+    /// Create a new VLESS stream.
+    ///
+    /// `header` is the pre-encoded VLESS request header (from `encode_request_with_flow`).
+    pub fn new(inner: T, header: Vec<u8>) -> Self {
+        Self {
+            inner,
+            read_state: ReadState::WaitingResponse,
+            write_state: WriteState::NeedHeader(header),
+            resp_buf: Vec::new(),
+        }
+    }
+}
+
+impl<T: AsyncRead + AsyncWrite + Unpin> AsyncRead for VlessStream<T> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let mut this = self.project();
+
+        match this.read_state {
+            ReadState::Streaming => {
+                // Passthrough
+                this.inner.poll_read(cx, buf)
+            }
+            ReadState::WaitingResponse => {
+                // We need to read at least 2 bytes: [version][addon_len]
+                // Then `addon_len` more bytes for the addons.
+                // Use a small temporary buffer to read bytes one-at-a-time
+                // until we have enough to skip the response header.
+                loop {
+                    let needed = if this.resp_buf.len() < 2 {
+                        // Still reading version + addon_len
+                        2 - this.resp_buf.len()
+                    } else {
+                        // We know the addon length
+                        let addon_len = this.resp_buf[1] as usize;
+                        let total = 2 + addon_len;
+                        if this.resp_buf.len() >= total {
+                            // Response header fully consumed. Switch to streaming.
+                            *this.read_state = ReadState::Streaming;
+                            return this.inner.poll_read(cx, buf);
+                        }
+                        total - this.resp_buf.len()
+                    };
+
+                    // Read into a small stack buffer. `needed` never exceeds the
+                    // addon length (a u8, so at most 255 bytes), so a fixed
+                    // 255-byte array covers every read without heap allocation.
+                    let mut tmp = [0u8; 255];
+                    let mut tmp_buf = ReadBuf::new(&mut tmp[..needed]);
+                    match this.inner.as_mut().poll_read(cx, &mut tmp_buf) {
+                        Poll::Ready(Ok(())) => {
+                            let filled = tmp_buf.filled();
+                            if filled.is_empty() {
+                                // EOF before full response header
+                                return Poll::Ready(Err(io::Error::new(
+                                    io::ErrorKind::UnexpectedEof,
+                                    "VLESS response header truncated",
+                                )));
+                            }
+                            this.resp_buf.extend_from_slice(filled);
+                        }
+                        Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                        Poll::Pending => return Poll::Pending,
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl<T: AsyncRead + AsyncWrite + Unpin> AsyncWrite for VlessStream<T> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let mut this = self.project();
+
+        match this.write_state {
+            WriteState::Streaming => {
+                // Passthrough
+                this.inner.poll_write(cx, buf)
+            }
+            WriteState::NeedHeader(ref mut header) => {
+                // Combine header + first payload into a single write for efficiency.
+                let mut combined = std::mem::take(header);
+                let header_len = combined.len();
+                combined.extend_from_slice(buf);
+
+                // Drain the combined buffer. We must never return Ok(0) on a
+                // partial header write: tokio's write_all treats Ok(0) as a
+                // fatal WriteZero and kills the connection. Loop until the
+                // header is fully sent, parking the remainder on Pending.
+                let mut pos = 0;
+                loop {
+                    if pos >= combined.len() {
+                        // Header (and any user bytes) fully sent.
+                        *this.write_state = WriteState::Streaming;
+                        return Poll::Ready(Ok(pos - header_len));
+                    }
+                    match this.inner.as_mut().poll_write(cx, &combined[pos..]) {
+                        Poll::Ready(Ok(0)) => {
+                            return Poll::Ready(Err(io::Error::new(
+                                io::ErrorKind::WriteZero,
+                                "VLESS header write returned 0",
+                            )));
+                        }
+                        Poll::Ready(Ok(n)) => {
+                            pos += n;
+                            if pos >= header_len {
+                                // Header fully sent; report the user bytes written.
+                                *this.write_state = WriteState::Streaming;
+                                return Poll::Ready(Ok(pos - header_len));
+                            }
+                        }
+                        Poll::Ready(Err(e)) => {
+                            *this.write_state =
+                                WriteState::NeedHeader(combined[pos..header_len].to_vec());
+                            return Poll::Ready(Err(e));
+                        }
+                        Poll::Pending => {
+                            *this.write_state =
+                                WriteState::NeedHeader(combined[pos..header_len].to_vec());
+                            return Poll::Pending;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.project().inner.poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.project().inner.poll_shutdown(cx)
+    }
 }
 
 #[cfg(test)]
@@ -224,7 +391,7 @@ mod tests {
     fn encode_request_header() {
         let uuid = parse_uuid("11111111-2222-3333-4444-555555555555").unwrap();
         let addr = Address::Domain("example.com".to_string(), 443);
-        let header = encode_request(&uuid, CMD_TCP, &addr);
+        let header = encode_request_with_flow(&uuid, CMD_TCP, &addr, None);
 
         // Version
         assert_eq!(header[0], VLESS_VERSION);
@@ -239,20 +406,6 @@ mod tests {
         assert_eq!(header[21], ATYP_DOMAIN);
         assert_eq!(header[22], 11); // "example.com".len()
         assert_eq!(&header[23..34], b"example.com");
-    }
-
-    #[test]
-    fn encode_request_udp() {
-        let uuid = [0u8; 16];
-        let sock = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(8, 8, 8, 8), 53));
-        let addr = Address::Ip(sock);
-        let header = encode_request(&uuid, CMD_UDP, &addr);
-
-        assert_eq!(header[18], CMD_UDP);
-        // port (BE) then address type then the IPv4 octets.
-        assert_eq!(&header[19..21], &53u16.to_be_bytes());
-        assert_eq!(header[21], ATYP_IPV4);
-        assert_eq!(&header[22..26], &[8, 8, 8, 8]);
     }
 
     #[test]
@@ -282,177 +435,13 @@ mod tests {
     }
 
     #[test]
-    fn encode_request_no_flow_matches_original() {
+    fn encode_request_no_flow_matches_empty_flow() {
         let uuid = parse_uuid("11111111-2222-3333-4444-555555555555").unwrap();
         let addr = Address::Domain("example.com".to_string(), 443);
 
-        let h1 = encode_request(&uuid, CMD_TCP, &addr);
-        let h2 = encode_request_with_flow(&uuid, CMD_TCP, &addr, None);
-        let h3 = encode_request_with_flow(&uuid, CMD_TCP, &addr, Some(""));
+        let h1 = encode_request_with_flow(&uuid, CMD_TCP, &addr, None);
+        let h2 = encode_request_with_flow(&uuid, CMD_TCP, &addr, Some(""));
 
         assert_eq!(h1, h2);
-        assert_eq!(h1, h3);
-    }
-}
-
-/// State machine for the VLESS stream wrapper.
-enum ReadState {
-    /// Waiting to read the VLESS response header.
-    WaitingResponse,
-    /// Response header has been consumed; pass through.
-    Streaming,
-}
-
-enum WriteState {
-    /// Need to prepend the VLESS request header to the first write.
-    NeedHeader(Vec<u8>),
-    /// Header has been sent; pass through.
-    Streaming,
-}
-
-pin_project! {
-    /// A stream wrapper that handles the VLESS handshake transparently.
-    ///
-    /// - On the first `write`, prepends the VLESS request header.
-    /// - On the first `read`, consumes the VLESS response header.
-    /// - After handshake, acts as a zero-overhead passthrough.
-    pub struct VlessStream<T> {
-        #[pin]
-        inner: T,
-        read_state: ReadState,
-        write_state: WriteState,
-        // Buffer for response header bytes being read.
-        resp_buf: Vec<u8>,
-    }
-}
-
-impl<T> VlessStream<T> {
-    /// Create a new VLESS stream.
-    ///
-    /// `header` is the pre-encoded VLESS request header (from `encode_request`).
-    pub fn new(inner: T, header: Vec<u8>) -> Self {
-        Self {
-            inner,
-            read_state: ReadState::WaitingResponse,
-            write_state: WriteState::NeedHeader(header),
-            resp_buf: Vec::new(),
-        }
-    }
-}
-
-impl<T: AsyncRead + AsyncWrite + Unpin> AsyncRead for VlessStream<T> {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        let mut this = self.project();
-
-        match this.read_state {
-            ReadState::Streaming => {
-                // Passthrough
-                this.inner.poll_read(cx, buf)
-            }
-            ReadState::WaitingResponse => {
-                // We need to read at least 2 bytes: [version][addon_len]
-                // Then `addon_len` more bytes for the addons.
-                // Use a small temporary buffer to read bytes one-at-a-time
-                // until we have enough to skip the response header.
-                loop {
-                    let needed = if this.resp_buf.len() < 2 {
-                        // Still reading version + addon_len
-                        2 - this.resp_buf.len()
-                    } else {
-                        // We know the addon length
-                        let addon_len = this.resp_buf[1] as usize;
-                        let total = 2 + addon_len;
-                        if this.resp_buf.len() >= total {
-                            // Response header fully consumed. Switch to streaming.
-                            *this.read_state = ReadState::Streaming;
-                            return this.inner.poll_read(cx, buf);
-                        }
-                        total - this.resp_buf.len()
-                    };
-
-                    // Read into a small stack buffer.
-                    let mut tmp = vec![0u8; needed];
-                    let mut tmp_buf = ReadBuf::new(&mut tmp);
-                    match this.inner.as_mut().poll_read(cx, &mut tmp_buf) {
-                        Poll::Ready(Ok(())) => {
-                            let filled = tmp_buf.filled();
-                            if filled.is_empty() {
-                                // EOF before full response header
-                                return Poll::Ready(Err(io::Error::new(
-                                    io::ErrorKind::UnexpectedEof,
-                                    "VLESS response header truncated",
-                                )));
-                            }
-                            this.resp_buf.extend_from_slice(filled);
-                        }
-                        Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                        Poll::Pending => return Poll::Pending,
-                    }
-                }
-            }
-        }
-    }
-}
-
-impl<T: AsyncRead + AsyncWrite + Unpin> AsyncWrite for VlessStream<T> {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        let this = self.project();
-
-        match this.write_state {
-            WriteState::Streaming => {
-                // Passthrough
-                this.inner.poll_write(cx, buf)
-            }
-            WriteState::NeedHeader(ref mut header) => {
-                // Combine header + first payload into a single write for efficiency.
-                let mut combined = std::mem::take(header);
-                combined.extend_from_slice(buf);
-
-                match this.inner.poll_write(cx, &combined) {
-                    Poll::Ready(Ok(n)) => {
-                        let header_len = combined.len() - buf.len();
-                        if n < header_len {
-                            // Partial header write: keep the unsent remainder.
-                            *header = combined[n..header_len].to_vec();
-                            // We haven't sent any user data yet, but we made progress.
-                            // Return Pending-like by re-storing and trying again.
-                            // Actually, report 0 user bytes written so caller retries.
-                            Poll::Ready(Ok(0))
-                        } else {
-                            // Header fully sent. Switch to streaming.
-                            *this.write_state = WriteState::Streaming;
-                            let user_bytes = n - header_len;
-                            Poll::Ready(Ok(user_bytes))
-                        }
-                    }
-                    Poll::Ready(Err(e)) => {
-                        // Put header back so caller can retry
-                        *header = combined[..combined.len() - buf.len()].to_vec();
-                        Poll::Ready(Err(e))
-                    }
-                    Poll::Pending => {
-                        // Put header back
-                        *header = combined[..combined.len() - buf.len()].to_vec();
-                        Poll::Pending
-                    }
-                }
-            }
-        }
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.project().inner.poll_flush(cx)
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.project().inner.poll_shutdown(cx)
     }
 }

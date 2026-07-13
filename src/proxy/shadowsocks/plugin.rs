@@ -20,8 +20,6 @@ pub struct PluginOpts {
     pub path: Option<String>,
     pub tls: bool,
     pub password: Option<String>,
-    #[allow(dead_code)]
-    pub version: Option<u32>,
 }
 
 impl PluginOpts {
@@ -42,21 +40,12 @@ impl PluginOpts {
                 })
                 .unwrap_or(false)
         };
-        let get_u32 = |key: &str| -> Option<u32> {
-            map.get(key).and_then(|v| match v {
-                serde_yaml::Value::Number(n) => n.as_u64().map(|n| n as u32),
-                serde_yaml::Value::String(s) => s.parse().ok(),
-                _ => None,
-            })
-        };
-
         Self {
             mode: get_str("mode"),
             host: get_str("host"),
             path: get_str("path"),
             tls: get_bool("tls"),
             password: get_str("password"),
-            version: get_u32("version"),
         }
     }
 }
@@ -103,9 +92,6 @@ enum ObfsReadState {
     /// TLS mode: reading record payload of known length.
     TlsRecordPayload { payload: Vec<u8>, remaining: usize },
 }
-
-// T: Unpin, and all other fields are Unpin, so ObfsStream is Unpin.
-impl<T: Unpin> Unpin for ObfsStream<T> {}
 
 impl<T> ObfsStream<T> {
     /// Create a new simple-obfs HTTP stream.
@@ -472,9 +458,9 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncWrite for ObfsStream<T> {
                     }
                 }
             },
-            ObfsWriteState::Flushing { .. } => {
-                unreachable!("obfs: write state should have been flushed");
-            }
+            ObfsWriteState::Flushing { .. } => Poll::Ready(Err(io::Error::other(
+                "obfs: write state should have been flushed",
+            ))),
         }
     }
 
@@ -501,8 +487,10 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncWrite for ObfsStream<T> {
                     Poll::Pending => return Poll::Pending,
                 }
             }
+            // Only a drained Flushing buffer transitions to Streaming;
+            // NeedHeader must stay so the first write still sends the header.
+            this.write_state = ObfsWriteState::Streaming;
         }
-        this.write_state = ObfsWriteState::Streaming;
 
         Pin::new(&mut this.inner).poll_flush(cx)
     }
@@ -526,6 +514,12 @@ where
     let host = opts.host.as_deref().unwrap_or(server_host);
     let path = opts.path.as_deref().unwrap_or("/");
 
+    let ws_opts = crate::transport::ws::WsOptions {
+        host: host.to_string(),
+        path: path.to_string(),
+        headers: Vec::new(),
+    };
+
     if opts.tls {
         let tls_opts = crate::transport::tls::TlsOptions {
             sni: host.to_string(),
@@ -534,20 +528,9 @@ where
             fingerprint: None,
         };
         let tls_stream = crate::transport::tls::wrap_tls(stream, &tls_opts).await?;
-
-        let ws_opts = crate::transport::ws::WsOptions {
-            host: host.to_string(),
-            path: path.to_string(),
-            headers: Vec::new(),
-        };
         let ws_stream = crate::transport::ws::wrap_ws(tls_stream, &ws_opts).await?;
         Ok(Box::new(ws_stream))
     } else {
-        let ws_opts = crate::transport::ws::WsOptions {
-            host: host.to_string(),
-            path: path.to_string(),
-            headers: Vec::new(),
-        };
         let ws_stream = crate::transport::ws::wrap_ws(stream, &ws_opts).await?;
         Ok(Box::new(ws_stream))
     }
@@ -583,7 +566,7 @@ where
     Ok(ShadowTlsStream {
         inner: tls_stream,
         hmac_key: derive_shadow_tls_key(password.as_bytes()),
-        hmac_sent: false,
+        write_state: ShadowTlsWriteState::NeedHmac,
     })
 }
 
@@ -606,8 +589,22 @@ pin_project! {
         #[pin]
         inner: tokio_rustls::client::TlsStream<T>,
         hmac_key: [u8; 32],
-        hmac_sent: bool,
+        write_state: ShadowTlsWriteState,
     }
+}
+
+enum ShadowTlsWriteState {
+    /// First write: need to prepend the 8-byte HMAC tag.
+    NeedHmac,
+    /// Draining the composed [tag(8)][data] buffer across polls.
+    /// `data_len` is reported to the caller once fully written.
+    Flushing {
+        buf: Vec<u8>,
+        pos: usize,
+        data_len: usize,
+    },
+    /// Tag sent; writes pass through.
+    Streaming,
 }
 
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncRead for ShadowTlsStream<T> {
@@ -626,37 +623,59 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncWrite for ShadowTlsStream<T>
         cx: &mut Context<'_>,
         data: &[u8],
     ) -> Poll<io::Result<usize>> {
-        let this = self.project();
+        let mut this = self.project();
 
-        if !*this.hmac_sent {
-            use hmac::Mac;
-            type HmacSha256 = hmac::Hmac<sha2::Sha256>;
-
-            let mut mac = HmacSha256::new_from_slice(this.hmac_key)
-                .map_err(|e| io::Error::other(format!("shadow-tls hmac init: {e}")))?;
-            mac.update(data);
-            let tag = mac.finalize().into_bytes();
-
-            let mut buf = Vec::with_capacity(8 + data.len());
-            buf.extend_from_slice(&tag[..8]);
-            buf.extend_from_slice(data);
-
-            let data_len = data.len();
-            match this.inner.poll_write(cx, &buf) {
-                Poll::Ready(Ok(n)) => {
-                    if n >= 8 {
-                        *this.hmac_sent = true;
-                        let user_written = (n - 8).min(data_len);
-                        Poll::Ready(Ok(user_written.max(1).min(data_len)))
-                    } else {
-                        Poll::Ready(Ok(0))
+        loop {
+            match this.write_state {
+                ShadowTlsWriteState::NeedHmac => {
+                    if data.is_empty() {
+                        return Poll::Ready(Ok(0));
                     }
+
+                    use hmac::Mac;
+                    type HmacSha256 = hmac::Hmac<sha2::Sha256>;
+
+                    let mut mac = HmacSha256::new_from_slice(this.hmac_key)
+                        .map_err(|e| io::Error::other(format!("shadow-tls hmac init: {e}")))?;
+                    mac.update(data);
+                    let tag = mac.finalize().into_bytes();
+
+                    let mut buf = Vec::with_capacity(8 + data.len());
+                    buf.extend_from_slice(&tag[..8]);
+                    buf.extend_from_slice(data);
+
+                    *this.write_state = ShadowTlsWriteState::Flushing {
+                        buf,
+                        pos: 0,
+                        data_len: data.len(),
+                    };
                 }
-                Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
-                Poll::Pending => Poll::Pending,
+                ShadowTlsWriteState::Flushing {
+                    ref buf,
+                    ref mut pos,
+                    data_len,
+                } => {
+                    while *pos < buf.len() {
+                        match this.inner.as_mut().poll_write(cx, &buf[*pos..]) {
+                            Poll::Ready(Ok(n)) => {
+                                if n == 0 {
+                                    return Poll::Ready(Err(io::Error::new(
+                                        io::ErrorKind::WriteZero,
+                                        "shadow-tls: write zero",
+                                    )));
+                                }
+                                *pos += n;
+                            }
+                            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                            Poll::Pending => return Poll::Pending,
+                        }
+                    }
+                    let data_len = *data_len;
+                    *this.write_state = ShadowTlsWriteState::Streaming;
+                    return Poll::Ready(Ok(data_len));
+                }
+                ShadowTlsWriteState::Streaming => return this.inner.poll_write(cx, data),
             }
-        } else {
-            this.inner.poll_write(cx, data)
         }
     }
 
@@ -689,17 +708,12 @@ mod tests {
             "password".to_string(),
             serde_yaml::Value::String("secret".to_string()),
         );
-        map.insert(
-            "version".to_string(),
-            serde_yaml::Value::Number(serde_yaml::Number::from(2)),
-        );
 
         let opts = PluginOpts::from_map(&map);
         assert_eq!(opts.mode.as_deref(), Some("http"));
         assert_eq!(opts.host.as_deref(), Some("example.com"));
         assert!(opts.tls);
         assert_eq!(opts.password.as_deref(), Some("secret"));
-        assert_eq!(opts.version, Some(2));
     }
 
     #[test]

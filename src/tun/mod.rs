@@ -257,7 +257,7 @@ async fn handle_tun_udp_flow(
         Some(d) => d,
         None => return Ok(()),
     };
-    let session = create_udp_session(src, dst, &first, conn_manager, dns).await?;
+    let session = create_udp_session(src, dst, &first, conn_manager, dns, "tun").await?;
     let outbound = session.outbound;
     let target = session.target;
 
@@ -474,7 +474,7 @@ async fn run_udp_relay(
         let dns_ref = dns.clone();
 
         tokio::spawn(async move {
-            match create_udp_session(src_addr, orig_dst, &data, &cm, &dns_ref).await {
+            match create_udp_session(src_addr, orig_dst, &data, &cm, &dns_ref, "tproxy").await {
                 Ok(session) => {
                     let outbound = session.outbound;
                     let target = session.target;
@@ -552,9 +552,12 @@ async fn create_udp_session(
     initial_data: &[u8],
     conn_manager: &ConnectionManager,
     dns: &Arc<DnsResolver>,
+    conn_type: &'static str,
 ) -> Result<UdpSessionResult> {
     // Run rule engine to decide action
-    let (action, domain) = conn_manager.resolve_udp_action(src, dst).await;
+    let (action, domain) = conn_manager
+        .resolve_udp_action(src, dst, conn_type, None)
+        .await;
 
     // mihomo: preHandleMetadata -- drop if FakeIP reverse lookup failed
     if domain.is_none() && dns.is_fake_ip(&dst.ip()) {

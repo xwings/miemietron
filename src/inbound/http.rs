@@ -7,7 +7,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
-use tracing::warn;
+use tracing::{debug, warn};
 
 use crate::conn::ConnectionManager;
 
@@ -34,7 +34,7 @@ pub async fn run_http_proxy(
         let auth = auth.clone();
         tokio::spawn(async move {
             if let Err(e) = handle_http_connection(stream, peer, cm, &auth).await {
-                warn!("HTTP connection from {} error: {}", peer, e);
+                debug!("HTTP connection from {} ended: {}", peer, e);
             }
         });
     }
@@ -55,7 +55,7 @@ async fn handle_http_connection(
     // Read the request line (e.g. "CONNECT example.com:443 HTTP/1.1\r\n")
     let mut request_line = String::new();
     buf_reader.read_line(&mut request_line).await?;
-    let request_line = request_line.trim_end().to_string();
+    let request_line = request_line.trim_end();
 
     if request_line.is_empty() {
         return Err(anyhow!("empty request line"));
@@ -71,6 +71,11 @@ async fn handle_http_connection(
 
     // Consume remaining headers, looking for Proxy-Authorization.
     // Keep all non-proxy headers so we can reconstruct the request for plain HTTP proxy.
+    // Cap total header bytes so a misbehaving client can't grow memory
+    // unboundedly (Go's http.ReadRequest caps at ~1MB by default; 64KB is
+    // ample for real proxy requests).
+    const MAX_HEADER_BYTES: usize = 64 * 1024;
+    let mut header_bytes = 0usize;
     let mut proxy_auth: Option<String> = None;
     let mut kept_headers: Vec<String> = Vec::new();
     loop {
@@ -79,9 +84,13 @@ async fn handle_http_connection(
         if header_line.trim().is_empty() {
             break;
         }
-        // Check for Proxy-Authorization header (case-insensitive)
-        let lower = header_line.to_lowercase();
-        if lower.starts_with("proxy-authorization:") {
+        header_bytes += header_line.len();
+        if header_bytes > MAX_HEADER_BYTES {
+            return Err(anyhow!("request headers exceed {MAX_HEADER_BYTES} bytes"));
+        }
+        // Check for Proxy-Authorization header (case-insensitive, no per-line
+        // lowercase allocation)
+        if starts_with_ignore_case(&header_line, "proxy-authorization:") {
             let value = header_line
                 .split_once(':')
                 .map(|(_, v)| v)
@@ -89,7 +98,7 @@ async fn handle_http_connection(
                 .trim()
                 .to_string();
             proxy_auth = Some(value);
-        } else if !lower.starts_with("proxy-connection:") {
+        } else if !starts_with_ignore_case(&header_line, "proxy-connection:") {
             // Keep all headers except Proxy-Authorization and Proxy-Connection
             kept_headers.push(header_line);
         }
@@ -137,17 +146,13 @@ async fn handle_http_connection(
     // Build a dummy SocketAddr — the ConnectionManager will use the host_override
     // for domain-based rule matching and proxy dispatch. We only need a real
     // SocketAddr for IP-literal targets.
-    let dst: SocketAddr = if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-        SocketAddr::new(ip, port)
-    } else {
-        // Use a placeholder IP; the domain name is passed via host_override
-        SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), port)
-    };
-
-    let host_override = if host.parse::<std::net::IpAddr>().is_err() {
-        Some(host.clone())
-    } else {
-        None
+    let (dst, host_override) = match host.parse::<std::net::IpAddr>() {
+        Ok(ip) => (SocketAddr::new(ip, port), None),
+        Err(_) => (
+            // Use a placeholder IP; the domain name is passed via host_override
+            SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), port),
+            Some(host),
+        ),
     };
 
     if method == "CONNECT" {
@@ -184,11 +189,34 @@ async fn handle_http_connection(
     Ok(())
 }
 
-/// Parse "host:port" with a default port.
+/// Case-insensitive ASCII prefix check without allocating.
+fn starts_with_ignore_case(line: &str, prefix: &str) -> bool {
+    line.len() >= prefix.len()
+        && line.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
+}
+
+/// Parse "host:port" with a default port. Strips brackets from IPv6 literals
+/// (`[2001:db8::1]:443` → host `2001:db8::1`) so they take the IP path
+/// instead of going out as a bogus domain. A malformed port is an error
+/// (matching Go's net.SplitHostPort behavior), not a silent default.
 fn parse_host_port(s: &str, default_port: u16) -> Result<(String, u16)> {
+    if let Some(rest) = s.strip_prefix('[') {
+        // IPv6 literal: [addr]:port or [addr]
+        let (host, after) = rest
+            .split_once(']')
+            .ok_or_else(|| anyhow!("malformed address: {s}"))?;
+        let port = match after.strip_prefix(':') {
+            Some(p) => p.parse().map_err(|_| anyhow!("invalid port in {s}"))?,
+            None if after.is_empty() => default_port,
+            None => return Err(anyhow!("malformed address: {s}")),
+        };
+        return Ok((host.to_string(), port));
+    }
     if let Some(idx) = s.rfind(':') {
         let host = &s[..idx];
-        let port: u16 = s[idx + 1..].parse().unwrap_or(default_port);
+        let port: u16 = s[idx + 1..]
+            .parse()
+            .map_err(|_| anyhow!("invalid port in {s}"))?;
         Ok((host.to_string(), port))
     } else {
         Ok((s.to_string(), default_port))
@@ -246,4 +274,52 @@ fn base64_decode(input: &str) -> Result<String> {
         .decode(input)
         .map_err(|e| anyhow!("base64 decode error: {e}"))?;
     String::from_utf8(bytes).map_err(|e| anyhow!("UTF-8 decode error: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_host_port_domain_with_port() {
+        assert_eq!(
+            parse_host_port("example.com:8443", 443).unwrap(),
+            ("example.com".to_string(), 8443)
+        );
+    }
+
+    #[test]
+    fn parse_host_port_domain_default_port() {
+        assert_eq!(
+            parse_host_port("example.com", 443).unwrap(),
+            ("example.com".to_string(), 443)
+        );
+    }
+
+    #[test]
+    fn parse_host_port_ipv6_literal_strips_brackets() {
+        let (host, port) = parse_host_port("[2001:db8::1]:443", 443).unwrap();
+        assert_eq!(host, "2001:db8::1");
+        assert_eq!(port, 443);
+        // The stripped host must take the IP path, not the domain path
+        assert!(host.parse::<std::net::IpAddr>().is_ok());
+    }
+
+    #[test]
+    fn parse_host_port_ipv6_literal_default_port() {
+        let (host, port) = parse_host_port("[::1]", 80).unwrap();
+        assert_eq!(host, "::1");
+        assert_eq!(port, 80);
+    }
+
+    #[test]
+    fn parse_host_port_rejects_malformed_port() {
+        assert!(parse_host_port("example.com:abc", 443).is_err());
+        assert!(parse_host_port("[::1]:abc", 443).is_err());
+    }
+
+    #[test]
+    fn parse_host_port_rejects_unclosed_bracket() {
+        assert!(parse_host_port("[2001:db8::1:443", 443).is_err());
+    }
 }

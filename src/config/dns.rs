@@ -1,3 +1,4 @@
+use super::default_true;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -129,10 +130,6 @@ impl Default for DnsConfig {
 
 fn default_listen() -> String {
     "0.0.0.0:1053".to_string()
-}
-
-fn default_true() -> bool {
-    true
 }
 
 fn default_enhanced_mode() -> String {

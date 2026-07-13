@@ -228,7 +228,7 @@ mod tests {
             alpn: vec![],
             fingerprint: None,
         };
-        let debug_str = format!("{:?}", opts);
+        let debug_str = format!("{opts:?}");
         assert!(debug_str.contains("debug.com"));
         assert!(debug_str.contains("TlsOptions"));
     }

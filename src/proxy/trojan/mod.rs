@@ -111,9 +111,22 @@ impl TrojanOutbound {
             .context("Trojan Reality: missing 'public-key'")?;
         let short_id = opts.short_id.as_deref().unwrap_or("");
         let fp = TlsFingerprint::from_str_opt(self.fingerprint.as_deref());
+        let alpn = match self.network.as_str() {
+            "ws" => vec!["http/1.1".to_string()],
+            "grpc" | "h2" => vec!["h2".to_string()],
+            _ if self.alpn.is_empty() => crate::transport::fingerprint::default_alpn_for(fp),
+            _ => self.alpn.clone(),
+        };
 
-        let config = RealityConfig::from_opts(public_key, short_id, self.sni.clone(), fp)
-            .context("Trojan Reality: invalid configuration")?;
+        let config = RealityConfig::from_opts(
+            public_key,
+            short_id,
+            self.sni.clone(),
+            fp,
+            alpn,
+            opts.support_x25519mlkem768,
+        )
+        .context("Trojan Reality: invalid configuration")?;
 
         Ok(Some(config))
     }
@@ -184,6 +197,8 @@ impl OutboundHandler for TrojanOutbound {
     }
 
     fn supports_udp(&self) -> bool {
+        // UDP relay (connect_datagram) is not yet implemented for Trojan; this
+        // flag only mirrors config, so requesting UDP errors at runtime.
         self.udp
     }
 

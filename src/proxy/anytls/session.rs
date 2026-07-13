@@ -46,10 +46,6 @@ pub struct SessionInner {
     pub closed: AtomicBool,
     pub die: Notify,
     pub peer_version: AtomicU8,
-    /// Session sequence number; bookkeeping kept to match mihomo even though
-    /// our pool is a simple VecDeque instead of a skiplist.
-    #[allow(dead_code)]
-    pub seq: u64,
     pub idle_since: PlMutex<Instant>,
 }
 
@@ -241,7 +237,6 @@ impl Session {
         reader: BoxedReader,
         writer: BoxedWriter,
         padding: Arc<PaddingFactory>,
-        seq: u64,
     ) -> Self {
         let inner = Arc::new(SessionInner {
             writer: TokioMutex::new(WriterState {
@@ -257,7 +252,6 @@ impl Session {
             closed: AtomicBool::new(false),
             die: Notify::new(),
             peer_version: AtomicU8::new(0),
-            seq,
             idle_since: PlMutex::new(Instant::now()),
         });
         // Spawn the recv loop.
@@ -291,11 +285,10 @@ impl Session {
         let sid = self.inner.next_stream_id.fetch_add(1, Ordering::AcqRel) + 1;
 
         let (tx, rx) = mpsc::unbounded_channel::<Bytes>();
-        let die_notify = Arc::new(Notify::new());
         let slot = Arc::new(StreamSlot {
             tx,
             die_err: PlMutex::new(None),
-            die_notify: Arc::clone(&die_notify),
+            die_notify: Arc::new(Notify::new()),
         });
         self.inner.register_stream(sid, Arc::clone(&slot));
 
@@ -316,7 +309,6 @@ impl Session {
             leftover: Bytes::new(),
             write_closed: false,
             die_err: slot,
-            die_notify,
             fin_sent: false,
             pending_write: None,
             pending_shutdown: None,
@@ -413,8 +405,6 @@ pub struct AnytlsStream {
     leftover: Bytes,
     write_closed: bool,
     die_err: Arc<StreamSlot>,
-    #[allow(dead_code)]
-    die_notify: Arc<Notify>,
     fin_sent: bool,
     pending_write: Option<(usize, WriteFut)>,
     pending_shutdown: Option<ShutdownFut>,

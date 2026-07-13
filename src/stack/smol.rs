@@ -810,11 +810,8 @@ impl StackCore {
         // Inbound: socket -> flow channels (emit new flows on first packet).
         for (&dst, &handle) in self.udp_socks.iter() {
             let sock = self.sockets.get_mut::<udp::Socket>(handle);
-            loop {
-                let (data, meta) = match sock.recv() {
-                    Ok((buf, meta)) => (buf.to_vec(), meta),
-                    Err(_) => break,
-                };
+            while let Ok((buf, meta)) = sock.recv() {
+                let data = buf.to_vec();
                 let src = endpoint_to_sockaddr(meta.endpoint);
                 let key = (src, dst);
                 if let Some(flow) = self.udp_flows.get(&key) {
@@ -1121,7 +1118,6 @@ mod tests {
         syn: bool,
         ack: bool,
         fin: bool,
-        rst: bool,
         seq: u32,
         ack_no: u32,
         src_port: u16,
@@ -1141,7 +1137,6 @@ mod tests {
             syn: tcp_pkt.syn(),
             ack: tcp_pkt.ack(),
             fin: tcp_pkt.fin(),
-            rst: tcp_pkt.rst(),
             seq: tcp_pkt.seq_number().0 as u32,
             ack_no: tcp_pkt.ack_number().0 as u32,
             src_port: tcp_pkt.src_port(),

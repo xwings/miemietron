@@ -1,3 +1,4 @@
+use super::default_true;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -158,10 +159,6 @@ impl Default for TunConfig {
             extra: HashMap::new(),
         }
     }
-}
-
-fn default_true() -> bool {
-    true
 }
 
 fn default_device() -> String {

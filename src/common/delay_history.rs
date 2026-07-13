@@ -50,14 +50,6 @@ impl DelayQueue {
         }
     }
 
-    /// Remove and return the oldest entry.
-    /// Matches mihomo's `Queue.Pop()`.
-    #[allow(dead_code)]
-    pub fn pop(&self) -> Option<DelayHistory> {
-        let mut items = self.inner.write();
-        items.pop_front()
-    }
-
     /// Return the most recent entry (last in queue).
     /// Matches mihomo's `Queue.Last()`.
     pub fn last(&self) -> Option<DelayHistory> {
@@ -70,19 +62,6 @@ impl DelayQueue {
     pub fn copy(&self) -> Vec<DelayHistory> {
         let items = self.inner.read();
         items.iter().cloned().collect()
-    }
-
-    /// Return the number of entries.
-    /// Matches mihomo's `Queue.Len()`.
-    #[allow(dead_code)]
-    pub fn len(&self) -> usize {
-        let items = self.inner.read();
-        items.len()
-    }
-
-    #[allow(dead_code)]
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
     }
 }
 
@@ -138,33 +117,15 @@ mod tests {
     fn test_delay_queue_put_and_last() {
         let q = DelayQueue::new();
         assert!(q.last().is_none());
-        assert!(q.is_empty());
+        assert!(q.copy().is_empty());
 
         q.put(make_entry(100));
-        assert_eq!(q.len(), 1);
+        assert_eq!(q.copy().len(), 1);
         assert_eq!(q.last().unwrap().delay, 100);
 
         q.put(make_entry(200));
-        assert_eq!(q.len(), 2);
+        assert_eq!(q.copy().len(), 2);
         assert_eq!(q.last().unwrap().delay, 200);
-    }
-
-    #[test]
-    fn test_delay_queue_pop() {
-        let q = DelayQueue::new();
-        assert!(q.pop().is_none());
-
-        q.put(make_entry(10));
-        q.put(make_entry(20));
-        q.put(make_entry(30));
-
-        let popped = q.pop().unwrap();
-        assert_eq!(popped.delay, 10);
-        assert_eq!(q.len(), 2);
-
-        let popped = q.pop().unwrap();
-        assert_eq!(popped.delay, 20);
-        assert_eq!(q.len(), 1);
     }
 
     #[test]
@@ -181,7 +142,7 @@ mod tests {
         assert_eq!(copy[2].delay, 30);
 
         // Original unaffected
-        assert_eq!(q.len(), 3);
+        assert_eq!(q.copy().len(), 3);
     }
 
     #[test]
@@ -192,11 +153,11 @@ mod tests {
         for i in 0..MAX_HISTORY {
             q.put(make_entry(i as u16));
         }
-        assert_eq!(q.len(), MAX_HISTORY);
+        assert_eq!(q.copy().len(), MAX_HISTORY);
 
         // Adding one more should evict the oldest (delay=0)
         q.put(make_entry(100));
-        assert_eq!(q.len(), MAX_HISTORY);
+        assert_eq!(q.copy().len(), MAX_HISTORY);
 
         let items = q.copy();
         // Oldest should now be delay=1 (delay=0 was evicted)
@@ -214,9 +175,8 @@ mod tests {
             q.put(make_entry(i));
         }
 
-        assert_eq!(q.len(), MAX_HISTORY);
-
         let items = q.copy();
+        assert_eq!(items.len(), MAX_HISTORY);
         // Oldest 5 should have been evicted, remaining should be 5..15
         for (idx, item) in items.iter().enumerate() {
             assert_eq!(item.delay, (idx + 5) as u16);
@@ -239,10 +199,10 @@ mod tests {
     fn test_proxy_state_with_history() {
         let state = ProxyState::new();
         assert!(state.is_alive());
-        assert!(state.history.is_empty());
+        assert!(state.history.last().is_none());
 
         state.history.put(make_entry(150));
-        assert_eq!(state.history.len(), 1);
+        assert_eq!(state.history.copy().len(), 1);
         assert_eq!(state.history.last().unwrap().delay, 150);
 
         // Simulate a failed health check

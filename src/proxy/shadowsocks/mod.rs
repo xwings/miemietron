@@ -73,11 +73,10 @@ impl ShadowsocksOutbound {
                     .map_err(|e| anyhow!("ss2022: invalid base64 key '{s}': {e}"))
             };
 
-            if password.contains(':') {
+            if let Some((server_b64, user_b64)) = password.split_once(':') {
                 // Multi-user format: "server_key:user_key"
-                let parts: Vec<&str> = password.splitn(2, ':').collect();
-                let server_key = decode_b64(parts[0])?;
-                let user_key = decode_b64(parts[1])?;
+                let server_key = decode_b64(server_b64)?;
+                let user_key = decode_b64(user_b64)?;
                 if server_key.len() != cipher.key_len() || user_key.len() != cipher.key_len() {
                     return Err(anyhow!(
                         "ss2022: key length mismatch: expected {} bytes each, got server={} user={}",
@@ -113,6 +112,44 @@ impl ShadowsocksOutbound {
             .map(PluginOpts::from_map)
             .unwrap_or_default();
 
+        // Unknown plugins must FAIL LOUD at config load, never silently
+        // degrade to a plain TCP transport (CLAUDE.md "never silent fallback").
+        match plugin.as_deref() {
+            None | Some("") => {}
+            Some("obfs-local") | Some("obfs") | Some("simple-obfs") | Some("v2ray-plugin") => {}
+            Some("shadow-tls") | Some("shadowtls") | Some("shadow-tls-v2") => {
+                // mihomo compat deviation: only shadow-tls v2 is implemented.
+                // Reject a requested v3 at load instead of silently running
+                // the v2 handshake against a v3 server.
+                let version = config
+                    .plugin_opts
+                    .as_ref()
+                    .and_then(|m| m.get("version"))
+                    .and_then(|v| match v {
+                        serde_yaml::Value::Number(n) => n.as_u64(),
+                        serde_yaml::Value::String(s) => s.parse().ok(),
+                        _ => None,
+                    });
+                if let Some(v) = version {
+                    if v != 2 {
+                        return Err(anyhow!(
+                            "ss {server}:{port} shadow-tls version {v} not supported (only v2 is implemented)"
+                        ));
+                    }
+                }
+            }
+            Some("shadow-tls-v3") => {
+                return Err(anyhow!(
+                    "ss {server}:{port} shadow-tls version 3 not supported (only v2 is implemented)"
+                ));
+            }
+            Some(plugin_name) => {
+                return Err(anyhow!(
+                    "ss {server}:{port} plugin {plugin_name} not supported"
+                ));
+            }
+        }
+
         let connect_opts = ConnectOpts::from_proxy_config(config);
 
         info!(
@@ -145,7 +182,7 @@ impl ShadowsocksOutbound {
             std::net::SocketAddr::new(ip, self.port)
         };
 
-        info!(
+        debug!(
             "ss: connecting to server {} ({}:{})",
             self.server,
             addr.ip(),
@@ -167,6 +204,25 @@ impl ShadowsocksOutbound {
         })?;
         debug!("ss: TCP connected to {}:{}", addr.ip(), addr.port());
         Ok(stream)
+    }
+
+    /// Wrap a transport in the AEAD encrypted stream and flush the handshake.
+    async fn wrap_aead<S>(&self, transport: S, addr_header: Vec<u8>) -> Result<Box<dyn ProxyStream>>
+    where
+        S: ProxyStream + 'static,
+    {
+        let mut ss = SsStream::new(
+            transport,
+            self.cipher,
+            self.master_key.clone(),
+            addr_header,
+            self.identity_keys.clone(),
+        );
+        // mihomo compat: flush handshake to wire immediately (like DialConn)
+        ss.flush_handshake()
+            .await
+            .map_err(|e| anyhow!("ss handshake flush: {e}"))?;
+        Ok(Box::new(ss))
     }
 }
 
@@ -205,18 +261,7 @@ impl OutboundHandler for ShadowsocksOutbound {
         match self.plugin.as_deref() {
             None | Some("") => {
                 // Direct TCP - wrap in AEAD encrypted stream
-                let mut ss = SsStream::new(
-                    tcp_stream,
-                    self.cipher,
-                    self.master_key.clone(),
-                    addr_header,
-                    self.identity_keys.clone(),
-                );
-                // mihomo compat: flush handshake to wire immediately (like DialConn)
-                ss.flush_handshake()
-                    .await
-                    .map_err(|e| anyhow::anyhow!("ss handshake flush: {e}"))?;
-                Ok(Box::new(ss))
+                self.wrap_aead(tcp_stream, addr_header).await
             }
 
             Some("obfs-local") | Some("obfs") | Some("simple-obfs") => {
@@ -231,17 +276,7 @@ impl OutboundHandler for ShadowsocksOutbound {
                     _ => ObfsStream::new_http(tcp_stream, host.to_string()),
                 };
 
-                let mut ss = SsStream::new(
-                    obfs_stream,
-                    self.cipher,
-                    self.master_key.clone(),
-                    addr_header,
-                    self.identity_keys.clone(),
-                );
-                ss.flush_handshake()
-                    .await
-                    .map_err(|e| anyhow::anyhow!("ss handshake flush: {e}"))?;
-                Ok(Box::new(ss))
+                self.wrap_aead(obfs_stream, addr_header).await
             }
 
             Some("v2ray-plugin") => {
@@ -253,23 +288,10 @@ impl OutboundHandler for ShadowsocksOutbound {
                         .await
                         .map_err(|e| anyhow!("ss: v2ray-plugin setup failed: {e}"))?;
 
-                let mut ss = SsStream::new(
-                    transport,
-                    self.cipher,
-                    self.master_key.clone(),
-                    addr_header,
-                    self.identity_keys.clone(),
-                );
-                ss.flush_handshake()
-                    .await
-                    .map_err(|e| anyhow::anyhow!("ss handshake flush: {e}"))?;
-                Ok(Box::new(ss))
+                self.wrap_aead(transport, addr_header).await
             }
 
-            Some("shadow-tls")
-            | Some("shadowtls")
-            | Some("shadow-tls-v2")
-            | Some("shadow-tls-v3") => {
+            Some("shadow-tls") | Some("shadowtls") | Some("shadow-tls-v2") => {
                 // shadow-tls: TLS handshake + HMAC-authenticated data, then AEAD
                 debug!("ss: using shadow-tls");
 
@@ -278,37 +300,11 @@ impl OutboundHandler for ShadowsocksOutbound {
                         .await
                         .map_err(|e| anyhow!("ss: shadow-tls setup failed: {e}"))?;
 
-                let mut ss = SsStream::new(
-                    stls_stream,
-                    self.cipher,
-                    self.master_key.clone(),
-                    addr_header,
-                    self.identity_keys.clone(),
-                );
-                ss.flush_handshake()
-                    .await
-                    .map_err(|e| anyhow::anyhow!("ss handshake flush: {e}"))?;
-                Ok(Box::new(ss))
+                self.wrap_aead(stls_stream, addr_header).await
             }
 
-            Some(plugin_name) => {
-                // Unknown plugin -- fall back to direct TCP with a warning.
-                tracing::warn!(
-                    "ss: plugin '{}' not supported, using direct TCP",
-                    plugin_name
-                );
-                let mut ss = SsStream::new(
-                    tcp_stream,
-                    self.cipher,
-                    self.master_key.clone(),
-                    addr_header,
-                    self.identity_keys.clone(),
-                );
-                ss.flush_handshake()
-                    .await
-                    .map_err(|e| anyhow::anyhow!("ss handshake flush: {e}"))?;
-                Ok(Box::new(ss))
-            }
+            // Unknown plugins are rejected in from_config; unreachable in practice.
+            Some(plugin_name) => Err(anyhow!("ss: plugin '{plugin_name}' not supported")),
         }
     }
 
@@ -333,5 +329,120 @@ impl OutboundHandler for ShadowsocksOutbound {
         let socket =
             udp::SsUdpSocket::new(server_addr, self.cipher, self.master_key.clone()).await?;
         Ok(Box::new(socket))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::proxy::ProxyConfig;
+    use std::collections::HashMap;
+
+    fn make_ss_config() -> ProxyConfig {
+        ProxyConfig {
+            name: "ss-test".to_string(),
+            proxy_type: "ss".to_string(),
+            server: Some("1.2.3.4".to_string()),
+            port: Some(8388),
+            cipher: Some("aes-256-gcm".to_string()),
+            password: Some("test-password".to_string()),
+            udp: Some(true),
+            tfo: Some(false),
+            mptcp: Some(false),
+            // Defaults for the rest
+            uuid: None,
+            alter_id: None,
+            flow: None,
+            encryption: None,
+            packet_encoding: None,
+            xudp: None,
+            packet_addr: None,
+            tls: None,
+            sni: None,
+            servername: None,
+            skip_cert_verify: None,
+            fingerprint: None,
+            client_fingerprint: None,
+            alpn: None,
+            certificate: None,
+            private_key: None,
+            reality_opts: None,
+            ech_opts: None,
+            network: None,
+            ws_opts: None,
+            grpc_opts: None,
+            h2_opts: None,
+            http_opts: None,
+            xhttp_opts: None,
+            ss_opts: None,
+            udp_over_tcp: None,
+            udp_over_tcp_version: None,
+            plugin: None,
+            plugin_opts: None,
+            interface_name: None,
+            routing_mark: None,
+            tcp_concurrent: None,
+            ip_version: None,
+            dialer_proxy: None,
+            keep_alive_idle: None,
+            keep_alive_interval: None,
+            disable_keep_alive: None,
+            extra: HashMap::new(),
+        }
+    }
+
+    /// Unknown plugins must FAIL LOUD at config load, never silently fall
+    /// back to a plain TCP transport.
+    #[test]
+    fn ss_unknown_plugin_rejected_at_load() {
+        for plugin in ["restls", "kcptun", "does-not-exist"] {
+            let mut config = make_ss_config();
+            config.plugin = Some(plugin.to_string());
+            let err = match ShadowsocksOutbound::from_config(&config) {
+                Ok(_) => panic!("plugin {plugin} must be rejected"),
+                Err(e) => e.to_string(),
+            };
+            assert!(
+                err.contains(&format!("plugin {plugin} not supported")),
+                "unexpected error for {plugin}: {err}"
+            );
+        }
+    }
+
+    /// shadow-tls v3 is not implemented; requesting it must be a load-time
+    /// error rather than silently running the v2 handshake.
+    #[test]
+    fn ss_shadow_tls_v3_rejected_at_load() {
+        // Via the plugin name alias.
+        let mut config = make_ss_config();
+        config.plugin = Some("shadow-tls-v3".to_string());
+        assert!(ShadowsocksOutbound::from_config(&config).is_err());
+
+        // Via plugin-opts version.
+        let mut config = make_ss_config();
+        config.plugin = Some("shadow-tls".to_string());
+        let mut opts = HashMap::new();
+        opts.insert(
+            "version".to_string(),
+            serde_yaml::Value::Number(serde_yaml::Number::from(3)),
+        );
+        config.plugin_opts = Some(opts);
+        assert!(ShadowsocksOutbound::from_config(&config).is_err());
+    }
+
+    #[test]
+    fn ss_known_plugins_accepted_at_load() {
+        for plugin in ["", "obfs", "obfs-local", "v2ray-plugin", "shadow-tls"] {
+            let mut config = make_ss_config();
+            config.plugin = if plugin.is_empty() {
+                None
+            } else {
+                Some(plugin.to_string())
+            };
+            assert!(
+                ShadowsocksOutbound::from_config(&config).is_ok(),
+                "plugin '{plugin}' should be accepted"
+            );
+        }
     }
 }

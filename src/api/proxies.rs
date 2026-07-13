@@ -186,6 +186,58 @@ fn proxy_json(state: &ApiState, name: &str, proxy_type: &str, udp: bool) -> Valu
     })
 }
 
+/// Non-group proxy JSON as emitted under `/proxies`, with the empty
+/// `all`/`now` fields dashboards expect for plain proxies.
+fn plain_proxy_json(state: &ApiState, name: &str, proxy_type: &str, udp: bool) -> Value {
+    json!({
+        "name": name,
+        "type": proxy_type,
+        "udp": udp,
+        "history": proxy_history(state, name),
+        "all": [],
+        "now": "",
+        "alive": proxy_alive(state, name),
+        "extra": proxy_extra(state, name),
+    })
+}
+
+/// Group names in config order, then any live groups not in config
+/// (shouldn't happen, but be safe).
+fn ordered_group_names(
+    config: &crate::config::MiemieConfig,
+    live_groups: &std::collections::HashMap<
+        String,
+        std::sync::Arc<dyn crate::proxy_group::ProxyGroup>,
+    >,
+) -> Vec<String> {
+    let mut group_names: Vec<String> = config.proxy_groups.iter().map(|g| g.name.clone()).collect();
+    for (name, _) in live_groups.iter() {
+        if !group_names.contains(name) {
+            group_names.push(name.clone());
+        }
+    }
+    group_names
+}
+
+/// Persist current group selections to cache.db when `store-selected` is on.
+/// `action` names the operation in the failure log.
+fn persist_selections_if_enabled(state: &ApiState, action: &str) {
+    let store_selected = state
+        .app
+        .config()
+        .profile
+        .as_ref()
+        .map(|p| p.store_selected)
+        .unwrap_or(false);
+    if store_selected {
+        let selections = state.app.proxy_manager().get_all_selections();
+        let home_dir = &state.app.home_dir;
+        if let Err(e) = crate::store::save_selected(home_dir, &selections) {
+            tracing::warn!("Failed to persist {}: {}", action, e);
+        }
+    }
+}
+
 pub async fn get_proxies(State(state): State<ApiState>) -> Json<Value> {
     // mihomo compat: ordered map — GLOBAL first, then groups (config order),
     // then DIRECT/REJECT, then individual proxies.
@@ -195,14 +247,7 @@ pub async fn get_proxies(State(state): State<ApiState>) -> Json<Value> {
     // Collect group info first (need group_names for GLOBAL)
     let live_groups = pm.list_live_groups();
     let config = state.app.config();
-    // Use config order for groups
-    let mut group_names: Vec<String> = config.proxy_groups.iter().map(|g| g.name.clone()).collect();
-    // Add any live groups not in config (shouldn't happen, but be safe)
-    for (name, _) in live_groups.iter() {
-        if !group_names.contains(name) {
-            group_names.push(name.clone());
-        }
-    }
+    let group_names = ordered_group_names(&config, live_groups);
 
     // 1. GLOBAL first — a real live selector (see ProxyManager GLOBAL setup).
     if let Some(global) = live_groups.get("GLOBAL") {
@@ -223,41 +268,24 @@ pub async fn get_proxies(State(state): State<ApiState>) -> Json<Value> {
     }
 
     // 3. DIRECT and REJECT
-    for p in pm.list_proxies() {
+    let all_proxies = pm.list_proxies();
+    for p in &all_proxies {
         if p.name == "DIRECT" || p.name == "REJECT" || p.name == "REJECT-DROP" {
             proxies.insert(
                 p.name.clone(),
-                json!({
-                    "name": p.name,
-                    "type": p.proxy_type,
-                    "udp": p.udp,
-                    "history": proxy_history(&state, &p.name),
-                    "all": [],
-                    "now": "",
-                    "alive": proxy_alive(&state, &p.name),
-                    "extra": proxy_extra(&state, &p.name),
-                }),
+                plain_proxy_json(&state, &p.name, &p.proxy_type, p.udp),
             );
         }
     }
 
     // 4. Individual proxies
-    for p in pm.list_proxies() {
+    for p in &all_proxies {
         if p.name == "DIRECT" || p.name == "REJECT" || p.name == "REJECT-DROP" {
             continue;
         }
         proxies.insert(
             p.name.clone(),
-            json!({
-                "name": p.name,
-                "type": p.proxy_type,
-                "udp": p.udp,
-                "history": proxy_history(&state, &p.name),
-                "all": [],
-                "now": "",
-                "alive": proxy_alive(&state, &p.name),
-                "extra": proxy_extra(&state, &p.name),
-            }),
+            plain_proxy_json(&state, &p.name, &p.proxy_type, p.udp),
         );
     }
 
@@ -274,16 +302,12 @@ pub async fn get_proxy(
     }
 
     if let Some(handler) = state.app.proxy_manager().get(&name) {
-        Ok(Json(json!({
-            "name": handler.name(),
-            "type": handler.proto(),
-            "udp": handler.supports_udp(),
-            "history": proxy_history(&state, &name),
-            "all": [],
-            "now": "",
-            "alive": proxy_alive(&state, &name),
-            "extra": proxy_extra(&state, &name),
-        })))
+        Ok(Json(plain_proxy_json(
+            &state,
+            handler.name(),
+            handler.proto(),
+            handler.supports_udp(),
+        )))
     } else {
         Err(StatusCode::NOT_FOUND)
     }
@@ -317,8 +341,8 @@ async fn do_delay_test(
     let port = parsed
         .port()
         .unwrap_or(if parsed.scheme() == "https" { 443 } else { 80 });
-    let path = if parsed.query().is_some() {
-        format!("{}?{}", parsed.path(), parsed.query().unwrap())
+    let path = if let Some(query) = parsed.query() {
+        format!("{}?{}", parsed.path(), query)
     } else {
         parsed.path().to_string()
     };
@@ -442,7 +466,7 @@ pub async fn get_proxy_delay(
         Ok(Ok((delay, status))) => {
             let satisfied = expected_status
                 .as_deref()
-                .map_or(true, |r| status_matches(status, r));
+                .is_none_or(|r| status_matches(status, r));
             if satisfied {
                 store.record_result(&name, url_str, Some(delay));
             } else {
@@ -541,20 +565,7 @@ pub async fn put_proxy(
         tracing::info!("Selected proxy '{}' in group '{}'", body.name, group_name);
 
         // Persist selection if store-selected is enabled
-        let store_selected = state
-            .app
-            .config()
-            .profile
-            .as_ref()
-            .map(|p| p.store_selected)
-            .unwrap_or(false);
-        if store_selected {
-            let selections = proxy_manager.get_all_selections();
-            let home_dir = &state.app.home_dir;
-            if let Err(e) = crate::store::save_selected(home_dir, &selections) {
-                tracing::warn!("Failed to persist proxy selection: {}", e);
-            }
-        }
+        persist_selections_if_enabled(&state, "proxy selection");
 
         StatusCode::NO_CONTENT.into_response()
     } else {
@@ -613,20 +624,7 @@ pub async fn delete_proxy(
     tracing::info!("Cleared forced selection for group '{}'", name);
 
     // Persist the reset selection if store-selected is enabled
-    let store_selected = state
-        .app
-        .config()
-        .profile
-        .as_ref()
-        .map(|p| p.store_selected)
-        .unwrap_or(false);
-    if store_selected {
-        let selections = proxy_manager.get_all_selections();
-        let home_dir = &state.app.home_dir;
-        if let Err(e) = crate::store::save_selected(home_dir, &selections) {
-            tracing::warn!("Failed to persist proxy selection reset: {}", e);
-        }
-    }
+    persist_selections_if_enabled(&state, "proxy selection reset");
 
     StatusCode::NO_CONTENT.into_response()
 }
@@ -639,13 +637,7 @@ pub async fn get_groups(State(state): State<ApiState>) -> Json<Value> {
     let live_groups = pm.list_live_groups();
     let config = state.app.config();
 
-    // Config order for groups, then any live groups not in config.
-    let mut group_names: Vec<String> = config.proxy_groups.iter().map(|g| g.name.clone()).collect();
-    for (name, _) in live_groups.iter() {
-        if !group_names.contains(name) {
-            group_names.push(name.clone());
-        }
-    }
+    let group_names = ordered_group_names(&config, live_groups);
 
     let mut groups: Vec<Value> = Vec::with_capacity(group_names.len());
     for name in &group_names {
@@ -767,7 +759,7 @@ pub async fn get_group_delay(
                 Some((delay, status)) => {
                     let satisfied = expected_status
                         .as_deref()
-                        .map_or(true, |r| status_matches(status, r));
+                        .is_none_or(|r| status_matches(status, r));
                     if satisfied {
                         store.record_result(&pname, &url_str, Some(delay));
                     } else {
