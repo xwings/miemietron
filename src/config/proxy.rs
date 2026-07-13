@@ -141,6 +141,60 @@ where
     deserializer.deserialize_any(FlexU16Visitor)
 }
 
+fn deserialize_optional_flexible_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    use serde::de;
+
+    struct FlexStringVisitor;
+    impl<'de> de::Visitor<'de> for FlexStringVisitor {
+        type Value = Option<String>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a string or scalar value")
+        }
+
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+            Ok(Some(v.to_string()))
+        }
+
+        fn visit_string<E: de::Error>(self, v: String) -> Result<Self::Value, E> {
+            Ok(Some(v))
+        }
+
+        fn visit_u64<E: de::Error>(self, v: u64) -> Result<Self::Value, E> {
+            Ok(Some(v.to_string()))
+        }
+
+        fn visit_i64<E: de::Error>(self, v: i64) -> Result<Self::Value, E> {
+            Ok(Some(v.to_string()))
+        }
+
+        fn visit_f64<E: de::Error>(self, v: f64) -> Result<Self::Value, E> {
+            Ok(Some(v.to_string()))
+        }
+
+        fn visit_bool<E: de::Error>(self, v: bool) -> Result<Self::Value, E> {
+            Ok(Some(v.to_string()))
+        }
+
+        fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_some<D2: Deserializer<'de>>(self, d: D2) -> Result<Self::Value, D2::Error> {
+            d.deserialize_any(FlexStringVisitor)
+        }
+    }
+
+    deserializer.deserialize_any(FlexStringVisitor)
+}
+
 /// Proxy definition from config. Uses serde flatten to accept all protocol-specific fields.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -228,6 +282,8 @@ pub struct ProxyConfig {
     pub h2_opts: Option<H2Opts>,
     #[serde(default)]
     pub http_opts: Option<HashMap<String, serde_yaml::Value>>,
+    #[serde(default)]
+    pub xhttp_opts: Option<XHttpOpts>,
 
     // SS over Trojan
     #[serde(default)]
@@ -306,6 +362,120 @@ pub struct H2Opts {
     pub host: Vec<String>,
     #[serde(default)]
     pub path: Option<String>,
+}
+
+/// VLESS XHTTP (formerly SplitHTTP) transport options.
+///
+/// The field names mirror mihomo's `adapter/outbound/vless.go`. Numeric range
+/// values remain strings because mihomo accepts both a scalar (for example
+/// `30`) and a range (for example `20-80`).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub struct XHttpOpts {
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default)]
+    pub host: Option<String>,
+    #[serde(default)]
+    pub mode: Option<String>,
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
+    #[serde(default)]
+    pub no_grpc_header: Option<bool>,
+    #[serde(default)]
+    pub x_padding_bytes: Option<String>,
+    #[serde(default)]
+    pub x_padding_obfs_mode: Option<bool>,
+    #[serde(default)]
+    pub x_padding_key: Option<String>,
+    #[serde(default)]
+    pub x_padding_header: Option<String>,
+    #[serde(default)]
+    pub x_padding_placement: Option<String>,
+    #[serde(default)]
+    pub x_padding_method: Option<String>,
+    #[serde(default)]
+    pub uplink_http_method: Option<String>,
+    #[serde(default)]
+    pub session_placement: Option<String>,
+    #[serde(default)]
+    pub session_key: Option<String>,
+    #[serde(default)]
+    pub session_table: Option<String>,
+    #[serde(default)]
+    pub session_length: Option<String>,
+    #[serde(default)]
+    pub seq_placement: Option<String>,
+    #[serde(default)]
+    pub seq_key: Option<String>,
+    #[serde(default)]
+    pub uplink_data_placement: Option<String>,
+    #[serde(default)]
+    pub uplink_data_key: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_flexible_string")]
+    pub uplink_chunk_size: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_flexible_string")]
+    pub sc_max_each_post_bytes: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_flexible_string")]
+    pub sc_min_posts_interval_ms: Option<String>,
+    #[serde(default)]
+    pub reuse_settings: Option<XHttpReuseSettings>,
+    #[serde(default)]
+    pub download_settings: Option<XHttpDownloadSettings>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub struct XHttpReuseSettings {
+    #[serde(default, deserialize_with = "deserialize_optional_flexible_string")]
+    pub max_concurrency: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_flexible_string")]
+    pub max_connections: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_flexible_string")]
+    pub c_max_reuse_times: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_flexible_string")]
+    pub h_max_request_times: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_flexible_string")]
+    pub h_max_reusable_secs: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_flexible_string")]
+    pub h_keep_alive_period: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub struct XHttpDownloadSettings {
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default)]
+    pub host: Option<String>,
+    #[serde(default)]
+    pub headers: Option<HashMap<String, String>>,
+    #[serde(default)]
+    pub reuse_settings: Option<XHttpReuseSettings>,
+    #[serde(default)]
+    pub server: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_flexible_u16")]
+    pub port: Option<u16>,
+    #[serde(default)]
+    pub tls: Option<bool>,
+    #[serde(default)]
+    pub alpn: Option<Vec<String>>,
+    #[serde(default)]
+    pub ech_opts: Option<HashMap<String, serde_yaml::Value>>,
+    #[serde(default)]
+    pub reality_opts: Option<RealityOpts>,
+    #[serde(default)]
+    pub skip_cert_verify: Option<bool>,
+    #[serde(default)]
+    pub fingerprint: Option<String>,
+    #[serde(default)]
+    pub certificate: Option<String>,
+    #[serde(default)]
+    pub private_key: Option<String>,
+    #[serde(default)]
+    pub servername: Option<String>,
+    #[serde(default)]
+    pub client_fingerprint: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -628,5 +798,34 @@ short-id: "abcd1234"
         let opts: RealityOpts = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(opts.public_key.as_deref(), Some("test-public-key"));
         assert_eq!(opts.short_id.as_deref(), Some("abcd1234"));
+    }
+
+    #[test]
+    fn parse_xhttp_opts() {
+        let yaml = r#"
+name: test-xhttp
+type: vless
+server: proxy.example.com
+port: 443
+uuid: 11111111-2222-3333-4444-555555555555
+tls: true
+network: xhttp
+alpn: [h2, http/1.1]
+xhttp-opts:
+  host: edge.example.com
+  mode: auto
+  path: /tunnel
+  x-padding-bytes: 100-1000
+  sc-max-each-post-bytes: 1000000
+  sc-min-posts-interval-ms: "30"
+"#;
+        let config: ProxyConfig = serde_yaml::from_str(yaml).unwrap();
+        let opts = config.xhttp_opts.as_ref().unwrap();
+        assert_eq!(opts.host.as_deref(), Some("edge.example.com"));
+        assert_eq!(opts.mode.as_deref(), Some("auto"));
+        assert_eq!(opts.path.as_deref(), Some("/tunnel"));
+        assert_eq!(opts.x_padding_bytes.as_deref(), Some("100-1000"));
+        assert_eq!(opts.sc_max_each_post_bytes.as_deref(), Some("1000000"));
+        assert_eq!(opts.sc_min_posts_interval_ms.as_deref(), Some("30"));
     }
 }

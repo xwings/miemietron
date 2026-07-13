@@ -25,14 +25,14 @@ Only tested on vanilla OpenWrt with OpenClash. The firmware used for testing is 
 - **Shadowsocks** — AEAD (AES-128/256-GCM, ChaCha20-Poly1305) + SS2022 (2022-blake3-aes-256-gcm with multi-user EIH)
 - **ShadowsocksR** — Stream ciphers + obfs + protocol plugins
 - **VMess** — AEAD mode, AES-128-GCM / ChaCha20-Poly1305
-- **VLESS** — TCP, TLS, WebSocket, gRPC, HTTP/2, Reality, XTLS-Vision
+- **VLESS** — TCP, TLS, WebSocket, gRPC, HTTP/2, XHTTP-over-H2, Reality, XTLS-Vision
 - **Trojan** — TCP, TLS, WebSocket, gRPC, Reality
 
 ### Transports
 - **TLS** with browser fingerprinting (Chrome, Firefox, Safari, iOS, Android)
 - **Reality** protocol (x25519, camouflage SNI)
 - **WebSocket** with early data
-- **gRPC** / **HTTP/2**
+- **gRPC** / **HTTP/2** / **XHTTP** (`stream-one`, `stream-up`, `packet-up` over H2)
 
 ### SS Plugins
 - **simple-obfs** (HTTP + TLS modes)

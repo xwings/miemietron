@@ -7,3 +7,4 @@ pub mod reality;
 pub mod tcp;
 pub mod tls;
 pub mod ws;
+pub mod xhttp;

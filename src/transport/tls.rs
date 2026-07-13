@@ -19,6 +19,16 @@ pub struct TlsOptions {
     pub fingerprint: Option<String>,
 }
 
+impl TlsOptions {
+    /// Return a copy with the ALPN list replaced. Used by WebSocket transports
+    /// to force `http/1.1` regardless of the config's `alpn` (mihomo compat:
+    /// a WS upgrade can't run over an h2/h3-negotiated TLS connection).
+    pub fn with_alpn(mut self, alpn: Vec<String>) -> Self {
+        self.alpn = alpn;
+        self
+    }
+}
+
 /// Convenience function: wrap an existing async stream with a TLS client
 /// handshake using `TlsOptions`.
 pub async fn wrap_tls<S>(stream: S, opts: &TlsOptions) -> Result<TlsStream<S>>

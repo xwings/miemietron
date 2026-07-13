@@ -18,6 +18,7 @@ use crate::transport::reality::{self, RealityConfig};
 use crate::transport::tcp::{self, ConnectOpts};
 use crate::transport::tls::{self, TlsOptions};
 use crate::transport::ws::{self, WsOptions};
+use crate::transport::xhttp::{self, XHttpConfig};
 
 use header::{encode_request_with_flow, parse_uuid, VlessStream, CMD_TCP};
 
@@ -37,6 +38,7 @@ pub struct VlessOutbound {
     ws_opts: Option<WsOpts>,
     grpc_opts: Option<GrpcOpts>,
     h2_opts: Option<H2Opts>,
+    xhttp_config: Option<XHttpConfig>,
     reality_opts: Option<RealityOpts>,
     udp: bool,
     connect_opts: ConnectOpts,
@@ -63,6 +65,29 @@ impl VlessOutbound {
             .clone()
             .or_else(|| config.fingerprint.clone());
         let network = config.network.clone().unwrap_or_else(|| "tcp".to_string());
+        let xhttp_config = if network == "xhttp" {
+            if alpn.len() == 1 && alpn[0] == "h3" {
+                anyhow::bail!("VLESS XHTTP: HTTP/3 transport is not implemented yet");
+            }
+            if alpn.len() == 1 && alpn[0] == "http/1.1" {
+                anyhow::bail!("VLESS XHTTP: HTTP/1.1 transport is not implemented yet");
+            }
+            if config.reality_opts.is_some() {
+                anyhow::bail!(
+                    "VLESS XHTTP over REALITY is unavailable until REALITY ClientHello support is implemented"
+                );
+            }
+            Some(
+                XHttpConfig::from_options(
+                    config.xhttp_opts.as_ref(),
+                    &sni,
+                    config.reality_opts.is_some(),
+                )
+                .context("VLESS XHTTP: invalid configuration")?,
+            )
+        } else {
+            None
+        };
 
         let connect_opts = ConnectOpts::from_proxy_config(config);
 
@@ -81,6 +106,7 @@ impl VlessOutbound {
             ws_opts: config.ws_opts.clone(),
             grpc_opts: config.grpc_opts.clone(),
             h2_opts: config.h2_opts.clone(),
+            xhttp_config,
             reality_opts: config.reality_opts.clone(),
             udp: config.udp.unwrap_or(true),
             connect_opts,
@@ -97,6 +123,53 @@ impl VlessOutbound {
         );
         let stream = tcp::connect(addr, &self.connect_opts).await?;
         Ok(stream)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse_xhttp(alpn: &str) -> ProxyConfig {
+        serde_yaml::from_str(&format!(
+            r#"
+name: test-xhttp
+type: vless
+server: proxy.example.com
+port: 443
+uuid: 11111111-2222-3333-4444-555555555555
+tls: true
+network: xhttp
+alpn: {alpn}
+xhttp-opts:
+  host: edge.example.com
+  mode: auto
+  path: /tunnel
+  x-padding-bytes: 100-1000
+"#
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn xhttp_accepts_mihomo_default_h2_selection() {
+        let config = parse_xhttp("[h2, http/1.1]");
+        let outbound = VlessOutbound::new(&config).unwrap();
+        assert!(outbound.xhttp_config.is_some());
+    }
+
+    #[test]
+    fn xhttp_exact_http1_is_rejected_at_load() {
+        let config = parse_xhttp("[http/1.1]");
+        let error = VlessOutbound::new(&config).err().unwrap().to_string();
+        assert!(error.contains("HTTP/1.1 transport is not implemented"));
+    }
+
+    #[test]
+    fn xhttp_exact_h3_is_rejected_at_load() {
+        let config = parse_xhttp("[h3]");
+        let error = VlessOutbound::new(&config).err().unwrap().to_string();
+        assert!(error.contains("HTTP/3 transport is not implemented"));
     }
 }
 
@@ -172,6 +245,15 @@ impl OutboundHandler for VlessOutbound {
                     let vless_stream = VlessStream::new(h2_stream, header);
                     Ok(Box::new(vless_stream))
                 }
+                "xhttp" => {
+                    // Correct REALITY needs a ClientHello that explicitly
+                    // negotiates h2. The current rustls REALITY shim cannot
+                    // provide mihomo-compatible REALITY wire semantics, so do
+                    // not silently send plain VLESS or malformed XHTTP.
+                    anyhow::bail!(
+                        "VLESS XHTTP over REALITY is unavailable until REALITY ClientHello support is implemented"
+                    )
+                }
                 _ => {
                     let reality_stream = reality::wrap_reality(tcp_stream, &reality_config)
                         .await
@@ -188,10 +270,13 @@ impl OutboundHandler for VlessOutbound {
                 "ws" => {
                     // WebSocket transport (optionally over TLS).
                     if self.tls {
+                        // mihomo compat: vless.go:165 forces ALPN http/1.1 for
+                        // WebSocket regardless of the config's `alpn` — a WS
+                        // upgrade cannot run over an h2/h3-negotiated TLS conn.
                         let tls_opts = TlsOptions {
                             sni: self.sni.clone(),
                             skip_cert_verify: self.skip_cert_verify,
-                            alpn: self.alpn.clone(),
+                            alpn: vec!["http/1.1".to_string()],
                             fingerprint: self.fingerprint.clone(),
                         };
                         let tls_stream = tls::wrap_tls(tcp_stream, &tls_opts)
@@ -258,6 +343,37 @@ impl OutboundHandler for VlessOutbound {
                     let header = self.build_header(CMD_TCP, target);
                     let vless_stream = VlessStream::new(h2_stream, header);
                     Ok(Box::new(vless_stream))
+                }
+                "xhttp" => {
+                    let xhttp_config = self
+                        .xhttp_config
+                        .clone()
+                        .context("VLESS XHTTP: missing normalized configuration")?;
+
+                    let header = self.build_header(CMD_TCP, target);
+                    if self.tls {
+                        // mihomo NewTransport forces h2 unless ALPN is exactly
+                        // [http/1.1] or [h3], even when the config lists both
+                        // h2 and http/1.1.
+                        let tls_opts = TlsOptions {
+                            sni: self.sni.clone(),
+                            skip_cert_verify: self.skip_cert_verify,
+                            alpn: vec!["h2".to_string()],
+                            fingerprint: self.fingerprint.clone(),
+                        };
+                        let tls_stream = tls::wrap_tls(tcp_stream, &tls_opts)
+                            .await
+                            .context("VLESS XHTTP: TLS handshake failed")?;
+                        let xhttp_stream = xhttp::connect_h2(tls_stream, xhttp_config)
+                            .await
+                            .context("VLESS XHTTP: HTTP/2 connect failed")?;
+                        Ok(Box::new(VlessStream::new(xhttp_stream, header)))
+                    } else {
+                        let xhttp_stream = xhttp::connect_h2(tcp_stream, xhttp_config)
+                            .await
+                            .context("VLESS XHTTP: h2c connect failed")?;
+                        Ok(Box::new(VlessStream::new(xhttp_stream, header)))
+                    }
                 }
                 _ => {
                     // Plain TCP or TLS-only transport.

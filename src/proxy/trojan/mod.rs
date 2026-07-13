@@ -243,7 +243,14 @@ impl OutboundHandler for TrojanOutbound {
             // Standard TLS transport (Trojan always requires TLS).
             match self.network.as_str() {
                 "ws" => {
-                    let tls_opts = self.tls_options();
+                    // mihomo compat: trojan.go:95-97 — WS uses DefaultWebsocketALPN
+                    // (["http/1.1"]) unless the config sets an explicit `alpn`.
+                    let ws_alpn = if self.alpn.is_empty() {
+                        vec!["http/1.1".to_string()]
+                    } else {
+                        self.alpn.clone()
+                    };
+                    let tls_opts = self.tls_options().with_alpn(ws_alpn);
                     let tls_stream = tls::wrap_tls(tcp_stream, &tls_opts)
                         .await
                         .context("Trojan: TLS handshake failed")?;

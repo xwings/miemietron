@@ -212,7 +212,9 @@ impl OutboundHandler for VmessOutbound {
             "ws" => {
                 // WebSocket transport (optionally over TLS).
                 if self.tls {
-                    let tls_opts = self.tls_options();
+                    // mihomo compat: vmess.go:132 forces ALPN http/1.1 for WebSocket
+                    // regardless of config `alpn` (WS needs HTTP/1.1).
+                    let tls_opts = self.tls_options().with_alpn(vec!["http/1.1".to_string()]);
                     let tls_stream = tls::wrap_tls(tcp_stream, &tls_opts)
                         .await
                         .context("VMess: TLS handshake failed")?;
@@ -332,6 +334,7 @@ mod tests {
             grpc_opts: None,
             h2_opts: None,
             http_opts: None,
+            xhttp_opts: None,
             ss_opts: None,
             interface_name: None,
             routing_mark: None,

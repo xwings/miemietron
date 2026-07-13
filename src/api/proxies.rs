@@ -353,6 +353,9 @@ async fn do_delay_test(
 
         let req = format!("HEAD {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
         tls_stream.write_all(req.as_bytes()).await?;
+        // Flush so message-framed transports (WebSocket) actually put the
+        // request on the wire — write_all alone leaves it buffered in the sink.
+        tls_stream.flush().await?;
 
         let mut buf = [0u8; 512];
         let n = tls_stream.read(&mut buf).await?;
@@ -361,6 +364,7 @@ async fn do_delay_test(
         let mut stream = stream;
         let req = format!("HEAD {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
         stream.write_all(req.as_bytes()).await?;
+        stream.flush().await?;
 
         let mut buf = [0u8; 512];
         let n = stream.read(&mut buf).await?;

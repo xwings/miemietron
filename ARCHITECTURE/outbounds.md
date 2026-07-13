@@ -49,6 +49,11 @@ The **anytls** outbound deserves a dedicated note. It is a session-multiplexed, 
 - `cargo test anytls` — anytls frame/padding/idle-pool tests; pass = `test result: ok`.
 - Integration: `timeout 30 target/debug/miemietron -d <openclash-dir> -f <config.yaml>`, then `curl` a domestic and a foreign URL through `127.0.0.1:7890` and confirm the selected outbound via `/proxies`.
 
+## mihomo parity notes (2026-07 audit)
+- VLESS request framing writes `command · port(BE) · addrType · addr` (mihomo `transport/vless/conn.go`) — the port precedes the address type, unlike the SOCKS5 order Trojan/Shadowsocks use. `encode_address_vless` in `src/proxy/vless/header.rs` handles this; the shared `encode_address` (SOCKS5 order) stays for Trojan.
+- WebSocket transports force ALPN `http/1.1` for VLESS/VMess (mihomo hardcodes it) and default to `http/1.1` for Trojan unless `alpn` is set — a WS upgrade cannot run over an h2/h3-negotiated TLS connection.
+- VLESS `network: xhttp` follows mihomo Meta's H2 wire model: `auto` resolves to `packet-up` without REALITY, downstream uses `GET /path/{session}`, ordered upstream chunks use `POST /path/{session}/{seq}`, and `stream-one` / `stream-up`, metadata placement, payload placement, range options, default browser headers, and X-Padding are supported. Exact-ALPN HTTP/1.1, HTTP/3, XMUX cross-stream reuse, separate `download-settings`, and REALITY+XHTTP currently fail explicitly instead of falling through to plain TLS+VLESS.
+
 ## Open Gaps / Roadmap
 - **anytls UDP is not implemented** — deliberate stub; `supports_udp` returns `false` at `src/proxy/anytls/mod.rs:266`. TCP/stream multiplexing is complete. A future sing/uot port would let it return `self.udp`.
 - Out-of-scope outbounds (`hysteria`/`hysteria2`/`tuic`/`wireguard`/`ssh`/config-defined `dns`/`mieru`/etc.) remain rejected at load with `unsupport proxy type: <T>` — by design, not a gap.

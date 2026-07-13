@@ -295,6 +295,7 @@ mod tests {
             grpc_opts: None,
             h2_opts: None,
             http_opts: None,
+            xhttp_opts: None,
             ss_opts: None,
             udp_over_tcp: None,
             udp_over_tcp_version: None,
