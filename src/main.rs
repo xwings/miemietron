@@ -348,6 +348,12 @@ impl AppState {
         let (new_dns, new_rules, new_proxies) =
             build_components(&new_config, &self.home_dir, self.proxy_state_store.clone()).await?;
 
+        // mihomo compat: executor.go updateDNS calls PatchFrom on the old
+        // enhancer — fake-ip pool mappings and the ip→host mapping survive
+        // the reload, so fake IPs already handed to clients keep resolving
+        // to the same domains instead of being reallocated from scratch.
+        new_dns.patch_from(&self.dns_resolver());
+
         let rule_count = new_rules.rule_count();
         let proxy_count = new_proxies.proxy_count();
 
@@ -917,15 +923,18 @@ impl Engine {
             info!("NTP sync task started");
         }
 
-        // Spawn periodic FakeIP persistence task (every 60s)
+        // Spawn periodic FakeIP persistence task (every 60s).
+        // Read the resolver from AppState each tick — a config reload swaps
+        // in a new resolver, and holding the boot-time Arc here would keep
+        // saving the orphaned pre-reload pool forever.
         let fakeip_save_handle = if store_fake_ip {
-            let resolver = dns_resolver.clone();
+            let state = app_state.clone();
             let path = fakeip_path.clone();
             Some(tokio::spawn(async move {
                 let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
                 loop {
                     interval.tick().await;
-                    if let Err(e) = resolver.save_fakeip(&path) {
+                    if let Err(e) = state.dns_resolver().save_fakeip(&path) {
                         warn!("Failed to save FakeIP cache: {}", e);
                     }
                 }
@@ -968,9 +977,10 @@ impl Engine {
             }
         }
 
-        // Save FakeIP state on shutdown
+        // Save FakeIP state on shutdown (current resolver, not the boot-time
+        // one — reloads may have swapped it)
         if store_fake_ip {
-            if let Err(e) = dns_resolver.save_fakeip(&fakeip_path) {
+            if let Err(e) = app_state.dns_resolver().save_fakeip(&fakeip_path) {
                 warn!("Failed to save FakeIP cache on shutdown: {}", e);
             } else {
                 info!("FakeIP cache saved");

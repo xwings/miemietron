@@ -187,6 +187,29 @@ impl FakeIpPool {
         self.filter_mode == FilterMode::Whitelist
     }
 
+    /// Carry all mappings over from the pool of the previous config.
+    ///
+    /// mihomo compat: pool.go `CloneFrom` (called from `PatchFrom` in
+    /// dns/enhancer.go on every config reload) — LruCache.CloneTo overwrites
+    /// the target store, so clear first, then copy both directions blindly
+    /// (mihomo does not re-validate entries against the new range either).
+    /// The ring offset is also carried: mihomo's cachefile store restores it
+    /// via restoreState, while its memory store restarts from the first IP
+    /// and immediately re-walks slots still held by the cloned mappings —
+    /// we deliberately keep the offset in both modes to avoid that reuse.
+    pub fn clone_from(&self, old: &FakeIpPool) {
+        self.ip_to_domain.clear();
+        self.domain_to_ip.clear();
+        for entry in old.ip_to_domain.iter() {
+            self.ip_to_domain.insert(*entry.key(), entry.value().clone());
+        }
+        for entry in old.domain_to_ip.iter() {
+            self.domain_to_ip.insert(entry.key().clone(), *entry.value());
+        }
+        self.offset
+            .store(old.offset.load(Ordering::Relaxed), Ordering::Relaxed);
+    }
+
     /// Clear all mappings.
     pub fn clear(&self) {
         self.ip_to_domain.clear();
@@ -529,6 +552,53 @@ mod tests {
         assert!(should_bypass(&pool, "dns.msftncsi.com"));
         assert!(!should_bypass(&pool, "google.com"));
         assert!(!should_bypass(&pool, "example.com"));
+    }
+
+    #[test]
+    fn clone_from_preserves_mappings_across_reload() {
+        let old = make_pool();
+        let ip_a = old.allocate("a.com");
+        let ip_b = old.allocate("b.com");
+
+        let new = make_pool();
+        new.clone_from(&old);
+
+        // Existing domains keep their fake IPs
+        assert_eq!(new.allocate("a.com"), ip_a);
+        assert_eq!(new.allocate("b.com"), ip_b);
+        assert_eq!(new.lookup_domain(&ip_a), Some("a.com".to_string()));
+        assert_eq!(new.lookup_domain(&ip_b), Some("b.com".to_string()));
+    }
+
+    #[test]
+    fn clone_from_carries_offset_so_new_domains_do_not_collide() {
+        let old = make_pool();
+        let ip_a = old.allocate("a.com");
+        let ip_b = old.allocate("b.com");
+
+        let new = make_pool();
+        new.clone_from(&old);
+
+        // A new domain must NOT steal a.com's or b.com's slot
+        let ip_c = new.allocate("c.com");
+        assert_ne!(ip_c, ip_a);
+        assert_ne!(ip_c, ip_b);
+        assert_eq!(new.lookup_domain(&ip_a), Some("a.com".to_string()));
+    }
+
+    #[test]
+    fn clone_from_overwrites_target_state() {
+        let old = make_pool();
+        let ip_a = old.allocate("a.com");
+
+        let new = make_pool();
+        let ip_x = new.allocate("x.com"); // same slot as a.com in old
+        new.clone_from(&old);
+
+        // CloneTo semantics: target replaced wholesale
+        assert_eq!(new.lookup_domain(&ip_x), Some("a.com".to_string()));
+        assert_eq!(new.allocate("a.com"), ip_a);
+        assert!(new.domain_to_ip.get("x.com").is_none());
     }
 
     #[test]

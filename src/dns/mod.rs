@@ -542,6 +542,24 @@ impl DnsResolver {
         }
     }
 
+    /// Carry cached state over from the previous resolver on config reload.
+    ///
+    /// mihomo compat: dns/enhancer.go `PatchFrom` (called from executor.go
+    /// updateDNS — "reuse cache of old host mapper") clones the fake-ip pool
+    /// store and the ip→host mapping into the new enhancer so client-cached
+    /// fake IPs stay valid across reloads instead of being reassigned to
+    /// other domains from offset zero.
+    pub fn patch_from(&self, old: &DnsResolver) {
+        if let (Some(new_pool), Some(old_pool)) = (self.fakeip.as_ref(), old.fakeip.as_ref()) {
+            new_pool.clone_from(old_pool);
+        }
+        // LruCache.CloneTo overwrites the target mapping wholesale.
+        self.ip_to_host.clear();
+        for entry in old.ip_to_host.iter() {
+            self.ip_to_host.insert(*entry.key(), entry.value().clone());
+        }
+    }
+
     /// Save FakeIP mappings to disk.
     pub fn save_fakeip(&self, path: &std::path::Path) -> Result<()> {
         if let Some(ref pool) = self.fakeip {
