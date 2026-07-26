@@ -244,6 +244,206 @@ async fn resolve_ip_on_demand(
     }
 }
 
+/// mihomo compat: tunnel.go retry() with a context timeout (tunnel.go:554-591,
+/// 695-716). The whole loop is bounded by DefaultTCPTimeout (5s); the 10-attempt
+/// cap is a backstop, the deadline is the real limit. Backoff is jittered —
+/// `duration = Random(min, min * factor^attempt)` via slowdown.New().
+async fn dial_with_retry(
+    handler: &Arc<dyn crate::proxy::OutboundHandler>,
+    group: Option<&Arc<dyn crate::proxy_group::ProxyGroup>>,
+    target: &Address,
+    dns: &crate::dns::DnsResolver,
+    src: SocketAddr,
+) -> Result<Box<dyn crate::proxy::ProxyStream>> {
+    // mihomo compat: retry() with context timeout (tunnel.go:554-591, 695-716).
+    // Entire retry loop bounded by DefaultTCPTimeout (5s).
+    // Max 10 iterations but the context timeout is the real limit.
+    // Backoff uses jitter: duration = Random(min, min * factor^attempt)
+    // via slowdown.New() (slowdown.go, backoff.go).
+    let proxy_name = handler.name();
+    let proxy_proto = handler.proto();
+    debug!(
+        "Connecting via [{}] {} to {}",
+        proxy_proto, proxy_name, target
+    );
+    use rand::Rng;
+    use tokio::time::{timeout, Instant};
+
+    let retry_deadline = Instant::now() + std::time::Duration::from_secs(5); // C.DefaultTCPTimeout
+    const MAX_RETRIES: usize = 10;
+    let mut last_err = None;
+    let mut remote_conn = None;
+    let backoff_min_ms: f64 = 10.0;
+    let backoff_factor: f64 = 2.0;
+    let backoff_max_ms: f64 = 1000.0;
+
+    for attempt in 0..MAX_RETRIES {
+        // Check if we've exceeded the overall timeout
+        let remaining = retry_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+
+        // Dial with remaining time as timeout
+        match timeout(remaining, handler.connect_stream(target, dns)).await {
+            Ok(Ok(r)) => {
+                // mihomo compat: notify group of successful dial
+                if let Some(group) = group {
+                    group.on_dial_success();
+                }
+                remote_conn = Some(r);
+                break;
+            }
+            Ok(Err(e)) => {
+                let err_str = e.to_string();
+
+                // mihomo compat: shouldStopRetry (tunnel.go:698-712) — ONLY
+                // resolver couldn't-find-ip, ip-version, ipv6-disabled and
+                // reject-loopback errors are terminal. Everything else
+                // (including transient DNS-server failures) is retried;
+                // each retry re-resolves.
+                let should_stop = err_str.contains("couldn't find ip")
+                    || err_str.contains("IP not found")
+                    || err_str.contains("ip version error")
+                    || err_str.contains("IPv6 disabled")
+                    || err_str.contains("reject loopback connection");
+
+                if should_stop {
+                    last_err = Some(e);
+                    break;
+                }
+
+                if attempt < MAX_RETRIES - 1 {
+                    // mihomo compat: slowdown with jitter (slowdown.go, backoff.go)
+                    // duration = Random(min, min * factor^attempt), capped at max
+                    let max_dur =
+                        (backoff_min_ms * backoff_factor.powi(attempt as i32)).min(backoff_max_ms);
+                    let jittered = rand::thread_rng().gen_range(backoff_min_ms..=max_dur);
+                    let sleep_dur = std::time::Duration::from_millis(jittered as u64);
+
+                    debug!(
+                        "Proxy connect attempt {}/{} failed [{}] {} -> {}: {}, retrying in {}ms",
+                        attempt + 1,
+                        MAX_RETRIES,
+                        proxy_name,
+                        src,
+                        target,
+                        e,
+                        jittered as u64
+                    );
+
+                    // Context-aware sleep: don't sleep past deadline
+                    let remaining = retry_deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        last_err = Some(e);
+                        break;
+                    }
+                    tokio::time::sleep(sleep_dur.min(remaining)).await;
+                }
+                last_err = Some(e);
+            }
+            Err(_timeout) => {
+                // Overall timeout expired during dial
+                last_err = Some(anyhow::anyhow!("connect timeout"));
+                break;
+            }
+        }
+    }
+
+    match remote_conn {
+        Some(r) => Ok(r),
+        None => {
+            let e = last_err.unwrap_or_else(|| anyhow::anyhow!("connect timeout"));
+            error!(
+                "Proxy connect failed after {} attempts [{}] {} -> {}: {}",
+                MAX_RETRIES, proxy_name, src, target, e
+            );
+            // mihomo compat: notify group of failed dial
+            // This may trigger an immediate health check after repeated failures.
+            if let Some(group) = group {
+                group.on_dial_failed(proxy_proto, &e.to_string());
+            }
+            Err(e)
+        }
+    }
+}
+
+/// The routing decision for one connection: the matched rule, the outbound
+/// handler it resolved to, and the chain reported to `/connections`.
+struct Route {
+    action: Action,
+    handler: Arc<dyn crate::proxy::OutboundHandler>,
+    /// The proxy group the action named, if any — touched for lazy health checks
+    /// and notified of dial success/failure.
+    group: Option<Arc<dyn crate::proxy_group::ProxyGroup>>,
+    /// mihomo convention: innermost (final proxy) first.
+    chains: Vec<String>,
+    /// Raw config rule type ("DOMAIN-SUFFIX"); empty when nothing matched.
+    rule_type: String,
+    rule_payload: String,
+}
+
+/// mihomo compat: tunnel.go match() plus the GLOBAL/DIRECT mode short-circuits.
+///
+/// Resolves the destination IP first if a rule needs it, matches the rule list,
+/// touches the matched group (mihomo's `GroupBase.GetProxies(touch=true)`) so
+/// lazy health checks know the group is in use, and resolves the action to an
+/// outbound handler. Errors if `Action::Proxy(name)` cannot be resolved — no
+/// silent DIRECT fallback. See ARCHITECTURE.md "Scope" and the regression tests
+/// in src/proxy/mod.rs.
+///
+/// The engine/manager/resolver are passed in rather than re-read from AppState
+/// so a concurrent reload can't split one connection across two generations.
+async fn resolve_route(
+    rules: &crate::rules::RuleEngine,
+    proxies: &crate::proxy::ProxyManager,
+    dns: &crate::dns::DnsResolver,
+    rule_meta: &mut RuleMetadata,
+    mode: &str,
+) -> Result<Route> {
+    resolve_ip_on_demand(mode, rule_meta, rules, dns).await;
+
+    let (action, rule_type, rule_payload) = if mode == "global" {
+        (
+            Action::Proxy("GLOBAL".to_string()),
+            "MATCH".to_string(),
+            String::new(),
+        )
+    } else if mode == "direct" {
+        (Action::Direct, "DIRECT".to_string(), String::new())
+    } else {
+        rules.match_rules_detailed(rule_meta)
+    };
+
+    // Group name (if routed through a proxy group), for the chain and for touch.
+    let group_name = match &action {
+        Action::Proxy(name) => Some(name.clone()),
+        _ => None,
+    };
+    let group = group_name.as_ref().and_then(|gn| proxies.get_group(gn));
+    if let Some(ref group) = group {
+        group.touch();
+    }
+
+    let handler = proxies.resolve_action(&action)?;
+    let proxy_name = handler.name();
+
+    // Build chains: [final_proxy, group_name] (mihomo convention: innermost first)
+    let chains = match group_name {
+        Some(gn) if gn != proxy_name => vec![proxy_name.to_string(), gn],
+        _ => vec![proxy_name.to_string()],
+    };
+
+    Ok(Route {
+        action,
+        handler,
+        group,
+        chains,
+        rule_type,
+        rule_payload,
+    })
+}
+
 /// mihomo compat: constant/adapters.go Chain.String() — a connection's chain
 /// renders as `last[first]` (e.g. `MyGroup[node]`), or the single element.
 fn chain_display(chains: &[String]) -> String {
@@ -251,6 +451,96 @@ fn chain_display(chains: &[String]) -> String {
         0 => String::new(),
         1 => chains[0].clone(),
         n => format!("{}[{}]", chains[n - 1], chains[0]),
+    }
+}
+
+/// mihomo compat: tunnel.go:633 logMetadata — build the single info-level line
+/// emitted per connection/session. Split out from [`log_metadata`] so the exact
+/// wording (which OpenClash's log parser reads) can be asserted in tests.
+///
+/// `rule_type` is the raw config type ("DOMAIN-SUFFIX"); the display mapping
+/// (`RuleType.String()`) happens here so both callers agree.
+fn format_metadata_log(
+    network: &str,
+    src: impl std::fmt::Display,
+    target: impl std::fmt::Display,
+    mode: &str,
+    rule_type: &str,
+    rule_payload: &str,
+    chain: &str,
+) -> String {
+    if mode == "global" {
+        format!("[{network}] {src} --> {target} using GLOBAL")
+    } else if mode == "direct" {
+        format!("[{network}] {src} --> {target} using DIRECT")
+    } else if rule_type.is_empty() {
+        format!("[{network}] {src} --> {target} doesn't match any rule using {chain}")
+    } else {
+        let rule = crate::rules::rule_type_display(rule_type);
+        if rule_payload.is_empty() {
+            format!("[{network}] {src} --> {target} match {rule} using {chain}")
+        } else {
+            format!("[{network}] {src} --> {target} match {rule}({rule_payload}) using {chain}")
+        }
+    }
+}
+
+/// mihomo compat: the one info log per connection (tunnel.go:633 logMetadata),
+/// shared by the TCP and UDP paths.
+#[allow(clippy::too_many_arguments)]
+fn log_metadata(
+    network: &str,
+    src: impl std::fmt::Display,
+    target: impl std::fmt::Display,
+    mode: &str,
+    rule_type: &str,
+    rule_payload: &str,
+    chain: &str,
+) {
+    info!(
+        "{}",
+        format_metadata_log(network, src, target, mode, rule_type, rule_payload, chain)
+    );
+}
+
+/// Result of the preHandleMetadata + sniff phase of a TCP connection.
+struct SniffOutcome {
+    /// Destination host — from the inbound, the FakeIP/redir-host mapping, or
+    /// the sniffer.
+    domain: Option<String>,
+    /// mihomo compat: metadata.SniffHost — recorded for /connections even when
+    /// override-destination is false.
+    sniff_host: String,
+    /// The sniffed host replaced the metadata host; mihomo's replaceDomain also
+    /// blanks DstIP so rules match the new domain.
+    sniff_overrode: bool,
+    /// Bytes consumed by the peek, to be replayed to the outbound.
+    peek_buf: Vec<u8>,
+}
+
+/// Process that owns the source socket (mihomo metadata.Process / ProcessPath).
+///
+/// mihomo's FindProcessStrict defers the lookup until a PROCESS-NAME /
+/// PROCESS-PATH rule needs it; we look it up up-front, bounded by a 100ms
+/// timeout, so a slow /proc scan can't stall the connection.
+async fn detect_process(
+    config: &crate::config::MiemieConfig,
+    src: SocketAddr,
+) -> (Option<String>, Option<String>) {
+    let find_process_mode = config.find_process_mode.as_deref().unwrap_or("strict");
+    if find_process_mode == "off" {
+        return (None, None);
+    }
+    let src_ip = src.ip();
+    let src_port = src.port();
+    match tokio::time::timeout(
+        std::time::Duration::from_millis(100),
+        tokio::task::spawn_blocking(move || process::lookup_process(&src_ip, src_port)),
+    )
+    .await
+    {
+        Ok(Ok(Some((name, path)))) => (Some(name), Some(path)),
+        _ => (None, None),
     }
 }
 
@@ -465,7 +755,6 @@ impl ConnectionManager {
         let rules = self.app.rule_engine();
         let proxies = self.app.proxy_manager();
         let config = self.app.config();
-        let stats = &self.app.stats;
 
         // Read current mode from runtime config
         let mode = {
@@ -473,11 +762,216 @@ impl ConnectionManager {
             rt.mode.clone()
         };
 
-        // mihomo compat: preHandleMetadata + sniffing flow (tunnel.go
-        // handleTCPConn + component/sniffer/dispatcher.go).
-        // 1. Try FakeIP reverse lookup (preHandleMetadata)
-        // 2. If failed AND sniffing gates allow, try sniffing TLS SNI / HTTP Host
-        // 3. Only drop if BOTH failed for FakeIP destinations
+        let Some(sniffed) = self
+            .sniff_and_override(src, dst, &mut stream, &config, &dns, host_override)
+            .await
+        else {
+            return Ok(());
+        };
+        let SniffOutcome {
+            domain,
+            sniff_host,
+            sniff_overrode,
+            peek_buf,
+        } = sniffed;
+
+        // Wrap the stream so the peeked bytes are replayed before the rest
+        let stream = PeekableStream::new(peek_buf, stream);
+
+        // Build the target address. Domain takes priority (always set for
+        // FakeIP connections thanks to the early check above). For non-FakeIP
+        // traffic without a domain (raw IP connections), use the IP directly.
+        let target = if let Some(ref domain) = domain {
+            Address::domain(domain, dst.port())
+        } else {
+            Address::ip(dst)
+        };
+
+        let (proc_name, proc_path) = detect_process(&config, src).await;
+
+        // Determine inbound listener port from connection type and config
+        let in_port = inbound_port(&config, conn_type);
+
+        // mihomo compat: clear dst_ip when domain is known and IP is a FakeIP
+        // or unresolved placeholder (tunnel.go:288-290). preHandleMetadata sets
+        // DstIP = netip.Addr{} for FakeIP so IP-CIDR rules don't match the
+        // FakeIP range. Same for HTTP proxy 0.0.0.0 placeholder, and for a
+        // sniff override (dispatcher.go replaceDomain blanks DstIP).
+        let rule_dst_ip = if domain.is_some()
+            && (sniff_overrode || dns.is_fake_ip(&dst.ip()) || dst.ip().is_unspecified())
+        {
+            None
+        } else {
+            Some(dst.ip())
+        };
+
+        // mihomo compat: resolveMetadata — a hosts-mapped domain resolves once
+        // here; the IP is used both for rule matching (set BEFORE matching,
+        // tunnel.go:329-332, so IP-CIDR/GEOIP rules match the hosts-mapped
+        // address) and for the dial target override below.
+        let hosts_ip: Option<std::net::IpAddr> = domain.as_deref().and_then(|d| {
+            config
+                .hosts
+                .get(&d.to_lowercase())
+                .and_then(|s| s.parse::<std::net::IpAddr>().ok())
+                .filter(|ip| !dns.is_fake_ip(ip))
+        });
+
+        let mut rule_meta = RuleMetadata {
+            domain: domain.clone(),
+            dst_ip: hosts_ip.or(rule_dst_ip),
+            src_ip: Some(src.ip()),
+            dst_port: dst.port(),
+            src_port: src.port(),
+            network: "tcp",
+            process_name: proc_name,
+            process_path: proc_path.clone(),
+            in_port,
+            in_type: Some(inbound_type_display(conn_type)),
+            ..Default::default()
+        };
+
+        let route = resolve_route(&rules, &proxies, &dns, &mut rule_meta, &mode).await?;
+        let Route {
+            action,
+            handler,
+            group: group_arc,
+            chains,
+            rule_type,
+            rule_payload,
+        } = route;
+
+        debug!(
+            "TCP {} -> {} ({}) => {:?} [{}]",
+            src,
+            target,
+            domain.as_deref().unwrap_or(""),
+            action,
+            rule_type
+        );
+
+        // Determine the rule string for the connection entry.
+        // mihomo compat: the /connections `rule` field uses RuleType.String()
+        // display form (e.g. "DomainSuffix", "Match"), not config syntax.
+        let rule_str = crate::rules::rule_type_display(&rule_type).to_string();
+
+        // mihomo compat: apply the hosts override (resolved once above) to the
+        // dial target: if host is in DefaultHosts and the resolved IP is not a
+        // FakeIP, override DstIP.
+        let target = if let Some(ip) = hosts_ip {
+            debug!(
+                "Hosts override: {} -> {}",
+                domain.as_deref().unwrap_or(""),
+                ip
+            );
+            Address::ip(SocketAddr::new(ip, dst.port()))
+        } else {
+            target
+        };
+
+        let remote = dial_with_retry(&handler, group_arc.as_ref(), &target, &dns, src).await?;
+
+        let conn_id: Arc<str> = uuid::Uuid::new_v4().to_string().into();
+        let conn_info = ConnectionInfo {
+            id: conn_id.clone(),
+            metadata: ConnectionMetadata {
+                network: "tcp",
+                conn_type: inbound_type_display(conn_type),
+                source_ip: src.ip(),
+                destination_ip: dst.ip(),
+                source_port: src.port(),
+                destination_port: dst.port(),
+                host: domain.clone().unwrap_or_default(),
+                dns_mode: if domain.is_some() { "fake-ip" } else { "" },
+                process_path: proc_path.unwrap_or_default(),
+                special_proxy: "",
+                special_rules: "",
+                remote_destination: target.to_string(),
+                dscp: 0,
+                sniff_host,
+            },
+            upload: 0,
+            download: 0,
+            start: chrono::Utc::now().to_rfc3339(),
+            chains,
+            rule: rule_str,
+            rule_payload,
+        };
+        log_metadata(
+            "TCP",
+            src,
+            &target,
+            &mode,
+            &rule_type,
+            &conn_info.rule_payload,
+            &chain_display(&conn_info.chains),
+        );
+
+        self.register_and_relay(conn_info, stream, remote).await;
+
+        Ok(())
+    }
+
+    /// Register the connection so `/connections` can see and close it, relay
+    /// both directions to completion, then flush its byte totals into the
+    /// global stats and deregister.
+    async fn register_and_relay<L, R>(&self, info: ConnectionInfo, local: L, remote: R)
+    where
+        L: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+        R: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
+        let conn_id = info.id.clone();
+        let up_counter = Arc::new(AtomicU64::new(0));
+        let down_counter = Arc::new(AtomicU64::new(0));
+        let remote_counted = CountingStream::new(remote, up_counter.clone(), down_counter.clone());
+
+        let relay_handle = tokio::spawn(async move {
+            relay_bidirectional(local, remote_counted).await;
+        });
+        self.connections.insert(
+            conn_id.clone(),
+            ConnEntry {
+                info,
+                upload: up_counter.clone(),
+                download: down_counter.clone(),
+                abort: relay_handle.abort_handle(),
+            },
+        );
+        let stats = &self.app.stats;
+        stats.add_connection();
+
+        // Wait for the relay to complete (normally or via abort from close_connection)
+        let _ = relay_handle.await;
+
+        // Flush totals into global stats
+        stats.add_upload(up_counter.load(Ordering::Relaxed));
+        stats.add_download(down_counter.load(Ordering::Relaxed));
+        stats.remove_connection();
+        self.connections.remove(&conn_id);
+    }
+
+    /// mihomo compat: preHandleMetadata + the sniffing flow (tunnel.go
+    /// handleTCPConn + component/sniffer/dispatcher.go).
+    ///
+    /// 1. Try FakeIP / redir-host reverse lookup (preHandleMetadata)
+    /// 2. If that failed AND the sniffing gates allow, sniff TLS SNI / HTTP Host
+    /// 3. Only drop if BOTH failed for a FakeIP destination
+    ///
+    /// `None` means the connection must be dropped: either the peer sent nothing
+    /// within the peek deadline, or the destination is a FakeIP with no
+    /// recoverable domain.
+    async fn sniff_and_override<S>(
+        &self,
+        src: SocketAddr,
+        dst: SocketAddr,
+        stream: &mut S,
+        config: &crate::config::MiemieConfig,
+        dns: &crate::dns::DnsResolver,
+        host_override: Option<String>,
+    ) -> Option<SniffOutcome>
+    where
+        S: tokio::io::AsyncRead + Unpin,
+    {
         let domain_from_inbound = host_override.is_some();
         let mut domain = host_override.or_else(|| dns.reverse_lookup(&dst.ip()));
         let is_fakeip_dst = dns.is_fake_ip(&dst.ip());
@@ -534,7 +1028,7 @@ impl ConnectionManager {
             // the connection ("Consider adding skip").
             let first = tokio::time::timeout(
                 SNIFF_PEEK_TIMEOUT,
-                AsyncReadExt::read(&mut stream, &mut tmp),
+                AsyncReadExt::read(&mut *stream, &mut tmp),
             )
             .await;
             let mut verdict = match first {
@@ -553,7 +1047,7 @@ impl ConnectionManager {
                         "[Sniffer] [{}] may not have any sent data, Consider adding skip",
                         dst.ip()
                     );
-                    return Ok(());
+                    return None;
                 }
             };
 
@@ -567,8 +1061,11 @@ impl ConnectionManager {
                     if remaining.is_zero() {
                         break;
                     }
-                    match tokio::time::timeout(remaining, AsyncReadExt::read(&mut stream, &mut tmp))
-                        .await
+                    match tokio::time::timeout(
+                        remaining,
+                        AsyncReadExt::read(&mut *stream, &mut tmp),
+                    )
+                    .await
                     {
                         Ok(Ok(0)) => break,
                         Ok(Ok(n)) => peek_buf.extend_from_slice(&tmp[..n]),
@@ -630,360 +1127,15 @@ impl ConnectionManager {
         // mihomo compat: only drop if preHandle failed AND sniffing didn't recover
         if pre_handle_failed {
             debug!("fake DNS record {} missing, sniffing failed", dst.ip());
-            return Ok(());
+            return None;
         }
 
-        // Wrap the stream so the peeked bytes are replayed before the rest
-        let stream = PeekableStream::new(peek_buf, stream);
-
-        // Build the target address. Domain takes priority (always set for
-        // FakeIP connections thanks to the early check above). For non-FakeIP
-        // traffic without a domain (raw IP connections), use the IP directly.
-        let target = if let Some(ref domain) = domain {
-            Address::domain(domain, dst.port())
-        } else {
-            Address::ip(dst)
-        };
-
-        // Process detection: look up the process that owns this source socket.
-        // Runs eagerly for every connection unless find-process-mode is "off"
-        // (mihomo's FindProcessStrict defers the lookup until a PROCESS-NAME /
-        // PROCESS-PATH rule needs it; we look up up-front, bounded by a 100ms
-        // timeout, so a slow /proc scan can't stall the connection).
-        let find_process_mode = config.find_process_mode.as_deref().unwrap_or("strict");
-        let (proc_name, proc_path) = if find_process_mode != "off" {
-            // Wrap in a timeout to avoid blocking on slow /proc scans
-            let src_ip = src.ip();
-            let src_p = src.port();
-            match tokio::time::timeout(
-                std::time::Duration::from_millis(100),
-                tokio::task::spawn_blocking(move || process::lookup_process(&src_ip, src_p)),
-            )
-            .await
-            {
-                Ok(Ok(Some((name, path)))) => (Some(name), Some(path)),
-                _ => (None, None),
-            }
-        } else {
-            (None, None)
-        };
-
-        // Determine inbound listener port from connection type and config
-        let in_port = inbound_port(&config, conn_type);
-
-        // mihomo compat: clear dst_ip when domain is known and IP is a FakeIP
-        // or unresolved placeholder (tunnel.go:288-290). preHandleMetadata sets
-        // DstIP = netip.Addr{} for FakeIP so IP-CIDR rules don't match the
-        // FakeIP range. Same for HTTP proxy 0.0.0.0 placeholder, and for a
-        // sniff override (dispatcher.go replaceDomain blanks DstIP).
-        let rule_dst_ip = if domain.is_some()
-            && (sniff_overrode || dns.is_fake_ip(&dst.ip()) || dst.ip().is_unspecified())
-        {
-            None
-        } else {
-            Some(dst.ip())
-        };
-
-        // mihomo compat: resolveMetadata — a hosts-mapped domain resolves once
-        // here; the IP is used both for rule matching (set BEFORE matching,
-        // tunnel.go:329-332, so IP-CIDR/GEOIP rules match the hosts-mapped
-        // address) and for the dial target override below.
-        let hosts_ip: Option<std::net::IpAddr> = domain.as_deref().and_then(|d| {
-            config
-                .hosts
-                .get(&d.to_lowercase())
-                .and_then(|s| s.parse::<std::net::IpAddr>().ok())
-                .filter(|ip| !dns.is_fake_ip(ip))
-        });
-
-        let mut rule_meta = RuleMetadata {
-            domain: domain.clone(),
-            dst_ip: hosts_ip.or(rule_dst_ip),
-            src_ip: Some(src.ip()),
-            dst_port: dst.port(),
-            src_port: src.port(),
-            network: "tcp",
-            process_name: proc_name,
-            process_path: proc_path.clone(),
-            in_port,
-            in_type: Some(inbound_type_display(conn_type)),
-            ..Default::default()
-        };
-
-        resolve_ip_on_demand(&mode, &mut rule_meta, &rules, &dns).await;
-
-        // Match rules
-        // mihomo compat: global mode routes to proxies["GLOBAL"], direct mode to DIRECT
-        let (action, rule_type, rule_payload) = if mode == "global" {
-            (
-                Action::Proxy("GLOBAL".to_string()),
-                "MATCH".to_string(),
-                String::new(),
-            )
-        } else if mode == "direct" {
-            (Action::Direct, "DIRECT".to_string(), String::new())
-        } else {
-            rules.match_rules_detailed(&rule_meta)
-        };
-
-        debug!(
-            "TCP {} -> {} ({}) => {:?} [{}]",
-            src,
-            target,
-            domain.as_deref().unwrap_or(""),
-            action,
-            rule_type
-        );
-
-        // Get the group name (if routed through a proxy group) for chains
-        let group_name = match &action {
-            Action::Proxy(name) => Some(name.clone()),
-            _ => None,
-        };
-
-        // mihomo compat: Touch the group to mark it as recently used (for lazy health checks).
-        // Matches mihomo's GroupBase.GetProxies(touch=true) pattern.
-        let group_arc = group_name.as_ref().and_then(|gn| proxies.get_group(gn));
-        if let Some(ref group) = group_arc {
-            group.touch();
-        }
-
-        // Resolve the action to an outbound handler. ProxyManager::resolve_action
-        // errors if Action::Proxy(name) cannot be resolved — no silent DIRECT
-        // fallback. See ARCHITECTURE.md "Scope" and the regression tests in
-        // src/proxy/mod.rs.
-        let handler = proxies.resolve_action(&action)?;
-        let proxy_name = handler.name().to_string();
-        let proxy_proto = handler.proto().to_string();
-
-        // Build chains: [final_proxy, group_name] (mihomo convention: innermost first)
-        let chains = if let Some(ref gn) = group_name {
-            if gn != &proxy_name {
-                vec![proxy_name.clone(), gn.clone()]
-            } else {
-                vec![proxy_name.clone()]
-            }
-        } else {
-            vec![proxy_name.clone()]
-        };
-
-        // Determine the rule string for the connection entry.
-        // mihomo compat: the /connections `rule` field uses RuleType.String()
-        // display form (e.g. "DomainSuffix", "Match"), not config syntax.
-        let rule_str = crate::rules::rule_type_display(&rule_type).to_string();
-
-        // mihomo compat: apply the hosts override (resolved once above) to the
-        // dial target: if host is in DefaultHosts and the resolved IP is not a
-        // FakeIP, override DstIP.
-        let target = if let Some(ip) = hosts_ip {
-            debug!(
-                "Hosts override: {} -> {}",
-                domain.as_deref().unwrap_or(""),
-                ip
-            );
-            Address::ip(SocketAddr::new(ip, dst.port()))
-        } else {
-            target
-        };
-
-        // mihomo compat: retry() with context timeout (tunnel.go:554-591, 695-716).
-        // Entire retry loop bounded by DefaultTCPTimeout (5s).
-        // Max 10 iterations but the context timeout is the real limit.
-        // Backoff uses jitter: duration = Random(min, min * factor^attempt)
-        // via slowdown.New() (slowdown.go, backoff.go).
-        debug!(
-            "Connecting via [{}] {} to {}",
-            handler.proto(),
-            proxy_name,
-            target
-        );
-        use rand::Rng;
-        use tokio::time::{timeout, Instant};
-
-        let retry_deadline = Instant::now() + std::time::Duration::from_secs(5); // C.DefaultTCPTimeout
-        const MAX_RETRIES: usize = 10;
-        let mut last_err = None;
-        let mut remote_conn = None;
-        let backoff_min_ms: f64 = 10.0;
-        let backoff_factor: f64 = 2.0;
-        let backoff_max_ms: f64 = 1000.0;
-
-        for attempt in 0..MAX_RETRIES {
-            // Check if we've exceeded the overall timeout
-            let remaining = retry_deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                break;
-            }
-
-            // Dial with remaining time as timeout
-            match timeout(remaining, handler.connect_stream(&target, &dns)).await {
-                Ok(Ok(r)) => {
-                    // mihomo compat: notify group of successful dial
-                    if let Some(ref group) = group_arc {
-                        group.on_dial_success();
-                    }
-                    remote_conn = Some(r);
-                    break;
-                }
-                Ok(Err(e)) => {
-                    let err_str = e.to_string();
-
-                    // mihomo compat: shouldStopRetry (tunnel.go:698-712) — ONLY
-                    // resolver couldn't-find-ip, ip-version, ipv6-disabled and
-                    // reject-loopback errors are terminal. Everything else
-                    // (including transient DNS-server failures) is retried;
-                    // each retry re-resolves.
-                    let should_stop = err_str.contains("couldn't find ip")
-                        || err_str.contains("IP not found")
-                        || err_str.contains("ip version error")
-                        || err_str.contains("IPv6 disabled")
-                        || err_str.contains("reject loopback connection");
-
-                    if should_stop {
-                        last_err = Some(e);
-                        break;
-                    }
-
-                    if attempt < MAX_RETRIES - 1 {
-                        // mihomo compat: slowdown with jitter (slowdown.go, backoff.go)
-                        // duration = Random(min, min * factor^attempt), capped at max
-                        let max_dur = (backoff_min_ms * backoff_factor.powi(attempt as i32))
-                            .min(backoff_max_ms);
-                        let jittered = rand::thread_rng().gen_range(backoff_min_ms..=max_dur);
-                        let sleep_dur = std::time::Duration::from_millis(jittered as u64);
-
-                        debug!(
-                            "Proxy connect attempt {}/{} failed [{}] {} -> {}: {}, retrying in {}ms",
-                            attempt + 1,
-                            MAX_RETRIES,
-                            proxy_name,
-                            src,
-                            target,
-                            e,
-                            jittered as u64
-                        );
-
-                        // Context-aware sleep: don't sleep past deadline
-                        let remaining = retry_deadline.saturating_duration_since(Instant::now());
-                        if remaining.is_zero() {
-                            last_err = Some(e);
-                            break;
-                        }
-                        tokio::time::sleep(sleep_dur.min(remaining)).await;
-                    }
-                    last_err = Some(e);
-                }
-                Err(_timeout) => {
-                    // Overall timeout expired during dial
-                    last_err = Some(anyhow::anyhow!("connect timeout"));
-                    break;
-                }
-            }
-        }
-
-        let remote = match remote_conn {
-            Some(r) => r,
-            None => {
-                let e = last_err.unwrap_or_else(|| anyhow::anyhow!("connect timeout"));
-                error!(
-                    "Proxy connect failed after {} attempts [{}] {} -> {}: {}",
-                    MAX_RETRIES, proxy_name, src, target, e
-                );
-                // mihomo compat: notify group of failed dial
-                // This may trigger an immediate health check after repeated failures.
-                if let Some(ref group) = group_arc {
-                    group.on_dial_failed(&proxy_proto, &e.to_string());
-                }
-                return Err(e);
-            }
-        };
-
-        let conn_id: Arc<str> = uuid::Uuid::new_v4().to_string().into();
-        let up_counter = Arc::new(AtomicU64::new(0));
-        let down_counter = Arc::new(AtomicU64::new(0));
-
-        // Register connection in the DashMap
-        let conn_info = ConnectionInfo {
-            id: conn_id.clone(),
-            metadata: ConnectionMetadata {
-                network: "tcp",
-                conn_type: inbound_type_display(conn_type),
-                source_ip: src.ip(),
-                destination_ip: dst.ip(),
-                source_port: src.port(),
-                destination_port: dst.port(),
-                host: domain.clone().unwrap_or_default(),
-                dns_mode: if domain.is_some() { "fake-ip" } else { "" },
-                process_path: proc_path.unwrap_or_default(),
-                special_proxy: "",
-                special_rules: "",
-                remote_destination: target.to_string(),
-                dscp: 0,
-                sniff_host,
-            },
-            upload: 0,
-            download: 0,
-            start: chrono::Utc::now().to_rfc3339(),
-            chains,
-            rule: rule_str,
-            rule_payload,
-        };
-        // mihomo compat: single info log per connection, logMetadata format
-        // (tunnel.go:633-650): `match Type(payload) using Group[proxy]`,
-        // distinct lines for GLOBAL/DIRECT modes and unmatched connections.
-        {
-            let chains_str = chain_display(&conn_info.chains);
-            if mode == "global" {
-                info!("[TCP] {} --> {} using GLOBAL", src, target);
-            } else if mode == "direct" {
-                info!("[TCP] {} --> {} using DIRECT", src, target);
-            } else if conn_info.rule.is_empty() {
-                info!(
-                    "[TCP] {} --> {} doesn't match any rule using {}",
-                    src, target, chains_str
-                );
-            } else if !conn_info.rule_payload.is_empty() {
-                info!(
-                    "[TCP] {} --> {} match {}({}) using {}",
-                    src, target, conn_info.rule, conn_info.rule_payload, chains_str
-                );
-            } else {
-                info!(
-                    "[TCP] {} --> {} match {} using {}",
-                    src, target, conn_info.rule, chains_str
-                );
-            }
-        }
-
-        let local_plain = stream;
-        let remote_counted = CountingStream::new(remote, up_counter.clone(), down_counter.clone());
-
-        let relay_handle = tokio::spawn(async move {
-            relay_bidirectional(local_plain, remote_counted).await;
-        });
-        self.connections.insert(
-            conn_id.clone(),
-            ConnEntry {
-                info: conn_info,
-                upload: up_counter.clone(),
-                download: down_counter.clone(),
-                abort: relay_handle.abort_handle(),
-            },
-        );
-        stats.add_connection();
-
-        // Wait for the relay to complete (normally or via abort from close_connection)
-        let _ = relay_handle.await;
-
-        // Flush totals into global stats
-        let up = up_counter.load(Ordering::Relaxed);
-        let down = down_counter.load(Ordering::Relaxed);
-        stats.add_upload(up);
-        stats.add_download(down);
-        stats.remove_connection();
-        self.connections.remove(&conn_id);
-
-        Ok(())
+        Some(SniffOutcome {
+            domain,
+            sniff_host,
+            sniff_overrode,
+            peek_buf,
+        })
     }
 
     /// Resolve a UDP datagram's destination through the rule engine.
@@ -1075,45 +1227,33 @@ impl ConnectionManager {
                 .as_deref()
                 .map(|d| format!("{}:{}", d, dst.port()))
                 .unwrap_or_else(|| dst.to_string());
-            let chain = match &action {
-                Action::Direct => "DIRECT".to_string(),
-                Action::Reject => "REJECT".to_string(),
-                Action::RejectDrop => "REJECT-DROP".to_string(),
+            // Same chain shape as the TCP path: innermost element first, so
+            // chain_display renders `group[node]`.
+            let chains = match &action {
+                Action::Direct => vec!["DIRECT".to_string()],
+                Action::Reject => vec!["REJECT".to_string()],
+                Action::RejectDrop => vec!["REJECT-DROP".to_string()],
                 Action::Proxy(name) => {
                     let final_name = proxies
                         .resolve(name)
                         .map(|h| h.name().to_string())
                         .unwrap_or_default();
                     if final_name.is_empty() || final_name == *name {
-                        name.clone()
+                        vec![name.clone()]
                     } else {
-                        format!("{name}[{final_name}]")
+                        vec![final_name, name.clone()]
                     }
                 }
             };
-            if mode == "global" {
-                info!("[UDP] {} --> {} using GLOBAL", src, target_str);
-            } else if mode == "direct" {
-                info!("[UDP] {} --> {} using DIRECT", src, target_str);
-            } else if rule_type.is_empty() {
-                info!(
-                    "[UDP] {} --> {} doesn't match any rule using {}",
-                    src, target_str, chain
-                );
-            } else {
-                let rule_disp = crate::rules::rule_type_display(&rule_type);
-                if rule_payload.is_empty() {
-                    info!(
-                        "[UDP] {} --> {} match {} using {}",
-                        src, target_str, rule_disp, chain
-                    );
-                } else {
-                    info!(
-                        "[UDP] {} --> {} match {}({}) using {}",
-                        src, target_str, rule_disp, rule_payload, chain
-                    );
-                }
-            }
+            log_metadata(
+                "UDP",
+                src,
+                &target_str,
+                &mode,
+                &rule_type,
+                &rule_payload,
+                &chain_display(&chains),
+            );
         }
 
         (action, domain)
@@ -1233,6 +1373,56 @@ mod tests {
     use std::sync::atomic::AtomicU64;
     use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// mihomo compat: tunnel.go:633 logMetadata — OpenClash's log parser reads
+    /// these lines, so the wording is pinned byte-for-byte. The TCP and UDP
+    /// paths share one formatter; the only difference is the `[TCP]`/`[UDP]` tag.
+    #[test]
+    fn metadata_log_lines_match_mihomo() {
+        let src = "192.168.1.2:5555";
+        let dst = "example.com:443";
+        let chain = "Proxy[HK-01]";
+
+        assert_eq!(
+            format_metadata_log("TCP", src, dst, "global", "MATCH", "", chain),
+            "[TCP] 192.168.1.2:5555 --> example.com:443 using GLOBAL"
+        );
+        assert_eq!(
+            format_metadata_log("TCP", src, dst, "direct", "DIRECT", "", chain),
+            "[TCP] 192.168.1.2:5555 --> example.com:443 using DIRECT"
+        );
+        // No rule matched: mihomo's default branch still names the chain.
+        assert_eq!(
+            format_metadata_log("TCP", src, dst, "rule", "", "", "DIRECT"),
+            "[TCP] 192.168.1.2:5555 --> example.com:443 doesn't match any rule using DIRECT"
+        );
+        // Payload present -> `Type(payload)`; raw config type is display-mapped.
+        assert_eq!(
+            format_metadata_log("TCP", src, dst, "rule", "DOMAIN-SUFFIX", "example.com", chain),
+            "[TCP] 192.168.1.2:5555 --> example.com:443 match DomainSuffix(example.com) using Proxy[HK-01]"
+        );
+        // MATCH carries no payload -> bare type.
+        assert_eq!(
+            format_metadata_log("UDP", src, "1.1.1.1:53", "rule", "MATCH", "", "DIRECT"),
+            "[UDP] 192.168.1.2:5555 --> 1.1.1.1:53 match Match using DIRECT"
+        );
+    }
+
+    /// mihomo compat: constant/adapters.go Chain.String().
+    #[test]
+    fn chain_display_renders_last_first() {
+        assert_eq!(chain_display(&[]), "");
+        assert_eq!(chain_display(&["DIRECT".to_string()]), "DIRECT");
+        assert_eq!(
+            chain_display(&["HK-01".to_string(), "Proxy".to_string()]),
+            "Proxy[HK-01]"
+        );
+        // Deeper chains render outermost[innermost], dropping the middle.
+        assert_eq!(
+            chain_display(&["HK-01".to_string(), "Auto".to_string(), "Proxy".to_string()]),
+            "Proxy[HK-01]"
+        );
+    }
 
     #[tokio::test]
     async fn peekable_stream_replays_prefix_then_inner() {

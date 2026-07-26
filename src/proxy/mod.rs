@@ -102,288 +102,17 @@ impl ProxyManager {
         global_opts: &ProxyGlobalOpts,
         state_store: Arc<crate::proxy_group::proxy_state::ProxyStateStore>,
     ) -> Result<Self> {
-        let mut proxies: HashMap<String, Arc<dyn OutboundHandler>> = HashMap::new();
-
-        let global_routing_mark = global_opts.routing_mark;
-
-        // mihomo compat: DefaultRoutingMark starts at 0 in mihomo (dialer/options.go:14).
-        // When no routing-mark is configured, mihomo does NOT set SO_MARK on sockets.
-        // It relies on GID 65534 (set by OpenClash via procd) for firewall bypass.
-        // Only set SO_MARK when the config explicitly specifies routing-mark.
-        // Built-in proxies — DIRECT gets the global routing mark for SO_MARK
-        proxies.insert(
-            "DIRECT".to_string(),
-            Arc::new(direct::DirectOutbound::new(global_routing_mark)),
-        );
-        proxies.insert("REJECT".to_string(), Arc::new(direct::RejectOutbound));
-        proxies.insert(
-            "REJECT-DROP".to_string(),
-            Arc::new(direct::RejectDropOutbound),
-        );
-
-        // Parse configured proxies, applying global settings as defaults.
-        // mihomo compat: config.go:880-882 — any per-proxy parse error fails the
-        // whole config load with `proxy %d: %w`. We never silently swap an
-        // unsupported / invalid proxy for DIRECT (which would leak traffic).
-        for (idx, config) in proxy_configs.iter().enumerate() {
-            let mut cfg = config.clone();
-            Self::apply_global_defaults(&mut cfg, global_opts);
-            let handler =
-                Self::load_proxy_config(&cfg).map_err(|e| anyhow::anyhow!("proxy {idx}: {e}"))?;
-            proxies.insert(cfg.name.clone(), handler);
-        }
-
-        // Load proxy providers and add their proxies.
-        // Track which proxy names come from each provider for group expansion.
-        let mut provider_proxy_names: HashMap<String, Vec<String>> = HashMap::new();
-        for (prov_name, prov_config) in providers {
-            match Self::load_proxy_provider(prov_name, prov_config).await {
-                Ok(provider_proxies) => {
-                    let mut names = Vec::new();
-                    // mihomo compat: provider.go:436-438 — any per-proxy parse
-                    // error fails the provider load with `proxy %d error: %w`.
-                    for (idx, pc) in provider_proxies.iter().enumerate() {
-                        let mut cfg = pc.clone();
-                        Self::apply_global_defaults(&mut cfg, global_opts);
-                        match Self::load_proxy_config(&cfg) {
-                            Ok(handler) => {
-                                names.push(cfg.name.clone());
-                                proxies.insert(cfg.name.clone(), handler);
-                            }
-                            Err(e) => {
-                                return Err(anyhow::anyhow!(
-                                    "provider '{prov_name}' proxy {idx} error: {e}"
-                                ));
-                            }
-                        }
-                    }
-                    info!(
-                        "Proxy provider '{}' loaded {} proxies",
-                        prov_name,
-                        names.len()
-                    );
-                    provider_proxy_names.insert(prov_name.clone(), names);
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to load proxy provider '{}': {}", prov_name, e);
-                    provider_proxy_names.insert(prov_name.clone(), Vec::new());
-                }
-            }
-        }
+        let mut proxies = Self::load_configured_proxies(proxy_configs, global_opts)?;
+        let provider_proxy_names =
+            Self::load_provider_proxies(providers, global_opts, &mut proxies).await?;
 
         // Build live proxy group instances from config.
-        // Expand `use` (provider references) into the proxies list.
-        // mihomo compat: filter regex only applies to non-Compatible providers
-        // (i.e., subscription/file providers from `use`), NOT to directly listed proxies.
-        // exclude-filter and exclude-type apply to all proxies regardless of source.
         let mut live_groups: HashMap<String, Arc<dyn ProxyGroup>> = HashMap::new();
         for gc in group_configs {
-            // Parse filter regexes (backtick-separated patterns)
-            // mihomo compat: uses regexp2 (RE2-compatible), Rust regex crate is compatible
-            let filter_regs = Self::parse_filter_regs(&gc.name, "filter", gc.filter.as_deref());
-            let exclude_filter_regs =
-                Self::parse_filter_regs(&gc.name, "exclude-filter", gc.exclude_filter.as_deref());
+            let all_proxies =
+                Self::group_members(gc, proxy_configs, &provider_proxy_names, &proxies);
 
-            let exclude_type_array: Vec<String> = gc
-                .exclude_type
-                .as_deref()
-                .filter(|s| !s.is_empty())
-                .map(|s| s.split('|').map(|t| t.trim().to_string()).collect())
-                .unwrap_or_default();
-
-            // Compatible proxies: directly listed in the group config (no filter applied)
-            let mut compatible_proxies = gc.proxies.clone();
-            let mut compatible_set: std::collections::HashSet<String> =
-                compatible_proxies.iter().cloned().collect();
-
-            // mihomo compat: include-all implies include-all-providers + include-all-proxies
-            let include_all_providers =
-                gc.include_all_providers.unwrap_or(false) || gc.include_all.unwrap_or(false);
-            let include_all_proxies =
-                gc.include_all_proxies.unwrap_or(false) || gc.include_all.unwrap_or(false);
-
-            // Handle include-all-proxies: mihomo pre-filters with filter regex
-            // before adding to the compatible list (parser.go lines 84-99)
-            if include_all_proxies {
-                if !filter_regs.is_empty() {
-                    for pc in proxy_configs {
-                        if compatible_set.contains(&pc.name) {
-                            continue;
-                        }
-                        for filter_reg in &filter_regs {
-                            if filter_reg.is_match(&pc.name) {
-                                compatible_set.insert(pc.name.clone());
-                                compatible_proxies.push(pc.name.clone());
-                                break;
-                            }
-                        }
-                    }
-                } else {
-                    for pc in proxy_configs {
-                        if compatible_set.insert(pc.name.clone()) {
-                            compatible_proxies.push(pc.name.clone());
-                        }
-                    }
-                }
-            }
-
-            // Provider proxies: from `use` and include-all-providers (filter applied)
-            let mut provider_proxies: Vec<String> = Vec::new();
-            let mut provider_set: std::collections::HashSet<String> =
-                std::collections::HashSet::new();
-
-            // Expand `use` provider references
-            for prov_name in &gc.use_providers {
-                if let Some(prov_proxies) = provider_proxy_names.get(prov_name) {
-                    for name in prov_proxies {
-                        if provider_set.insert(name.clone()) {
-                            provider_proxies.push(name.clone());
-                        }
-                    }
-                } else {
-                    tracing::warn!(
-                        "Proxy group '{}' references unknown provider '{}'",
-                        gc.name,
-                        prov_name
-                    );
-                }
-            }
-
-            // Handle include-all-providers flag
-            if include_all_providers {
-                for prov_proxies in provider_proxy_names.values() {
-                    for name in prov_proxies {
-                        if provider_set.insert(name.clone()) {
-                            provider_proxies.push(name.clone());
-                        }
-                    }
-                }
-            }
-
-            // Apply filter regex to provider proxies only (not compatible)
-            // mihomo compat (groupbase.go lines 135-161): filter acts as include-only;
-            // multiple backtick-separated patterns are OR'd. Proxies are ordered by
-            // filter pattern appearance (deduped).
-            if !filter_regs.is_empty() {
-                let mut filtered: Vec<String> = Vec::new();
-                let mut seen = std::collections::HashSet::new();
-                for filter_reg in &filter_regs {
-                    for name in &provider_proxies {
-                        if filter_reg.is_match(name) && seen.insert(name.clone()) {
-                            filtered.push(name.clone());
-                        }
-                    }
-                }
-                provider_proxies = filtered;
-            }
-
-            // Combine: compatible proxies first, then (filtered) provider proxies
-            // mihomo compat: Compatible provider is prepended to the providers list
-            let mut all_proxies = compatible_proxies;
-            all_proxies.extend(provider_proxies);
-
-            // Apply exclude-filter regex (remove any proxy matching ANY pattern)
-            // mihomo compat (groupbase.go lines 190-203): applies to ALL proxies
-            if !exclude_filter_regs.is_empty() {
-                all_proxies.retain(|name| !exclude_filter_regs.iter().any(|re| re.is_match(name)));
-            }
-
-            // Apply exclude-type (remove proxies of specified types, case-insensitive)
-            // mihomo compat (groupbase.go lines 205-218): applies to ALL proxies
-            if !exclude_type_array.is_empty() {
-                all_proxies.retain(|name| {
-                    if let Some(handler) = proxies.get(name) {
-                        !exclude_type_array
-                            .iter()
-                            .any(|t| handler.proto().eq_ignore_ascii_case(t))
-                    } else {
-                        true // keep unknown proxies (e.g., other group names)
-                    }
-                });
-            }
-
-            // Warn when filtering leaves the group empty (mihomo falls back to
-            // a COMPATIBLE placeholder; we only log — no fallback is inserted).
-            if all_proxies.is_empty() {
-                tracing::warn!("Proxy group '{}' has no proxies after filtering", gc.name);
-            }
-
-            // mihomo compat: default test URL is https (constant/adapters.go:61);
-            // `lazy` defaults to true (parser.go:51-53); `tolerance` defaults to
-            // 0 (urltest.go:19-23); `interval: 0` is coerced to 300s so the
-            // health-check timer never gets a zero period (parser.go:168-170) —
-            // a zero-period tokio interval would panic and abort the process.
-            let default_test_url = || "https://www.gstatic.com/generate_204".to_string();
-            let hc_interval = match gc.interval {
-                Some(0) | None => 300,
-                Some(n) => n,
-            };
-            let hc_lazy = gc.lazy.unwrap_or(true);
-            // mihomo compat: parser.go:118-121 — an invalid expected-status
-            // fails the whole config load with `<group>: <err>`.
-            let expected_status = crate::proxy_group::parse_expected_status(
-                gc.expected_status.as_deref().unwrap_or(""),
-            )
-            .map_err(|e| anyhow::anyhow!("{}: {}", gc.name, e))?;
-            let make_hc = |interval_secs: u64| crate::proxy_group::HealthCheckOpts {
-                url: gc.url.clone().unwrap_or_else(default_test_url),
-                interval_secs,
-                max_failed_times: gc.max_failed_times,
-                test_timeout: gc.timeout,
-                lazy: hc_lazy,
-                expected_status: expected_status.clone(),
-            };
-
-            let group: Arc<dyn ProxyGroup> = match gc.group_type.as_str() {
-                // mihomo compat: parser.go:166-171 + healthcheck.go auto() —
-                // select groups get a periodic health check only when the
-                // user configures a non-zero interval (no 300s default).
-                "select" => match gc.interval {
-                    Some(n) if n > 0 => Arc::new(SelectorGroup::with_health_check(
-                        gc.name.clone(),
-                        all_proxies,
-                        make_hc(n),
-                        state_store.clone(),
-                    )),
-                    _ => Arc::new(SelectorGroup::new(gc.name.clone(), all_proxies)),
-                },
-                "url-test" => Arc::new(UrlTestGroup::new(
-                    gc.name.clone(),
-                    all_proxies,
-                    gc.tolerance.unwrap_or(0),
-                    make_hc(hc_interval),
-                    state_store.clone(),
-                )),
-                "fallback" => Arc::new(FallbackGroup::new(
-                    gc.name.clone(),
-                    all_proxies,
-                    make_hc(hc_interval),
-                    state_store.clone(),
-                )),
-                "load-balance" => Arc::new(LoadBalanceGroup::new(
-                    gc.name.clone(),
-                    all_proxies,
-                    LoadBalanceStrategy::from_str(
-                        gc.strategy.as_deref().unwrap_or("consistent-hashing"),
-                    ),
-                    make_hc(hc_interval),
-                    state_store.clone(),
-                )),
-                "relay" => {
-                    // mihomo compat: parser.go:196-197 — relay groups were
-                    // removed in Meta; this is a hard config error, not a skip.
-                    return Err(anyhow::anyhow!(
-                        "unsupport proxy group type: The group [{}] with relay type was removed, please using dialer-proxy instead",
-                        gc.name
-                    ));
-                }
-                other => {
-                    // mihomo compat: parser.go:198-199 — unknown group types
-                    // fail the config load; degrading to a selector would
-                    // silently change routing.
-                    return Err(anyhow::anyhow!("unsupport proxy group type: {other}"));
-                }
-            };
+            let group = Self::build_group(gc, all_proxies, &state_store)?;
             info!(
                 "Created proxy group '{}' (type: {})",
                 gc.name, gc.group_type
@@ -422,6 +151,321 @@ impl ProxyManager {
             provider_configs: providers.clone(),
             provider_proxy_names,
         })
+    }
+
+    /// The built-in outbounds plus every proxy listed under `proxies:`.
+    ///
+    /// mihomo compat: config.go:880-882 — any per-proxy parse error fails the
+    /// whole config load with `proxy %d: %w`. We never silently swap an
+    /// unsupported / invalid proxy for DIRECT (which would leak traffic).
+    fn load_configured_proxies(
+        proxy_configs: &[ProxyConfig],
+        global_opts: &ProxyGlobalOpts,
+    ) -> Result<HashMap<String, Arc<dyn OutboundHandler>>> {
+        let mut proxies: HashMap<String, Arc<dyn OutboundHandler>> = HashMap::new();
+
+        // mihomo compat: DefaultRoutingMark starts at 0 in mihomo (dialer/options.go:14).
+        // When no routing-mark is configured, mihomo does NOT set SO_MARK on sockets.
+        // It relies on GID 65534 (set by OpenClash via procd) for firewall bypass.
+        // Only set SO_MARK when the config explicitly specifies routing-mark.
+        // Built-in proxies — DIRECT gets the global routing mark for SO_MARK
+        proxies.insert(
+            "DIRECT".to_string(),
+            Arc::new(direct::DirectOutbound::new(global_opts.routing_mark)),
+        );
+        proxies.insert("REJECT".to_string(), Arc::new(direct::RejectOutbound));
+        proxies.insert(
+            "REJECT-DROP".to_string(),
+            Arc::new(direct::RejectDropOutbound),
+        );
+
+        for (idx, config) in proxy_configs.iter().enumerate() {
+            let mut cfg = config.clone();
+            Self::apply_global_defaults(&mut cfg, global_opts);
+            let handler =
+                Self::load_proxy_config(&cfg).map_err(|e| anyhow::anyhow!("proxy {idx}: {e}"))?;
+            proxies.insert(cfg.name.clone(), handler);
+        }
+
+        Ok(proxies)
+    }
+
+    /// Fetch every proxy provider and merge its proxies into `proxies`.
+    ///
+    /// Returns the member names per provider, which group expansion (`use:` /
+    /// include-all-providers) needs. A provider that fails to fetch is a warning
+    /// with an empty member list (mihomo keeps running on a stale/absent
+    /// subscription); a provider that fetches but contains an unparsable proxy
+    /// is a hard error (provider.go:436-438 `proxy %d error: %w`).
+    async fn load_provider_proxies(
+        providers: &HashMap<String, ProxyProviderConfig>,
+        global_opts: &ProxyGlobalOpts,
+        proxies: &mut HashMap<String, Arc<dyn OutboundHandler>>,
+    ) -> Result<HashMap<String, Vec<String>>> {
+        let mut provider_proxy_names: HashMap<String, Vec<String>> = HashMap::new();
+        for (prov_name, prov_config) in providers {
+            match Self::load_proxy_provider(prov_name, prov_config).await {
+                Ok(provider_proxies) => {
+                    let mut names = Vec::new();
+                    for (idx, pc) in provider_proxies.iter().enumerate() {
+                        let mut cfg = pc.clone();
+                        Self::apply_global_defaults(&mut cfg, global_opts);
+                        match Self::load_proxy_config(&cfg) {
+                            Ok(handler) => {
+                                names.push(cfg.name.clone());
+                                proxies.insert(cfg.name.clone(), handler);
+                            }
+                            Err(e) => {
+                                return Err(anyhow::anyhow!(
+                                    "provider '{prov_name}' proxy {idx} error: {e}"
+                                ));
+                            }
+                        }
+                    }
+                    info!(
+                        "Proxy provider '{}' loaded {} proxies",
+                        prov_name,
+                        names.len()
+                    );
+                    provider_proxy_names.insert(prov_name.clone(), names);
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to load proxy provider '{}': {}", prov_name, e);
+                    provider_proxy_names.insert(prov_name.clone(), Vec::new());
+                }
+            }
+        }
+        Ok(provider_proxy_names)
+    }
+
+    /// The final, ordered member list for one proxy group.
+    ///
+    /// Expands `use:` provider references and the include-all* flags, then
+    /// applies the filters. mihomo compat: `filter` only applies to
+    /// non-Compatible providers (i.e. proxies coming from `use:`), NOT to
+    /// directly listed ones; `exclude-filter` and `exclude-type` apply to all
+    /// proxies regardless of source (groupbase.go:135-218).
+    fn group_members(
+        gc: &ProxyGroupConfig,
+        proxy_configs: &[ProxyConfig],
+        provider_proxy_names: &HashMap<String, Vec<String>>,
+        proxies: &HashMap<String, Arc<dyn OutboundHandler>>,
+    ) -> Vec<String> {
+        // Parse filter regexes (backtick-separated patterns)
+        // mihomo compat: uses regexp2 (RE2-compatible), Rust regex crate is compatible
+        let filter_regs = Self::parse_filter_regs(&gc.name, "filter", gc.filter.as_deref());
+        let exclude_filter_regs =
+            Self::parse_filter_regs(&gc.name, "exclude-filter", gc.exclude_filter.as_deref());
+
+        let exclude_type_array: Vec<String> = gc
+            .exclude_type
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(|s| s.split('|').map(|t| t.trim().to_string()).collect())
+            .unwrap_or_default();
+
+        // Compatible proxies: directly listed in the group config (no filter applied)
+        let mut compatible_proxies = gc.proxies.clone();
+        let mut compatible_set: std::collections::HashSet<String> =
+            compatible_proxies.iter().cloned().collect();
+
+        // mihomo compat: include-all implies include-all-providers + include-all-proxies
+        let include_all_providers =
+            gc.include_all_providers.unwrap_or(false) || gc.include_all.unwrap_or(false);
+        let include_all_proxies =
+            gc.include_all_proxies.unwrap_or(false) || gc.include_all.unwrap_or(false);
+
+        // Handle include-all-proxies: mihomo pre-filters with filter regex
+        // before adding to the compatible list (parser.go lines 84-99)
+        if include_all_proxies {
+            if !filter_regs.is_empty() {
+                for pc in proxy_configs {
+                    if compatible_set.contains(&pc.name) {
+                        continue;
+                    }
+                    for filter_reg in &filter_regs {
+                        if filter_reg.is_match(&pc.name) {
+                            compatible_set.insert(pc.name.clone());
+                            compatible_proxies.push(pc.name.clone());
+                            break;
+                        }
+                    }
+                }
+            } else {
+                for pc in proxy_configs {
+                    if compatible_set.insert(pc.name.clone()) {
+                        compatible_proxies.push(pc.name.clone());
+                    }
+                }
+            }
+        }
+
+        // Provider proxies: from `use` and include-all-providers (filter applied)
+        let mut provider_proxies: Vec<String> = Vec::new();
+        let mut provider_set: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        // Expand `use` provider references
+        for prov_name in &gc.use_providers {
+            if let Some(prov_proxies) = provider_proxy_names.get(prov_name) {
+                for name in prov_proxies {
+                    if provider_set.insert(name.clone()) {
+                        provider_proxies.push(name.clone());
+                    }
+                }
+            } else {
+                tracing::warn!(
+                    "Proxy group '{}' references unknown provider '{}'",
+                    gc.name,
+                    prov_name
+                );
+            }
+        }
+
+        // Handle include-all-providers flag
+        if include_all_providers {
+            for prov_proxies in provider_proxy_names.values() {
+                for name in prov_proxies {
+                    if provider_set.insert(name.clone()) {
+                        provider_proxies.push(name.clone());
+                    }
+                }
+            }
+        }
+
+        // Apply filter regex to provider proxies only (not compatible)
+        // mihomo compat (groupbase.go lines 135-161): filter acts as include-only;
+        // multiple backtick-separated patterns are OR'd. Proxies are ordered by
+        // filter pattern appearance (deduped).
+        if !filter_regs.is_empty() {
+            let mut filtered: Vec<String> = Vec::new();
+            let mut seen = std::collections::HashSet::new();
+            for filter_reg in &filter_regs {
+                for name in &provider_proxies {
+                    if filter_reg.is_match(name) && seen.insert(name.clone()) {
+                        filtered.push(name.clone());
+                    }
+                }
+            }
+            provider_proxies = filtered;
+        }
+
+        // Combine: compatible proxies first, then (filtered) provider proxies
+        // mihomo compat: Compatible provider is prepended to the providers list
+        let mut all_proxies = compatible_proxies;
+        all_proxies.extend(provider_proxies);
+
+        // Apply exclude-filter regex (remove any proxy matching ANY pattern)
+        // mihomo compat (groupbase.go lines 190-203): applies to ALL proxies
+        if !exclude_filter_regs.is_empty() {
+            all_proxies.retain(|name| !exclude_filter_regs.iter().any(|re| re.is_match(name)));
+        }
+
+        // Apply exclude-type (remove proxies of specified types, case-insensitive)
+        // mihomo compat (groupbase.go lines 205-218): applies to ALL proxies
+        if !exclude_type_array.is_empty() {
+            all_proxies.retain(|name| {
+                if let Some(handler) = proxies.get(name) {
+                    !exclude_type_array
+                        .iter()
+                        .any(|t| handler.proto().eq_ignore_ascii_case(t))
+                } else {
+                    true // keep unknown proxies (e.g., other group names)
+                }
+            });
+        }
+
+        // Warn when filtering leaves the group empty (mihomo falls back to
+        // a COMPATIBLE placeholder; we only log — no fallback is inserted).
+        if all_proxies.is_empty() {
+            tracing::warn!("Proxy group '{}' has no proxies after filtering", gc.name);
+        }
+
+        all_proxies
+    }
+
+    /// Construct one live group instance from its config.
+    fn build_group(
+        gc: &ProxyGroupConfig,
+        all_proxies: Vec<String>,
+        state_store: &Arc<crate::proxy_group::proxy_state::ProxyStateStore>,
+    ) -> Result<Arc<dyn ProxyGroup>> {
+        // mihomo compat: default test URL is https (constant/adapters.go:61);
+        // `lazy` defaults to true (parser.go:51-53); `tolerance` defaults to
+        // 0 (urltest.go:19-23); `interval: 0` is coerced to 300s so the
+        // health-check timer never gets a zero period (parser.go:168-170) —
+        // a zero-period tokio interval would panic and abort the process.
+        let default_test_url = || "https://www.gstatic.com/generate_204".to_string();
+        let hc_interval = match gc.interval {
+            Some(0) | None => 300,
+            Some(n) => n,
+        };
+        let hc_lazy = gc.lazy.unwrap_or(true);
+        // mihomo compat: parser.go:118-121 — an invalid expected-status
+        // fails the whole config load with `<group>: <err>`.
+        let expected_status =
+            crate::proxy_group::parse_expected_status(gc.expected_status.as_deref().unwrap_or(""))
+                .map_err(|e| anyhow::anyhow!("{}: {}", gc.name, e))?;
+        let make_hc = |interval_secs: u64| crate::proxy_group::HealthCheckOpts {
+            url: gc.url.clone().unwrap_or_else(default_test_url),
+            interval_secs,
+            max_failed_times: gc.max_failed_times,
+            test_timeout: gc.timeout,
+            lazy: hc_lazy,
+            expected_status: expected_status.clone(),
+        };
+
+        let group: Arc<dyn ProxyGroup> = match gc.group_type.as_str() {
+            // mihomo compat: parser.go:166-171 + healthcheck.go auto() —
+            // select groups get a periodic health check only when the
+            // user configures a non-zero interval (no 300s default).
+            "select" => match gc.interval {
+                Some(n) if n > 0 => Arc::new(SelectorGroup::with_health_check(
+                    gc.name.clone(),
+                    all_proxies,
+                    make_hc(n),
+                    state_store.clone(),
+                )),
+                _ => Arc::new(SelectorGroup::new(gc.name.clone(), all_proxies)),
+            },
+            "url-test" => Arc::new(UrlTestGroup::new(
+                gc.name.clone(),
+                all_proxies,
+                gc.tolerance.unwrap_or(0),
+                make_hc(hc_interval),
+                state_store.clone(),
+            )),
+            "fallback" => Arc::new(FallbackGroup::new(
+                gc.name.clone(),
+                all_proxies,
+                make_hc(hc_interval),
+                state_store.clone(),
+            )),
+            "load-balance" => Arc::new(LoadBalanceGroup::new(
+                gc.name.clone(),
+                all_proxies,
+                LoadBalanceStrategy::from_str(
+                    gc.strategy.as_deref().unwrap_or("consistent-hashing"),
+                ),
+                make_hc(hc_interval),
+                state_store.clone(),
+            )),
+            "relay" => {
+                // mihomo compat: parser.go:196-197 — relay groups were
+                // removed in Meta; this is a hard config error, not a skip.
+                return Err(anyhow::anyhow!(
+                    "unsupport proxy group type: The group [{}] with relay type was removed, please using dialer-proxy instead",
+                    gc.name
+                ));
+            }
+            other => {
+                // mihomo compat: parser.go:198-199 — unknown group types
+                // fail the config load; degrading to a selector would
+                // silently change routing.
+                return Err(anyhow::anyhow!("unsupport proxy group type: {other}"));
+            }
+        };
+
+        Ok(group)
     }
 
     /// Apply global proxy options (routing mark, tcp-concurrent, keepalive) to
@@ -1154,6 +1198,170 @@ type: dns
         assert!(
             msg.contains("BAD"),
             "must name the proxy that failed: {msg}"
+        );
+    }
+
+    // ---- group member selection (groupbase.go filter semantics) ----
+
+    fn parse_group(yaml: &str) -> crate::config::proxy::ProxyGroupConfig {
+        serde_yaml::from_str(yaml).expect("group fixture should parse")
+    }
+
+    /// One provider named `prov` exposing the given proxy names, in order.
+    fn provider_names(names: &[&str]) -> HashMap<String, Vec<String>> {
+        let mut m = HashMap::new();
+        m.insert(
+            "prov".to_string(),
+            names.iter().map(|s| s.to_string()).collect(),
+        );
+        m
+    }
+
+    fn members(
+        gc: &crate::config::proxy::ProxyGroupConfig,
+        proxy_configs: &[ProxyConfig],
+        providers: &HashMap<String, Vec<String>>,
+        proxies: &HashMap<String, Arc<dyn OutboundHandler>>,
+    ) -> Vec<String> {
+        ProxyManager::group_members(gc, proxy_configs, providers, proxies)
+    }
+
+    #[test]
+    fn group_members_lists_compatible_first_and_filters_only_providers() {
+        // mihomo compat (groupbase.go:135-161): `filter` is include-only and
+        // applies to provider proxies. Proxies named directly in the group
+        // config are the "Compatible" provider, prepended and unfiltered —
+        // so "Listed-Direct" survives a filter it doesn't match.
+        let gc = parse_group(
+            r#"
+name: PROXY
+type: select
+proxies: [Listed-Direct]
+use: [prov]
+filter: "HK|US"
+"#,
+        );
+        let provs = provider_names(&["HK-01", "US-01", "JP-01"]);
+        assert_eq!(
+            members(&gc, &[], &provs, &HashMap::new()),
+            vec!["Listed-Direct", "HK-01", "US-01"]
+        );
+    }
+
+    #[test]
+    fn group_members_orders_by_filter_pattern_appearance() {
+        // mihomo compat: backtick-separated patterns are OR'd, and the result
+        // is ordered by pattern appearance (deduped), not by provider order.
+        let gc = parse_group(
+            r#"
+name: PROXY
+type: url-test
+use: [prov]
+filter: "US`HK"
+"#,
+        );
+        let provs = provider_names(&["HK-01", "US-01", "HK-02"]);
+        assert_eq!(
+            members(&gc, &[], &provs, &HashMap::new()),
+            vec!["US-01", "HK-01", "HK-02"]
+        );
+    }
+
+    #[test]
+    fn group_members_exclude_filter_applies_to_listed_proxies_too() {
+        // mihomo compat (groupbase.go:190-203): exclude-filter applies to ALL
+        // proxies, including the directly-listed ones that `filter` skips.
+        let gc = parse_group(
+            r#"
+name: PROXY
+type: select
+proxies: [HK-Listed]
+use: [prov]
+exclude-filter: "HK"
+"#,
+        );
+        let provs = provider_names(&["HK-02", "US-01"]);
+        assert_eq!(
+            members(&gc, &[], &provs, &HashMap::new()),
+            vec!["US-01"],
+            "exclude-filter must drop the listed HK proxy as well"
+        );
+    }
+
+    #[test]
+    fn group_members_exclude_type_matches_handler_proto_and_keeps_unknowns() {
+        // mihomo compat (groupbase.go:205-218): exclude-type is a
+        // case-insensitive `|`-separated list matched against the adapter
+        // type name (`AdapterType.String()` — "Shadowsocks", not the config
+        // `type: ss` key). Names with no handler (e.g. other group names,
+        // which resolve later) are kept.
+        let ss = parse_cfg(
+            r#"
+name: SS-01
+type: ss
+server: 1.2.3.4
+port: 8388
+cipher: aes-128-gcm
+password: secret
+"#,
+        );
+        let socks = parse_cfg(
+            r#"
+name: SOCKS-01
+type: socks5
+server: 1.2.3.4
+port: 1080
+"#,
+        );
+        let mut proxies: HashMap<String, Arc<dyn OutboundHandler>> = HashMap::new();
+        for cfg in [&ss, &socks] {
+            proxies.insert(
+                cfg.name.clone(),
+                ProxyManager::load_proxy_config(cfg).expect("fixture should build"),
+            );
+        }
+
+        let gc = parse_group(
+            r#"
+name: PROXY
+type: select
+proxies: [SS-01, SOCKS-01, OTHER-GROUP]
+exclude-type: "shadowsocks|vmess"
+"#,
+        );
+        assert_eq!(
+            members(&gc, &[], &HashMap::new(), &proxies),
+            vec!["SOCKS-01", "OTHER-GROUP"]
+        );
+    }
+
+    #[test]
+    fn group_members_include_all_pulls_proxies_and_providers() {
+        // mihomo compat: include-all implies include-all-proxies +
+        // include-all-providers, and include-all-proxies pre-filters with
+        // the filter regex (parser.go:84-99) — unlike directly-listed names.
+        let cfgs: Vec<ProxyConfig> = ["HK-cfg", "JP-cfg"]
+            .iter()
+            .map(|n| {
+                parse_cfg(&format!(
+                    "name: {n}\ntype: socks5\nserver: 1.2.3.4\nport: 1080\n"
+                ))
+            })
+            .collect();
+        let provs = provider_names(&["HK-prov", "JP-prov"]);
+
+        let all = parse_group("name: PROXY\ntype: select\ninclude-all: true\n");
+        assert_eq!(
+            members(&all, &cfgs, &provs, &HashMap::new()),
+            vec!["HK-cfg", "JP-cfg", "HK-prov", "JP-prov"]
+        );
+
+        let filtered =
+            parse_group("name: PROXY\ntype: select\ninclude-all: true\nfilter: \"HK\"\n");
+        assert_eq!(
+            members(&filtered, &cfgs, &provs, &HashMap::new()),
+            vec!["HK-cfg", "HK-prov"],
+            "filter must pre-filter include-all-proxies as well as providers"
         );
     }
 }

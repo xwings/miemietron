@@ -913,452 +913,268 @@ impl RuleEngine {
         false
     }
 
+    /// mihomo compat: `Rule.Match(metadata)` — evaluate one parsed rule.
+    ///
+    /// Dispatch is on the precomputed [`RuleKind`] discriminant (one compare per
+    /// rule instead of a 36-arm string match) and routes to a per-family
+    /// matcher. Every family except logic answers a plain bool, so the
+    /// `target -> Action` mapping happens once here.
     fn match_single_rule(
         &self,
         rule: &ParsedRule,
         metadata: &RuleMetadata,
         domain_lower: Option<&str>,
     ) -> Option<Action> {
+        use RuleKind::*;
+        let matched = match rule.kind {
+            Match => true,
+
+            Network => metadata.network.eq_ignore_ascii_case(&rule.payload),
+
+            Domain | DomainSuffix | DomainSuffixStrict | DomainStar | DomainKeyword
+            | DomainWildcard | DomainRegex | GeoSite => self.match_domain_rule(rule, domain_lower),
+
+            GeoIp | SrcGeoIp | IpCidr | SrcIpCidr | IpSuffix | SrcIpSuffix | IpAsn | SrcIpAsn => {
+                self.match_ip_rule(rule, metadata)
+            }
+
+            SrcPort | DstPort | InPort => self.match_port_rule(rule, metadata),
+
+            ProcessName | ProcessPath | ProcessNameRegex | ProcessPathRegex
+            | ProcessNameWildcard | ProcessPathWildcard => self.match_process_rule(rule, metadata),
+
+            InType | InUser | InName | Uid | Dscp => self.match_inbound_rule(rule, metadata),
+
+            // Logic rules pick their own target (SUB-RULE resolves to the
+            // matched rule *inside* the named group), so they answer directly.
+            And | Or | Not | SubRule => return self.match_logic_rule(rule, metadata, domain_lower),
+
+            Unknown => false,
+        };
+
+        if matched {
+            Some(target_to_action(&rule.target))
+        } else {
+            None
+        }
+    }
+
+    /// DOMAIN / DOMAIN-SUFFIX / DOMAIN-KEYWORD / DOMAIN-REGEX /
+    /// DOMAIN-WILDCARD / GEOSITE plus the two provider-only suffix forms.
+    /// The payload was lowercased at parse time, as was `domain_lower`.
+    fn match_domain_rule(&self, rule: &ParsedRule, domain_lower: Option<&str>) -> bool {
+        let Some(d) = domain_lower else {
+            return false;
+        };
+        let s = rule.payload.as_str();
         match rule.kind {
-            RuleKind::Match => Some(target_to_action(&rule.target)),
+            RuleKind::Domain => d == s,
 
-            RuleKind::Network => {
-                if metadata.network.eq_ignore_ascii_case(&rule.payload) {
-                    Some(target_to_action(&rule.target))
-                } else {
-                    None
-                }
-            }
-
-            RuleKind::SrcPort => {
-                let matched = match &rule.prepared {
-                    Prepared::Ports(ranges) => port_matches_pre(metadata.src_port, ranges),
-                    _ => port_matches(metadata.src_port, &rule.payload),
-                };
-                if matched {
-                    return Some(target_to_action(&rule.target));
-                }
-                None
-            }
-
-            RuleKind::ProcessName => {
-                // mihomo compat: process.go uses strings.EqualFold (case-insensitive)
-                if let Some(ref name) = metadata.process_name {
-                    if name.eq_ignore_ascii_case(&rule.payload) {
-                        return Some(target_to_action(&rule.target));
-                    }
-                }
-                None
-            }
-
-            RuleKind::ProcessPath => {
-                // mihomo compat: process.go uses strings.EqualFold (case-insensitive)
-                if let Some(ref path) = metadata.process_path {
-                    if path.eq_ignore_ascii_case(&rule.payload) {
-                        return Some(target_to_action(&rule.target));
-                    }
-                }
-                None
-            }
-
-            RuleKind::GeoIp => {
-                // mihomo compat: `src` param flips matching to the source IP
-                // (base.go ParseParams; parser.go NewGEOIP(isSrc)).
-                let ip_opt = if rule.is_src {
-                    metadata.src_ip.as_ref()
-                } else {
-                    metadata.dst_ip.as_ref()
-                };
-                if let Some(ip) = ip_opt {
-                    if self.geoip_payload_matches(ip, &rule.payload) {
-                        return Some(target_to_action(&rule.target));
-                    }
-                }
-                None
-            }
-
-            RuleKind::SrcGeoIp => {
-                if let Some(ref ip) = metadata.src_ip {
-                    if self.geoip_payload_matches(ip, &rule.payload) {
-                        return Some(target_to_action(&rule.target));
-                    }
-                }
-                None
-            }
-
-            RuleKind::GeoSite => {
-                if let Some(d) = domain_lower {
-                    if self.geosite_matcher.lookup(d, &rule.payload) {
-                        return Some(target_to_action(&rule.target));
-                    }
-                }
-                None
-            }
-
-            RuleKind::SrcIpCidr => {
-                if let Some(ref ip) = metadata.src_ip {
-                    let matched = match &rule.prepared {
-                        Prepared::Cidr(cidr) => cidr.matches(ip),
-                        _ => check_ip_in_cidr(ip, &rule.payload),
-                    };
-                    if matched {
-                        return Some(target_to_action(&rule.target));
-                    }
-                }
-                None
-            }
-
-            RuleKind::DomainRegex => {
-                if let Some(d) = domain_lower {
-                    // Pre-compiled at parse time (avoids Regex::new per match).
-                    let matched = match &rule.prepared {
-                        Prepared::Regex(re) => re.is_match(d),
-                        // Only patterns that failed to compile land here, and
-                        // they fail again → no match.
-                        _ => match_domain_regex(&rule.payload, d),
-                    };
-                    if matched {
-                        return Some(target_to_action(&rule.target));
-                    }
-                }
-                None
-            }
-
-            // mihomo compat: logic.go Match — sub-rules were parsed through the
-            // full rule parser at load, so every rule type (including nested
-            // logic) evaluates with the real matcher. AND over zero rules is
-            // vacuously true; OR over zero rules is false.
-            RuleKind::And => {
-                if rule
-                    .sub_rules
-                    .iter()
-                    .all(|r| self.match_single_rule(r, metadata, domain_lower).is_some())
-                {
-                    Some(target_to_action(&rule.target))
-                } else {
-                    None
-                }
-            }
-
-            RuleKind::Or => {
-                if rule
-                    .sub_rules
-                    .iter()
-                    .any(|r| self.match_single_rule(r, metadata, domain_lower).is_some())
-                {
-                    Some(target_to_action(&rule.target))
-                } else {
-                    None
-                }
-            }
-
-            RuleKind::Not => {
-                let inner = rule.sub_rules.first()?;
-                if self
-                    .match_single_rule(inner, metadata, domain_lower)
-                    .is_none()
-                {
-                    Some(target_to_action(&rule.target))
-                } else {
-                    None
-                }
-            }
-
-            RuleKind::Domain => {
-                if let Some(d) = domain_lower {
-                    if d == rule.payload {
-                        return Some(target_to_action(&rule.target));
-                    }
-                }
-                None
-            }
-
-            RuleKind::DomainSuffix => {
-                if let Some(d) = domain_lower {
-                    let s = &rule.payload; // already lowercase from parse time
-                    if d == s.as_str()
-                        || (d.len() > s.len()
-                            && d.ends_with(s.as_str())
-                            && d.as_bytes()[d.len() - s.len() - 1] == b'.')
-                    {
-                        return Some(target_to_action(&rule.target));
-                    }
-                }
-                None
-            }
+            RuleKind::DomainSuffix => d == s || is_subdomain_of(d, s),
 
             // mihomo compat: ".example.com" in domain-behavior providers
             // matches subdomains only (not the domain itself)
-            RuleKind::DomainSuffixStrict => {
-                if let Some(d) = domain_lower {
-                    let s = &rule.payload; // already lowercase from parse time
-                    if d.len() > s.len()
-                        && d.ends_with(s.as_str())
-                        && d.as_bytes()[d.len() - s.len() - 1] == b'.'
-                    {
-                        return Some(target_to_action(&rule.target));
-                    }
-                }
-                None
-            }
+            RuleKind::DomainSuffixStrict => is_subdomain_of(d, s),
 
             // mihomo compat: "*.example.com" in domain-behavior providers —
             // exactly one extra label (trie/domain.go wildcard node).
             RuleKind::DomainStar => {
-                if let Some(d) = domain_lower {
-                    let s = &rule.payload;
-                    if d.len() > s.len() + 1
-                        && d.ends_with(s.as_str())
-                        && d.as_bytes()[d.len() - s.len() - 1] == b'.'
-                        && !d[..d.len() - s.len() - 1].contains('.')
-                    {
-                        return Some(target_to_action(&rule.target));
-                    }
-                }
-                None
+                d.len() > s.len() + 1
+                    && is_subdomain_of(d, s)
+                    && !d[..d.len() - s.len() - 1].contains('.')
             }
 
-            RuleKind::DomainKeyword => {
-                if let Some(d) = domain_lower {
-                    if d.contains(&rule.payload[..]) {
-                        return Some(target_to_action(&rule.target));
-                    }
-                }
-                None
+            RuleKind::DomainKeyword => d.contains(s),
+
+            RuleKind::DomainWildcard => wildcard_match(s, d),
+
+            // Pre-compiled at parse time (avoids Regex::new per match). Only
+            // patterns that failed to compile take the fallback, and they fail
+            // again there → no match.
+            RuleKind::DomainRegex => match &rule.prepared {
+                Prepared::Regex(re) => re.is_match(d),
+                _ => match_domain_regex(s, d),
+            },
+
+            RuleKind::GeoSite => self.geosite_matcher.lookup(d, s),
+
+            _ => false,
+        }
+    }
+
+    /// GEOIP / IP-CIDR / IP-SUFFIX / IP-ASN and their SRC- variants.
+    fn match_ip_rule(&self, rule: &ParsedRule, metadata: &RuleMetadata) -> bool {
+        // mihomo compat: the `src` param flips a destination-IP rule onto the
+        // source IP (base.go ParseParams; parser.go NewGEOIP(isSrc)); the SRC-*
+        // rule types always read the source IP.
+        let ip = match rule.kind {
+            RuleKind::SrcGeoIp
+            | RuleKind::SrcIpCidr
+            | RuleKind::SrcIpSuffix
+            | RuleKind::SrcIpAsn => metadata.src_ip.as_ref(),
+            _ if rule.is_src => metadata.src_ip.as_ref(),
+            _ => metadata.dst_ip.as_ref(),
+        };
+        let Some(ip) = ip else {
+            return false;
+        };
+        match rule.kind {
+            RuleKind::GeoIp | RuleKind::SrcGeoIp => self.geoip_payload_matches(ip, &rule.payload),
+
+            RuleKind::IpAsn | RuleKind::SrcIpAsn => self.asn_payload_matches(ip, rule),
+
+            // Pre-parsed at load time for an O(1) bitwise match; the string
+            // fallback only runs for a payload that failed to parse.
+            RuleKind::IpCidr | RuleKind::SrcIpCidr => match &rule.prepared {
+                Prepared::Cidr(cidr) => cidr.matches(ip),
+                _ => check_ip_in_cidr(ip, &rule.payload),
+            },
+
+            RuleKind::IpSuffix | RuleKind::SrcIpSuffix => match &rule.prepared {
+                Prepared::Suffix(suffix) => suffix.matches(ip),
+                _ => check_ip_suffix(ip, &rule.payload),
+            },
+
+            _ => false,
+        }
+    }
+
+    /// SRC-PORT / DST-PORT / IN-PORT — all three share one range-list payload.
+    fn match_port_rule(&self, rule: &ParsedRule, metadata: &RuleMetadata) -> bool {
+        let port = match rule.kind {
+            RuleKind::SrcPort => Some(metadata.src_port),
+            RuleKind::DstPort => Some(metadata.dst_port),
+            RuleKind::InPort => metadata.in_port,
+            _ => None,
+        };
+        let Some(port) = port else {
+            return false;
+        };
+        match &rule.prepared {
+            Prepared::Ports(ranges) => port_matches_pre(port, ranges),
+            _ => port_matches(port, &rule.payload),
+        }
+    }
+
+    /// PROCESS-NAME / PROCESS-PATH and their -REGEX / -WILDCARD variants.
+    fn match_process_rule(&self, rule: &ParsedRule, metadata: &RuleMetadata) -> bool {
+        let value = match rule.kind {
+            RuleKind::ProcessName | RuleKind::ProcessNameRegex | RuleKind::ProcessNameWildcard => {
+                metadata.process_name.as_deref()
+            }
+            RuleKind::ProcessPath | RuleKind::ProcessPathRegex | RuleKind::ProcessPathWildcard => {
+                metadata.process_path.as_deref()
+            }
+            _ => None,
+        };
+        let Some(value) = value else {
+            return false;
+        };
+        match rule.kind {
+            // mihomo compat: process.go uses strings.EqualFold (case-insensitive)
+            RuleKind::ProcessName | RuleKind::ProcessPath => {
+                value.eq_ignore_ascii_case(&rule.payload)
             }
 
-            RuleKind::DomainWildcard => {
-                if let Some(d) = domain_lower {
-                    if wildcard_match(&rule.payload, d) {
-                        return Some(target_to_action(&rule.target));
-                    }
-                }
-                None
+            // mihomo compat: process.go:45-47 uses regexp2 with IgnoreCase.
+            RuleKind::ProcessNameRegex | RuleKind::ProcessPathRegex => {
+                matches!(&rule.prepared, Prepared::Regex(re) if re.is_match(value))
             }
 
-            RuleKind::IpAsn => {
-                let ip_opt = if rule.is_src {
-                    metadata.src_ip.as_ref()
+            // mihomo compat: process.go lowercases both pattern and target
+            _ => wildcard_match(&rule.payload.to_lowercase(), &value.to_lowercase()),
+        }
+    }
+
+    /// IN-TYPE / IN-USER / IN-NAME plus the socket attributes UID and DSCP.
+    fn match_inbound_rule(&self, rule: &ParsedRule, metadata: &RuleMetadata) -> bool {
+        match rule.kind {
+            // mihomo compat: payload is a `/`-separated list, matched
+            // case-insensitively; `SOCKS` expands to SOCKS4+SOCKS5
+            // (in_type.go parseInTypes).
+            RuleKind::InType => metadata.in_type.is_some_and(|in_type| {
+                rule.payload.split('/').any(|tp| {
+                    let tp = tp.trim();
+                    tp.eq_ignore_ascii_case(in_type)
+                        || (tp.eq_ignore_ascii_case("socks")
+                            && (in_type.eq_ignore_ascii_case("socks4")
+                                || in_type.eq_ignore_ascii_case("socks5")))
+                })
+            }),
+
+            // mihomo compat: in_user.go / in_name.go — '/'-separated lists.
+            RuleKind::InUser => metadata
+                .in_user
+                .as_ref()
+                .is_some_and(|v| rule.payload.split('/').any(|u| u.trim() == v)),
+
+            RuleKind::InName => metadata
+                .in_name
+                .as_ref()
+                .is_some_and(|v| rule.payload.split('/').any(|n| n.trim() == v)),
+
+            // mihomo compat: uid.go / dscp.go — the payload is a range list
+            // ("1000-1100/2000") and IntRanges.Check(empty) is true, so "*"
+            // matches everything.
+            RuleKind::Uid | RuleKind::Dscp => {
+                let value = if rule.kind == RuleKind::Uid {
+                    metadata.uid
                 } else {
-                    metadata.dst_ip.as_ref()
+                    metadata.dscp.map(u32::from)
                 };
-                if let Some(ip) = ip_opt {
-                    if self.asn_payload_matches(ip, rule) {
-                        return Some(target_to_action(&rule.target));
-                    }
-                }
-                None
-            }
-
-            RuleKind::SrcIpAsn => {
-                if let Some(ref ip) = metadata.src_ip {
-                    if self.asn_payload_matches(ip, rule) {
-                        return Some(target_to_action(&rule.target));
-                    }
-                }
-                None
-            }
-
-            RuleKind::IpSuffix => {
-                let ip_opt = if rule.is_src {
-                    metadata.src_ip.as_ref()
-                } else {
-                    metadata.dst_ip.as_ref()
+                let Some(value) = value else {
+                    return false;
                 };
-                if let Some(ip) = ip_opt {
-                    let matched = match &rule.prepared {
-                        Prepared::Suffix(suffix) => suffix.matches(ip),
-                        _ => check_ip_suffix(ip, &rule.payload),
-                    };
-                    if matched {
-                        return Some(target_to_action(&rule.target));
-                    }
+                match &rule.prepared {
+                    Prepared::Ranges(ranges) => u32_ranges_check(value, ranges),
+                    _ => parse_u32_ranges(&rule.payload)
+                        .map(|r| u32_ranges_check(value, &r))
+                        .unwrap_or(false),
                 }
-                None
             }
 
-            RuleKind::SrcIpSuffix => {
-                if let Some(ref ip) = metadata.src_ip {
-                    let matched = match &rule.prepared {
-                        Prepared::Suffix(suffix) => suffix.matches(ip),
-                        _ => check_ip_suffix(ip, &rule.payload),
-                    };
-                    if matched {
-                        return Some(target_to_action(&rule.target));
-                    }
-                }
-                None
-            }
+            _ => false,
+        }
+    }
 
-            RuleKind::ProcessNameRegex => {
-                // mihomo compat: process.go:45-47 uses regexp2 with IgnoreCase.
-                if let Some(ref name) = metadata.process_name {
-                    if let Prepared::Regex(re) = &rule.prepared {
-                        if re.is_match(name) {
-                            return Some(target_to_action(&rule.target));
-                        }
-                    }
-                }
-                None
-            }
+    /// mihomo compat: logic.go Match — sub-rules were parsed through the full
+    /// rule parser at load, so every rule type (including nested logic)
+    /// evaluates with the real matcher. AND over zero rules is vacuously true;
+    /// OR over zero rules is false.
+    fn match_logic_rule(
+        &self,
+        rule: &ParsedRule,
+        metadata: &RuleMetadata,
+        domain_lower: Option<&str>,
+    ) -> Option<Action> {
+        match rule.kind {
+            RuleKind::And => rule
+                .sub_rules
+                .iter()
+                .all(|r| self.match_single_rule(r, metadata, domain_lower).is_some())
+                .then(|| target_to_action(&rule.target)),
 
-            RuleKind::ProcessPathRegex => {
-                if let Some(ref path) = metadata.process_path {
-                    if let Prepared::Regex(re) = &rule.prepared {
-                        if re.is_match(path) {
-                            return Some(target_to_action(&rule.target));
-                        }
-                    }
-                }
-                None
-            }
+            RuleKind::Or => rule
+                .sub_rules
+                .iter()
+                .any(|r| self.match_single_rule(r, metadata, domain_lower).is_some())
+                .then(|| target_to_action(&rule.target)),
 
-            RuleKind::ProcessNameWildcard => {
-                // mihomo compat: process.go lowercases both pattern and target
-                if let Some(ref name) = metadata.process_name {
-                    if wildcard_match(&rule.payload.to_lowercase(), &name.to_lowercase()) {
-                        return Some(target_to_action(&rule.target));
-                    }
-                }
-                None
-            }
+            RuleKind::Not => self
+                .match_single_rule(rule.sub_rules.first()?, metadata, domain_lower)
+                .is_none()
+                .then(|| target_to_action(&rule.target)),
 
-            RuleKind::ProcessPathWildcard => {
-                // mihomo compat: process.go lowercases both pattern and target
-                if let Some(ref path) = metadata.process_path {
-                    if wildcard_match(&rule.payload.to_lowercase(), &path.to_lowercase()) {
-                        return Some(target_to_action(&rule.target));
-                    }
-                }
-                None
-            }
-
-            RuleKind::IpCidr => {
-                let ip_opt = if rule.is_src {
-                    metadata.src_ip.as_ref()
-                } else {
-                    metadata.dst_ip.as_ref()
-                };
-                if let Some(ip) = ip_opt {
-                    // Use pre-parsed CIDR for O(1) bitwise match
-                    let matched = match &rule.prepared {
-                        Prepared::Cidr(cidr) => cidr.matches(ip),
-                        _ => check_ip_in_cidr(ip, &rule.payload),
-                    };
-                    if matched {
-                        return Some(target_to_action(&rule.target));
-                    }
-                }
-                None
-            }
-
-            RuleKind::DstPort => {
-                let matched = match &rule.prepared {
-                    Prepared::Ports(ranges) => port_matches_pre(metadata.dst_port, ranges),
-                    _ => port_matches(metadata.dst_port, &rule.payload),
-                };
-                if matched {
-                    return Some(target_to_action(&rule.target));
-                }
-                None
-            }
-
-            RuleKind::InPort => {
-                if let Some(in_port) = metadata.in_port {
-                    let matched = match &rule.prepared {
-                        Prepared::Ports(ranges) => port_matches_pre(in_port, ranges),
-                        _ => port_matches(in_port, &rule.payload),
-                    };
-                    if matched {
-                        return Some(target_to_action(&rule.target));
-                    }
-                }
-                None
-            }
-
-            RuleKind::InType => {
-                if let Some(in_type) = metadata.in_type {
-                    // mihomo compat: payload is a `/`-separated list, matched
-                    // case-insensitively; `SOCKS` expands to SOCKS4+SOCKS5
-                    // (in_type.go parseInTypes).
-                    let matched = rule.payload.split('/').any(|tp| {
-                        let tp = tp.trim();
-                        tp.eq_ignore_ascii_case(in_type)
-                            || (tp.eq_ignore_ascii_case("socks")
-                                && (in_type.eq_ignore_ascii_case("socks4")
-                                    || in_type.eq_ignore_ascii_case("socks5")))
-                    });
-                    if matched {
-                        return Some(target_to_action(&rule.target));
-                    }
-                }
-                None
-            }
-
-            RuleKind::InUser => {
-                // mihomo compat: in_user.go — payload is a '/'-separated list.
-                if let Some(ref in_user) = metadata.in_user {
-                    if rule.payload.split('/').any(|u| u.trim() == in_user) {
-                        return Some(target_to_action(&rule.target));
-                    }
-                }
-                None
-            }
-
-            RuleKind::InName => {
-                // mihomo compat: in_name.go — payload is a '/'-separated list.
-                if let Some(ref in_name) = metadata.in_name {
-                    if rule.payload.split('/').any(|n| n.trim() == in_name) {
-                        return Some(target_to_action(&rule.target));
-                    }
-                }
-                None
-            }
-
-            RuleKind::Uid => {
-                // mihomo compat: uid.go — payload is a range list
-                // ("1000-1100/2000"); IntRanges.Check(empty) is true.
-                if let Some(uid) = metadata.uid {
-                    let matched = match &rule.prepared {
-                        Prepared::Ranges(ranges) => u32_ranges_check(uid, ranges),
-                        _ => parse_u32_ranges(&rule.payload)
-                            .map(|r| u32_ranges_check(uid, &r))
-                            .unwrap_or(false),
-                    };
-                    if matched {
-                        return Some(target_to_action(&rule.target));
-                    }
-                }
-                None
-            }
-
-            RuleKind::Dscp => {
-                // mihomo compat: dscp.go — payload is a range list; "*" (empty
-                // ranges) matches everything (IntRanges.Check).
-                if let Some(dscp) = metadata.dscp {
-                    let matched = match &rule.prepared {
-                        Prepared::Ranges(ranges) => u32_ranges_check(dscp as u32, ranges),
-                        _ => parse_u32_ranges(&rule.payload)
-                            .map(|r| u32_ranges_check(dscp as u32, &r))
-                            .unwrap_or(false),
-                    };
-                    if matched {
-                        return Some(target_to_action(&rule.target));
-                    }
-                }
-                None
-            }
-
+            // mihomo compat: logic.go — the payload is ONE gating condition and
+            // the target is the sub-rule group name. Only when the condition
+            // matches is the named group evaluated.
             RuleKind::SubRule => {
-                // mihomo compat: logic.go — the payload is ONE gating
-                // condition and the target is the sub-rule group name. Only
-                // when the condition matches is the named group evaluated.
                 let cond = rule.sub_rules.first()?;
                 self.match_single_rule(cond, metadata, domain_lower)?;
                 self.match_sub_rules_group(&rule.target, metadata, domain_lower, 0)
             }
 
-            RuleKind::Unknown => None,
+            _ => None,
         }
     }
 
@@ -1930,6 +1746,14 @@ fn match_domain_regex(pattern: &str, domain: &str) -> bool {
 /// Malformed CIDRs (and family mismatches) never match.
 fn check_ip_in_cidr(ip: &IpAddr, cidr: &str) -> bool {
     PreParsedCidr::parse(cidr).is_some_and(|c| c.matches(ip))
+}
+
+/// `d` is a strict subdomain of `s` — it ends with `.{s}`.
+///
+/// mihomo compat: the label-boundary check in `trie/domain.go` / DomainSuffix —
+/// "oexample.com" must not match the suffix "example.com".
+fn is_subdomain_of(d: &str, s: &str) -> bool {
+    d.len() > s.len() && d.ends_with(s) && d.as_bytes()[d.len() - s.len() - 1] == b'.'
 }
 
 fn wildcard_match(pattern: &str, text: &str) -> bool {
