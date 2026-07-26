@@ -5,8 +5,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-use crate::common::addr::Address;
-use crate::proxy::vless::header::encode_address;
+use crate::common::addr::{encode_socks5, Address};
 
 /// Trojan command types.
 pub const CMD_TCP: u8 = 0x01;
@@ -32,8 +31,13 @@ pub fn hex_sha224(password: &str) -> String {
 /// [address: SOCKS5 format]
 /// [CRLF]
 /// ```
+///
+/// mihomo compat: the address is built by `adapter/outbound/util.go
+/// serializesSocksAddr` and handed to `transport/trojan.WriteHeader`
+/// (`adapter/outbound/trojan.go:158`), so the ATYP numbering is SOCKS5's
+/// (1/3/4) — *not* VMess/VLESS's (1/2/3).
 pub fn encode_request(password_hash: &str, cmd: u8, addr: &Address) -> Vec<u8> {
-    let addr_bytes = encode_address(addr);
+    let addr_bytes = encode_socks5(addr);
     let mut buf = Vec::with_capacity(56 + 2 + 1 + addr_bytes.len() + 2);
 
     // Password hash (56 hex chars)
@@ -169,7 +173,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> AsyncWrite for TrojanStream<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 
     #[test]
     fn sha224_known_value() {
@@ -210,12 +214,17 @@ mod tests {
         assert_eq!(&header[56..58], b"\r\n");
         // Command byte
         assert_eq!(header[58], CMD_TCP);
-        // Address starts at byte 59
-        // (ATYP_DOMAIN from vless encode_address = 0x02)
-        assert_eq!(header[59], 0x02);
+        // Address starts at byte 59. mihomo compat: socks5.AtypDomainName == 3
+        // (adapter/outbound/util.go serializesSocksAddr). We used to emit
+        // VLESS's 0x02 here, which a compliant Trojan server reads as IPv6.
+        assert_eq!(header[59], 0x03);
+        assert_eq!(header[60], 11); // "example.com".len()
+        assert_eq!(&header[61..72], b"example.com");
+        assert_eq!(&header[72..74], &443u16.to_be_bytes());
         // Trailing CRLF
         let len = header.len();
         assert_eq!(&header[len - 2..], b"\r\n");
+        assert_eq!(len, 74 + 2);
     }
 
     #[test]
@@ -227,7 +236,25 @@ mod tests {
 
         assert_eq!(&header[..56], password_hash.as_bytes());
         assert_eq!(header[58], CMD_TCP);
-        // IPv4 address type
+        // socks5.AtypIPv4 == 1
         assert_eq!(header[59], 0x01);
+        assert_eq!(&header[60..64], &[8, 8, 8, 8]);
+        assert_eq!(&header[64..66], &53u16.to_be_bytes());
+    }
+
+    #[test]
+    fn encode_request_with_ipv6() {
+        let password_hash = hex_sha224("pw");
+        let sock = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 443, 0, 0));
+        let addr = Address::Ip(sock);
+        let header = encode_request(&password_hash, CMD_TCP, &addr);
+
+        assert_eq!(header[58], CMD_TCP);
+        // mihomo compat: socks5.AtypIPv6 == 4. We used to emit VLESS's 0x03,
+        // which is SOCKS5's *domain* tag — the server then read the first
+        // address octet as a domain length.
+        assert_eq!(header[59], 0x04);
+        assert_eq!(&header[60..76], &Ipv6Addr::LOCALHOST.octets());
+        assert_eq!(&header[76..78], &443u16.to_be_bytes());
     }
 }

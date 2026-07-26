@@ -10,7 +10,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::debug;
 
 use super::{OutboundHandler, ProxyStream};
-use crate::common::addr::Address;
+use crate::common::addr::{encode_socks5_into, Address};
 use crate::config::proxy::ProxyConfig;
 use crate::dns::DnsResolver;
 use crate::transport::tcp::{self, ConnectOpts};
@@ -184,26 +184,7 @@ impl Socks5Outbound {
         let mut connect_req = Vec::with_capacity(64);
         connect_req.extend_from_slice(&[SOCKS5_VERSION, CMD_CONNECT, 0x00]); // ver, cmd, rsv
 
-        match target {
-            Address::Domain(host, port) => {
-                connect_req.push(ATYP_DOMAIN);
-                connect_req.push(host.len() as u8);
-                connect_req.extend_from_slice(host.as_bytes());
-                connect_req.extend_from_slice(&port.to_be_bytes());
-            }
-            Address::Ip(sockaddr) => match sockaddr.ip() {
-                std::net::IpAddr::V4(ipv4) => {
-                    connect_req.push(ATYP_IPV4);
-                    connect_req.extend_from_slice(&ipv4.octets());
-                    connect_req.extend_from_slice(&sockaddr.port().to_be_bytes());
-                }
-                std::net::IpAddr::V6(ipv6) => {
-                    connect_req.push(ATYP_IPV6);
-                    connect_req.extend_from_slice(&ipv6.octets());
-                    connect_req.extend_from_slice(&sockaddr.port().to_be_bytes());
-                }
-            },
-        }
+        encode_socks5_into(target, &mut connect_req);
 
         stream.write_all(&connect_req).await?;
         stream.flush().await?;

@@ -11,8 +11,6 @@ use digest::Digest;
 use pin_project_lite::pin_project;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-use crate::common::addr::Address;
-
 /// Maximum payload size per chunk.
 /// Legacy AEAD: 0x3FFF (16383 bytes)
 /// SS2022: 0xFFFF (65535 bytes)
@@ -154,49 +152,11 @@ fn hkdf_sha1(ikm: &[u8], salt: &[u8], info: &[u8], out_len: usize) -> Vec<u8> {
     okm
 }
 
-/// Write an Address as shadowsocks address header bytes into an existing buffer.
-///
-/// Format: [addr_type(1)][addr_data][port(2 big-endian)]
-///   addr_type 1 = IPv4 (4 bytes)
-///   addr_type 3 = domain (1 byte length + domain bytes)
-///   addr_type 4 = IPv6 (16 bytes)
-pub fn encode_address_into(addr: &Address, buf: &mut Vec<u8>) {
-    match addr {
-        Address::Ip(sockaddr) => match sockaddr.ip() {
-            std::net::IpAddr::V4(ipv4) => {
-                buf.push(0x01);
-                buf.extend_from_slice(&ipv4.octets());
-                buf.extend_from_slice(&sockaddr.port().to_be_bytes());
-            }
-            std::net::IpAddr::V6(ipv6) => {
-                buf.push(0x04);
-                buf.extend_from_slice(&ipv6.octets());
-                buf.extend_from_slice(&sockaddr.port().to_be_bytes());
-            }
-        },
-        Address::Domain(domain, port) => {
-            buf.push(0x03);
-            let domain_bytes = domain.as_bytes();
-            buf.push(domain_bytes.len() as u8);
-            buf.extend_from_slice(domain_bytes);
-            buf.extend_from_slice(&port.to_be_bytes());
-        }
-    }
-}
-
-/// Encode an Address into shadowsocks address header bytes.
-pub fn encode_address(addr: &Address) -> Vec<u8> {
-    let cap = match addr {
-        Address::Ip(sa) => match sa.ip() {
-            std::net::IpAddr::V4(_) => 7,
-            std::net::IpAddr::V6(_) => 19,
-        },
-        Address::Domain(d, _) => 4 + d.len(),
-    };
-    let mut buf = Vec::with_capacity(cap);
-    encode_address_into(addr, &mut buf);
-    buf
-}
+/// The shadowsocks address header is plain SOCKS5 framing
+/// (`ATYP · ADDR · PORT`, atyp 1/3/4).
+pub use crate::common::addr::{
+    encode_socks5 as encode_address, encode_socks5_into as encode_address_into,
+};
 
 /// Pre-initialized cipher — avoids re-running key expansion on every encrypt/decrypt.
 #[allow(clippy::large_enum_variant)]
@@ -1201,6 +1161,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncWrite for SsStream<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::common::addr::Address;
     use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 
     #[test]

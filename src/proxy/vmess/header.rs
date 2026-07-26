@@ -35,7 +35,6 @@ use hmac::Mac as HmacMac;
 use md5::{Digest as _, Md5};
 use rand::Rng;
 use sha2::Sha256;
-use std::net::IpAddr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 type HmacSha256 = hmac::Hmac<Sha256>;
@@ -48,10 +47,12 @@ const VMESS_HEADER_VERSION: u8 = 1;
 /// VMess command types.
 pub const CMD_TCP: u8 = 0x01;
 
-/// Address types.
+/// Address types. The encoder lives in `common::addr`; these are kept for the
+/// wire-format tests below.
+#[cfg(test)]
 const ATYP_IPV4: u8 = 0x01;
+#[cfg(test)]
 const ATYP_DOMAIN: u8 = 0x02;
-const ATYP_IPV6: u8 = 0x03;
 
 /// Option flags (vmess.go).
 ///
@@ -289,30 +290,9 @@ fn fnv1a32(data: &[u8]) -> u32 {
     hash
 }
 
-/// Encode a VMess address: `port (BE u16) || atyp || addr` (conn.go).
-fn encode_address(addr: &Address) -> Vec<u8> {
-    let mut buf = Vec::new();
-    buf.extend_from_slice(&addr.port().to_be_bytes());
-
-    match addr {
-        Address::Ip(sockaddr) => match sockaddr.ip() {
-            IpAddr::V4(ipv4) => {
-                buf.push(ATYP_IPV4);
-                buf.extend_from_slice(&ipv4.octets());
-            }
-            IpAddr::V6(ipv6) => {
-                buf.push(ATYP_IPV6);
-                buf.extend_from_slice(&ipv6.octets());
-            }
-        },
-        Address::Domain(domain, _port) => {
-            buf.push(ATYP_DOMAIN);
-            buf.push(domain.len() as u8);
-            buf.extend_from_slice(domain.as_bytes());
-        }
-    }
-    buf
-}
+/// The VMess address header is `port (BE u16) || atyp || addr` (conn.go) —
+/// the same framing VLESS uses.
+use crate::common::addr::encode_vmess as encode_address;
 
 /// Seal the plaintext header into the AEAD wire format (header.go
 /// `sealVMessAEADHeader`).
@@ -455,7 +435,7 @@ pub fn encode_request_header(
 }
 
 // mihomo compat: UUID parsing is identical across VMess/VLESS; reuse the VLESS
-// copy rather than duplicating it (Trojan already reuses vless::encode_address).
+// copy rather than duplicating it.
 pub use crate::proxy::vless::header::parse_uuid;
 
 #[cfg(test)]

@@ -1,22 +1,16 @@
 use pin_project_lite::pin_project;
 use std::io;
-use std::net::IpAddr;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-use crate::common::addr::Address;
+use crate::common::addr::{encode_vmess, Address};
 
 /// VLESS protocol version.
 const VLESS_VERSION: u8 = 0x00;
 
 /// VLESS command types.
 pub const CMD_TCP: u8 = 0x01;
-
-/// VLESS address types (SOCKS5 compatible).
-const ATYP_IPV4: u8 = 0x01;
-const ATYP_DOMAIN: u8 = 0x02;
-const ATYP_IPV6: u8 = 0x03;
 
 /// Parse a UUID string "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" into 16 raw bytes.
 pub fn parse_uuid(s: &str) -> Result<[u8; 16], &'static str> {
@@ -30,65 +24,6 @@ pub fn parse_uuid(s: &str) -> Result<[u8; 16], &'static str> {
             u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).map_err(|_| "invalid hex in UUID")?;
     }
     Ok(bytes)
-}
-
-/// Encode a SOCKS5-format address (`ATYP · ADDR · PORT`). Used by Trojan,
-/// whose request framing is SOCKS5-ordered (mihomo `transport/trojan`).
-pub fn encode_address(addr: &Address) -> Vec<u8> {
-    let mut buf = Vec::new();
-    match addr {
-        Address::Ip(sockaddr) => match sockaddr.ip() {
-            IpAddr::V4(ipv4) => {
-                buf.push(ATYP_IPV4);
-                buf.extend_from_slice(&ipv4.octets());
-                buf.extend_from_slice(&sockaddr.port().to_be_bytes());
-            }
-            IpAddr::V6(ipv6) => {
-                buf.push(ATYP_IPV6);
-                buf.extend_from_slice(&ipv6.octets());
-                buf.extend_from_slice(&sockaddr.port().to_be_bytes());
-            }
-        },
-        Address::Domain(domain, port) => {
-            buf.push(ATYP_DOMAIN);
-            buf.push(domain.len() as u8);
-            buf.extend_from_slice(domain.as_bytes());
-            buf.extend_from_slice(&port.to_be_bytes());
-        }
-    }
-    buf
-}
-
-/// Encode a VLESS-format address (`PORT · ATYP · ADDR`).
-///
-/// mihomo compat: `transport/vless/conn.go` writes the request as
-/// `command · BigEndian(port) · addrType · addr` — the port comes BEFORE the
-/// address type, unlike the SOCKS5 order Trojan/Shadowsocks use. Getting this
-/// wrong makes the server read the address bytes as the port and hang.
-fn encode_address_vless(addr: &Address) -> Vec<u8> {
-    let mut buf = Vec::new();
-    match addr {
-        Address::Ip(sockaddr) => {
-            buf.extend_from_slice(&sockaddr.port().to_be_bytes());
-            match sockaddr.ip() {
-                IpAddr::V4(ipv4) => {
-                    buf.push(ATYP_IPV4);
-                    buf.extend_from_slice(&ipv4.octets());
-                }
-                IpAddr::V6(ipv6) => {
-                    buf.push(ATYP_IPV6);
-                    buf.extend_from_slice(&ipv6.octets());
-                }
-            }
-        }
-        Address::Domain(domain, port) => {
-            buf.extend_from_slice(&port.to_be_bytes());
-            buf.push(ATYP_DOMAIN);
-            buf.push(domain.len() as u8);
-            buf.extend_from_slice(domain.as_bytes());
-        }
-    }
-    buf
 }
 
 /// Encode a VLESS request header with an optional flow addon.
@@ -115,7 +50,7 @@ pub fn encode_request_with_flow(
     addr: &Address,
     flow: Option<&str>,
 ) -> Vec<u8> {
-    let addr_bytes = encode_address_vless(addr);
+    let addr_bytes = encode_vmess(addr);
 
     // Build the addon bytes (protobuf-encoded flow string).
     let addon_bytes: Vec<u8> = match flow {
@@ -361,30 +296,31 @@ mod tests {
     fn encode_address_ipv4() {
         let sock = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 443));
         let addr = Address::Ip(sock);
-        let encoded = encode_address(&addr);
-        assert_eq!(encoded[0], ATYP_IPV4);
-        assert_eq!(&encoded[1..5], &[10, 0, 0, 1]);
-        assert_eq!(&encoded[5..7], &443u16.to_be_bytes());
+        let encoded = encode_vmess(&addr);
+        // mihomo compat: port (BE) then address type.
+        assert_eq!(&encoded[0..2], &443u16.to_be_bytes());
+        assert_eq!(encoded[2], 0x01);
+        assert_eq!(&encoded[3..7], &[10, 0, 0, 1]);
     }
 
     #[test]
     fn encode_address_ipv6() {
         let sock = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 80, 0, 0));
         let addr = Address::Ip(sock);
-        let encoded = encode_address(&addr);
-        assert_eq!(encoded[0], ATYP_IPV6);
-        assert_eq!(encoded.len(), 1 + 16 + 2);
-        assert_eq!(&encoded[17..19], &80u16.to_be_bytes());
+        let encoded = encode_vmess(&addr);
+        assert_eq!(&encoded[0..2], &80u16.to_be_bytes());
+        assert_eq!(encoded[2], 0x03);
+        assert_eq!(encoded.len(), 2 + 1 + 16);
     }
 
     #[test]
     fn encode_address_domain() {
         let addr = Address::Domain("test.com".to_string(), 8443);
-        let encoded = encode_address(&addr);
-        assert_eq!(encoded[0], ATYP_DOMAIN);
-        assert_eq!(encoded[1], 8); // "test.com".len()
-        assert_eq!(&encoded[2..10], b"test.com");
-        assert_eq!(&encoded[10..12], &8443u16.to_be_bytes());
+        let encoded = encode_vmess(&addr);
+        assert_eq!(&encoded[0..2], &8443u16.to_be_bytes());
+        assert_eq!(encoded[2], 0x02);
+        assert_eq!(encoded[3], 8); // "test.com".len()
+        assert_eq!(&encoded[4..12], b"test.com");
     }
 
     #[test]
@@ -403,7 +339,7 @@ mod tests {
         assert_eq!(header[18], CMD_TCP);
         // mihomo compat: VLESS order is port (BE) THEN address type.
         assert_eq!(&header[19..21], &443u16.to_be_bytes());
-        assert_eq!(header[21], ATYP_DOMAIN);
+        assert_eq!(header[21], 0x02); // VMess/VLESS domain tag
         assert_eq!(header[22], 11); // "example.com".len()
         assert_eq!(&header[23..34], b"example.com");
     }
@@ -431,7 +367,7 @@ mod tests {
         assert_eq!(header[36], CMD_TCP);
         // mihomo compat: port (BE) then address type.
         assert_eq!(&header[37..39], &443u16.to_be_bytes());
-        assert_eq!(header[39], ATYP_DOMAIN);
+        assert_eq!(header[39], 0x02);
     }
 
     #[test]

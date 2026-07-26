@@ -23,7 +23,7 @@ use tokio::io::{AsyncWriteExt, ReadHalf, WriteHalf};
 use tracing::debug;
 
 use super::{OutboundHandler, ProxyStream};
-use crate::common::addr::Address;
+use crate::common::addr::{encode_socks5, Address};
 use crate::config::proxy::ProxyConfig;
 use crate::dns::DnsResolver;
 use crate::transport::tcp::{self, ConnectOpts};
@@ -256,7 +256,7 @@ impl OutboundHandler for AnytlsOutbound {
 
         // mihomo writes the destination using SocksaddrSerializer.WriteAddrPort
         // which is the standard SOCKS5 address format: ATYP + ADDR + PORT.
-        let addr_bytes = write_socks_addr(target);
+        let addr_bytes = encode_socks5(target);
         tokio::io::AsyncWriteExt::write_all(&mut stream, &addr_bytes).await?;
 
         // Hook: on stream close, hand the session back to the idle pool.
@@ -268,34 +268,6 @@ impl OutboundHandler for AnytlsOutbound {
         };
         Ok(Box::new(wrapper))
     }
-}
-
-/// mihomo M.SocksaddrSerializer.WriteAddrPort — standard SOCKS5 address
-/// framing: 1 byte ATYP, then address, then u16 BE port.
-fn write_socks_addr(addr: &Address) -> Vec<u8> {
-    let mut out = Vec::with_capacity(1 + 256 + 2);
-    match addr {
-        Address::Domain(host, port) => {
-            out.push(0x03);
-            let h = host.as_bytes();
-            out.push(h.len() as u8);
-            out.extend_from_slice(h);
-            out.extend_from_slice(&port.to_be_bytes());
-        }
-        Address::Ip(sa) => match sa {
-            std::net::SocketAddr::V4(v4) => {
-                out.push(0x01);
-                out.extend_from_slice(&v4.ip().octets());
-                out.extend_from_slice(&v4.port().to_be_bytes());
-            }
-            std::net::SocketAddr::V6(v6) => {
-                out.push(0x04);
-                out.extend_from_slice(&v6.ip().octets());
-                out.extend_from_slice(&v6.port().to_be_bytes());
-            }
-        },
-    }
-    out
 }
 
 /// Wraps an [`AnytlsStream`] and, when dropped, returns the owning session
