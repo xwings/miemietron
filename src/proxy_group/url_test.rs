@@ -1,11 +1,8 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::Notify;
-use tracing::{debug, warn};
 
 use crate::common::addr::Address;
 use crate::common::singledo::SingleDo;
@@ -13,7 +10,7 @@ use crate::dns::DnsResolver;
 use crate::proxy::OutboundHandler;
 
 use super::proxy_state::ProxyStateStore;
-use super::{HealthCheckOpts, ProxyGroup};
+use super::{GroupBase, HealthCheckOpts, ProxyGroup};
 
 /// Auto-select the proxy with the lowest measured latency.
 ///
@@ -22,15 +19,9 @@ use super::{HealthCheckOpts, ProxyGroup};
 /// Results are stored in a shared `ProxyStateStore`. `get_proxy` returns the
 /// proxy with the smallest delay value.
 pub struct UrlTestGroup {
-    group_name: String,
-    proxy_names: Vec<String>,
-    test_url: String,
-    interval: Duration,
+    /// mihomo compat: the embedded GroupBase (groupbase.go).
+    base: GroupBase,
     tolerance: u32,
-    /// mihomo compat: expected-status ranges for the health check.
-    expected_status: Option<Vec<(u16, u16)>>,
-    /// Centralized state store for delay/alive tracking.
-    state_store: Arc<ProxyStateStore>,
     /// Current best proxy (tolerance-aware sticky selection).
     current_best: parking_lot::RwLock<Option<String>>,
     /// mihomo compat: force-pinned selection via API (Set/ForceSet).
@@ -39,22 +30,6 @@ pub struct UrlTestGroup {
     /// mihomo compat: SingleDo deduplication for fast() selection.
     /// Prevents thundering herd on concurrent now()/get_proxy() calls.
     fast_single: Arc<SingleDo<String>>,
-    /// mihomo compat: onDialFailed tracking fields (from GroupBase).
-    failed_times: AtomicU32,
-    failed_time: parking_lot::Mutex<Instant>,
-    failed_testing: AtomicBool,
-    max_failed_times: u32,
-    test_timeout: u64,
-    /// mihomo compat: lazy health check — tracks when group was last used.
-    /// Epoch millis.
-    pub(crate) last_touch: Arc<AtomicU64>,
-    /// Whether this group uses lazy health checks.
-    pub(crate) lazy: bool,
-    /// mihomo compat: failure-driven health check trigger.
-    /// `do_health_check` calls `notify_one()`; the background loop in
-    /// `health.rs` wakes and runs an immediate check, matching
-    /// GroupBase.healthCheck() in groupbase.go.
-    pub(crate) health_notify: Arc<Notify>,
 }
 
 impl UrlTestGroup {
@@ -66,46 +41,22 @@ impl UrlTestGroup {
         state_store: Arc<ProxyStateStore>,
     ) -> Self {
         Self {
-            group_name: name,
-            proxy_names: proxies,
-            test_url: hc.url,
-            interval: Duration::from_secs(hc.interval_secs),
+            base: GroupBase::new(name, proxies, hc, state_store),
             tolerance,
-            expected_status: hc.expected_status,
-            state_store,
             current_best: parking_lot::RwLock::new(None),
             force_selected: parking_lot::RwLock::new(None),
             fast_single: Arc::new(SingleDo::new(Duration::from_secs(10))),
-            failed_times: AtomicU32::new(0),
-            failed_time: parking_lot::Mutex::new(Instant::now()),
-            failed_testing: AtomicBool::new(false),
-            max_failed_times: hc.max_failed_times.unwrap_or(5),
-            test_timeout: hc.test_timeout.unwrap_or(5000),
-            last_touch: Arc::new(AtomicU64::new(0)),
-            lazy: hc.lazy,
-            health_notify: Arc::new(Notify::new()),
         }
     }
 
-    /// Mark whether a triggered health check is currently running.
-    /// mihomo compat: `failedTesting` flag in groupbase.go controls whether
-    /// `onDialSuccess` resets the failure counter.
-    pub(crate) fn set_health_testing(&self, running: bool) {
-        self.failed_testing.store(running, Ordering::Relaxed);
-        if !running {
-            self.failed_times.store(0, Ordering::Relaxed);
-        }
-    }
-
-    /// The configured health check interval.
-    pub fn interval(&self) -> Duration {
-        self.interval
+    pub(crate) fn base(&self) -> &GroupBase {
+        &self.base
     }
 
     /// The configured test URL.
     #[cfg(test)]
     pub fn test_url(&self) -> &str {
-        &self.test_url
+        self.base.test_url()
     }
 
     /// Run a health check against all proxies concurrently.
@@ -121,17 +72,7 @@ impl UrlTestGroup {
         proxies: &HashMap<String, Arc<dyn OutboundHandler>>,
         dns: &Arc<DnsResolver>,
     ) {
-        super::health::run_health_check(
-            "url-test",
-            &self.proxy_names,
-            &self.test_url,
-            self.test_timeout,
-            self.expected_status.clone(),
-            proxies,
-            dns,
-            &self.state_store,
-        )
-        .await;
+        self.base.run_health_check("url-test", proxies, dns).await;
     }
 
     /// Compute the best proxy name.
@@ -151,22 +92,23 @@ impl UrlTestGroup {
         // alive. (alive_for_url returns true when no state is recorded, so
         // a fresh pin is honored before the first health check.)
         if let Some(ref selected) = *self.force_selected.read() {
-            if self.proxy_names.iter().any(|n| n == selected)
-                && self.state_store.alive_for_url(selected, &self.test_url)
-            {
+            if self.base.contains(selected) && self.base.alive(selected) {
                 return selected.clone();
             }
         }
+
+        let store = self.base.state_store();
+        let test_url = self.base.test_url();
 
         // Find the proxy with the lowest delay among alive proxies
         let mut best_name: Option<String> = None;
         let mut best_delay: u16 = 0xFFFF;
 
-        for name in &self.proxy_names {
-            if !self.state_store.alive_for_url(name, &self.test_url) {
+        for name in self.base.proxy_names() {
+            if !self.base.alive(name) {
                 continue;
             }
-            let delay = self.state_store.last_delay_for_url(name, &self.test_url);
+            let delay = store.last_delay_for_url(name, test_url);
             if delay < best_delay {
                 best_delay = delay;
                 best_name = Some(name.clone());
@@ -179,8 +121,8 @@ impl UrlTestGroup {
                 // Check if current best is still alive and within tolerance
                 // mihomo compat: tolerance check from urltest.go fast()
                 if let Some(ref cur) = *current {
-                    if self.state_store.alive_for_url(cur, &self.test_url) {
-                        let cur_delay = self.state_store.last_delay_for_url(cur, &self.test_url);
+                    if self.base.alive(cur) {
+                        let cur_delay = store.last_delay_for_url(cur, test_url);
                         if cur_delay < 0xFFFF && cur_delay <= best_delay + self.tolerance as u16 {
                             return cur.clone();
                         }
@@ -192,7 +134,7 @@ impl UrlTestGroup {
             }
         }
 
-        self.proxy_names.first().cloned().unwrap_or_default()
+        self.base.proxy_names().first().cloned().unwrap_or_default()
     }
 
     /// Reset the fast_single cache. Called after health checks and when
@@ -203,21 +145,19 @@ impl UrlTestGroup {
     }
 
     /// Trigger an immediate health check via the background loop.
-    /// mihomo compat: matches GroupBase.healthCheck() in groupbase.go —
-    /// signals the health.rs loop to run a fresh URL-test pass instead of
-    /// waiting for the next periodic tick.
+    /// mihomo compat: urltest.go:101-104 — URLTest.healthCheck() brackets
+    /// GroupBase.healthCheck() with `fastSingle.Reset()`. The trailing reset
+    /// is ours too: health.rs calls `after_health_check()` once the triggered
+    /// pass finishes, which is where the fresh results land.
     fn do_health_check(&self) {
-        if self.failed_testing.load(Ordering::Relaxed) {
-            return;
-        }
         self.fast_single.reset();
-        self.health_notify.notify_one();
+        self.base.do_health_check();
     }
 }
 
 impl ProxyGroup for UrlTestGroup {
     fn name(&self) -> &str {
-        &self.group_name
+        self.base.name()
     }
 
     fn group_type(&self) -> &str {
@@ -229,12 +169,12 @@ impl ProxyGroup for UrlTestGroup {
     }
 
     fn all(&self) -> Vec<String> {
-        self.proxy_names.clone()
+        self.base.all()
     }
 
     fn select(&self, name: &str) -> bool {
         // mihomo compat: URLTest supports force-pinning via Set/ForceSet.
-        if self.proxy_names.iter().any(|n| n == name) {
+        if self.base.contains(name) {
             *self.force_selected.write() = Some(name.to_string());
             self.fast_single.reset();
             true
@@ -265,7 +205,7 @@ impl ProxyGroup for UrlTestGroup {
         }
 
         // Fallback: first available proxy in list order.
-        for name in &self.proxy_names {
+        for name in self.base.proxy_names() {
             if let Some(handler) = proxies.get(name) {
                 return Some(handler.clone());
             }
@@ -273,58 +213,21 @@ impl ProxyGroup for UrlTestGroup {
         None
     }
 
-    /// mihomo compat: GroupBase.onDialFailed() in groupbase.go
+    /// mihomo compat: GroupBase.onDialFailed() in groupbase.go — urltest.go
+    /// passes `u.healthCheck` as the trigger, so the fastSingle reset runs.
     fn on_dial_failed(&self, proxy_type: &str, err: &str) {
-        // mihomo compat: skip for built-in adapter types
-        match proxy_type {
-            "Direct" | "Compatible" | "Reject" | "Pass" | "RejectDrop" => return,
-            _ => {}
-        }
-
-        // mihomo compat: "connection refused" triggers immediate health check
-        if err.contains("connection refused") {
-            self.do_health_check();
-            return;
-        }
-
-        let mut failed_time = self.failed_time.lock();
-        let prev = self.failed_times.fetch_add(1, Ordering::Relaxed);
-        if prev == 0 {
-            // First failure
-            debug!("ProxyGroup: {} first failed", self.group_name);
-            *failed_time = Instant::now();
-        } else {
-            // Check if within test_timeout window
-            if failed_time.elapsed() > Duration::from_millis(self.test_timeout) {
-                self.failed_times.store(0, Ordering::Relaxed);
-                return;
-            }
-            let count = prev + 1;
-            debug!("ProxyGroup: {} failed count: {}", self.group_name, count);
-            if count >= self.max_failed_times {
-                warn!(
-                    "because {} failed multiple times, activate health check",
-                    self.group_name
-                );
-                self.do_health_check();
-            }
-        }
+        self.base
+            .on_dial_failed(proxy_type, err, || self.do_health_check());
     }
 
     /// mihomo compat: GroupBase.onDialSuccess() in groupbase.go
     fn on_dial_success(&self) {
-        if !self.failed_testing.load(Ordering::Relaxed) {
-            self.failed_times.store(0, Ordering::Relaxed);
-        }
+        self.base.on_dial_success();
     }
 
     /// mihomo compat: GroupBase.Touch() in groupbase.go
     fn touch(&self) {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-        self.last_touch.store(now, Ordering::Relaxed);
+        self.base.touch();
     }
 
     fn as_any_arc(self: Arc<Self>) -> Arc<dyn std::any::Any + Send + Sync> {
@@ -455,7 +358,7 @@ mod tests {
         );
         assert_eq!(group.name(), "auto");
         assert_eq!(group.group_type(), "URLTest");
-        assert_eq!(group.interval(), Duration::from_secs(300));
+        assert_eq!(group.base().interval(), Duration::from_secs(300));
         assert_eq!(group.test_url(), "http://test.example/204");
         assert_eq!(group.all(), vec!["a".to_string(), "b".to_string()]);
     }

@@ -18,9 +18,9 @@ use tracing::{debug, info, warn};
 use super::fallback::FallbackGroup;
 use super::load_balance::LoadBalanceGroup;
 use super::proxy_state::ProxyStateStore;
-use super::selector::SelectorGroup;
+use super::selector::{SelectorGroup, SelectorHealthCheck};
 use super::url_test::{measure_unified_delay, UrlTestGroup};
-use super::{status_matches, ProxyGroup};
+use super::{status_matches, GroupBase, ProxyGroup};
 use crate::dns::DnsResolver;
 use crate::proxy::OutboundHandler;
 
@@ -115,33 +115,50 @@ enum HealthCheckable {
 }
 
 impl HealthCheckable {
-    fn interval(&self) -> Duration {
+    /// The shared `GroupBase`, for every kind but Selector — whose optional
+    /// health state is a separate `SelectorHealthCheck` (mihomo's Selector
+    /// embeds GroupBase but has no onDial hooks, so we do not).
+    fn base(&self) -> Option<&GroupBase> {
         match self {
-            HealthCheckable::UrlTest(g) => g.interval(),
-            HealthCheckable::Fallback(g) => g.interval(),
-            HealthCheckable::LoadBalance(g) => g.interval(),
-            HealthCheckable::Selector(g) => g.health().map(|h| h.interval).unwrap_or_default(),
+            HealthCheckable::UrlTest(g) => Some(g.base()),
+            HealthCheckable::Fallback(g) => Some(g.base()),
+            HealthCheckable::LoadBalance(g) => Some(g.base()),
+            HealthCheckable::Selector(_) => None,
+        }
+    }
+
+    /// The Selector's optional health state; `None` for every other kind.
+    fn selector_health(&self) -> Option<&SelectorHealthCheck> {
+        match self {
+            HealthCheckable::Selector(g) => g.health(),
+            _ => None,
+        }
+    }
+
+    fn interval(&self) -> Duration {
+        match self.base() {
+            Some(base) => base.interval(),
+            None => self
+                .selector_health()
+                .map(|h| h.interval)
+                .unwrap_or_default(),
         }
     }
 
     /// Whether this group uses lazy health checks.
     fn lazy(&self) -> bool {
-        match self {
-            HealthCheckable::UrlTest(g) => g.lazy,
-            HealthCheckable::Fallback(g) => g.lazy,
-            HealthCheckable::LoadBalance(g) => g.lazy,
-            HealthCheckable::Selector(g) => g.health().map(|h| h.lazy).unwrap_or(true),
+        match self.base() {
+            Some(base) => base.lazy(),
+            None => self.selector_health().map(|h| h.lazy).unwrap_or(true),
         }
     }
 
     /// Get the last touch timestamp (epoch millis) for lazy health check.
     fn last_touch_millis(&self) -> u64 {
-        match self {
-            HealthCheckable::UrlTest(g) => g.last_touch.load(Ordering::Relaxed),
-            HealthCheckable::Fallback(g) => g.last_touch.load(Ordering::Relaxed),
-            HealthCheckable::LoadBalance(g) => g.last_touch.load(Ordering::Relaxed),
-            HealthCheckable::Selector(g) => g
-                .health()
+        match self.base() {
+            Some(base) => base.last_touch_millis(),
+            None => self
+                .selector_health()
                 .map(|h| h.last_touch.load(Ordering::Relaxed))
                 .unwrap_or(0),
         }
@@ -172,13 +189,11 @@ impl HealthCheckable {
     /// mihomo compat: matches GroupBase.healthCheck() being called from
     /// onDialFailed paths.
     fn health_notify(&self) -> Arc<Notify> {
-        match self {
-            HealthCheckable::UrlTest(g) => g.health_notify.clone(),
-            HealthCheckable::Fallback(g) => g.health_notify.clone(),
-            HealthCheckable::LoadBalance(g) => g.health_notify.clone(),
+        match self.base() {
+            Some(base) => base.health_notify(),
             // try_into_checkable only yields Selector when health() is Some.
-            HealthCheckable::Selector(g) => g
-                .health()
+            None => self
+                .selector_health()
                 .expect("Selector checkable always has health configured")
                 .health_notify
                 .clone(),
@@ -189,11 +204,8 @@ impl HealthCheckable {
     /// mihomo compat: groupbase.go healthCheck() sets/clears failedTesting.
     /// Selector has no onDial hooks in mihomo, so it is a no-op there.
     fn set_health_testing(&self, running: bool) {
-        match self {
-            HealthCheckable::UrlTest(g) => g.set_health_testing(running),
-            HealthCheckable::Fallback(g) => g.set_health_testing(running),
-            HealthCheckable::LoadBalance(g) => g.set_health_testing(running),
-            HealthCheckable::Selector(_) => {}
+        if let Some(base) = self.base() {
+            base.set_health_testing(running);
         }
     }
 }

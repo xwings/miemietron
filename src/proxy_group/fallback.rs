@@ -1,16 +1,11 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-
-use tokio::sync::Notify;
-use tracing::{debug, warn};
 
 use crate::dns::DnsResolver;
 use crate::proxy::OutboundHandler;
 
 use super::proxy_state::ProxyStateStore;
-use super::{HealthCheckOpts, ProxyGroup};
+use super::{GroupBase, HealthCheckOpts, ProxyGroup};
 
 /// Fallback group: pick the first proxy that is alive.
 ///
@@ -19,29 +14,10 @@ use super::{HealthCheckOpts, ProxyGroup};
 /// proxy. Instead it walks the proxy list in order and returns the first one
 /// whose last health check succeeded.
 pub struct FallbackGroup {
-    group_name: String,
-    proxy_names: Vec<String>,
-    test_url: String,
-    interval: Duration,
-    /// mihomo compat: expected-status ranges for the health check.
-    expected_status: Option<Vec<(u16, u16)>>,
-    /// Centralized state store for delay/alive tracking.
-    state_store: Arc<ProxyStateStore>,
+    /// mihomo compat: the embedded GroupBase (groupbase.go).
+    base: GroupBase,
     /// mihomo compat: force-pinned selection via API (Set/ForceSet).
     force_selected: parking_lot::RwLock<Option<String>>,
-    /// mihomo compat: onDialFailed tracking fields (from GroupBase).
-    failed_times: AtomicU32,
-    failed_time: parking_lot::Mutex<Instant>,
-    failed_testing: AtomicBool,
-    max_failed_times: u32,
-    test_timeout: u64,
-    /// mihomo compat: lazy health check — tracks when group was last used.
-    /// Epoch millis.
-    pub(crate) last_touch: Arc<AtomicU64>,
-    /// Whether this group uses lazy health checks.
-    pub(crate) lazy: bool,
-    /// mihomo compat: failure-driven health check trigger.
-    pub(crate) health_notify: Arc<Notify>,
 }
 
 impl FallbackGroup {
@@ -52,40 +28,18 @@ impl FallbackGroup {
         state_store: Arc<ProxyStateStore>,
     ) -> Self {
         Self {
-            group_name: name,
-            proxy_names: proxies,
-            test_url: hc.url,
-            interval: Duration::from_secs(hc.interval_secs),
-            expected_status: hc.expected_status,
-            state_store,
+            base: GroupBase::new(name, proxies, hc, state_store),
             force_selected: parking_lot::RwLock::new(None),
-            failed_times: AtomicU32::new(0),
-            failed_time: parking_lot::Mutex::new(Instant::now()),
-            failed_testing: AtomicBool::new(false),
-            max_failed_times: hc.max_failed_times.unwrap_or(5),
-            test_timeout: hc.test_timeout.unwrap_or(5000),
-            last_touch: Arc::new(AtomicU64::new(0)),
-            lazy: hc.lazy,
-            health_notify: Arc::new(Notify::new()),
         }
     }
 
-    /// Mark whether a triggered health check is currently running.
-    /// mihomo compat: `failedTesting` flag in groupbase.go.
-    pub(crate) fn set_health_testing(&self, running: bool) {
-        self.failed_testing.store(running, Ordering::Relaxed);
-        if !running {
-            self.failed_times.store(0, Ordering::Relaxed);
-        }
-    }
-
-    pub fn interval(&self) -> Duration {
-        self.interval
+    pub(crate) fn base(&self) -> &GroupBase {
+        &self.base
     }
 
     #[cfg(test)]
     pub fn test_url(&self) -> &str {
-        &self.test_url
+        self.base.test_url()
     }
 
     /// Run a health check against all proxies concurrently through their
@@ -95,17 +49,7 @@ impl FallbackGroup {
         proxies: &HashMap<String, Arc<dyn OutboundHandler>>,
         dns: &Arc<DnsResolver>,
     ) {
-        super::health::run_health_check(
-            "fallback",
-            &self.proxy_names,
-            &self.test_url,
-            self.test_timeout,
-            self.expected_status.clone(),
-            proxies,
-            dns,
-            &self.state_store,
-        )
-        .await;
+        self.base.run_health_check("fallback", proxies, dns).await;
     }
 
     /// mihomo compat: fallback.go findAliveProxy — walk the list in config
@@ -116,16 +60,16 @@ impl FallbackGroup {
         // Read-lock the pin; upgrade to a write lock only when a dead pin
         // must be cleared, so the hot path stays contention-free.
         let mut selected = self.force_selected.read().clone();
-        for name in &self.proxy_names {
+        for name in self.base.proxy_names() {
             match selected.as_deref() {
                 None => {
-                    if self.state_store.alive_for_url(name, &self.test_url) {
+                    if self.base.alive(name) {
                         return Some(name.clone());
                     }
                 }
                 Some(sel) => {
                     if name == sel {
-                        if self.state_store.alive_for_url(name, &self.test_url) {
+                        if self.base.alive(name) {
                             return Some(name.clone());
                         }
                         *self.force_selected.write() = None;
@@ -134,22 +78,13 @@ impl FallbackGroup {
                 }
             }
         }
-        self.proxy_names.first().cloned()
-    }
-
-    /// Trigger an immediate health check via the background loop.
-    /// mihomo compat: matches GroupBase.healthCheck() in groupbase.go.
-    fn do_health_check(&self) {
-        if self.failed_testing.load(Ordering::Relaxed) {
-            return;
-        }
-        self.health_notify.notify_one();
+        self.base.proxy_names().first().cloned()
     }
 }
 
 impl ProxyGroup for FallbackGroup {
     fn name(&self) -> &str {
-        &self.group_name
+        self.base.name()
     }
 
     fn group_type(&self) -> &str {
@@ -163,20 +98,20 @@ impl ProxyGroup for FallbackGroup {
     }
 
     fn all(&self) -> Vec<String> {
-        self.proxy_names.clone()
+        self.base.all()
     }
 
     fn select(&self, name: &str) -> bool {
         // mihomo compat: Fallback supports force-pinning via Set/ForceSet.
-        if self.proxy_names.iter().any(|n| n == name) {
+        if self.base.contains(name) {
             *self.force_selected.write() = Some(name.to_string());
             // TODO: mihomo fallback.go Set() (fallback.go:124-146) fires a
             // one-shot URLTest with a 5s timeout against just the newly
             // pinned proxy when it is not alive. select() has no access to
             // the proxies map / DNS resolver here, so we trigger the group's
             // health-check loop instead, which re-probes all members.
-            if !self.state_store.alive_for_url(name, &self.test_url) {
-                self.health_notify.notify_one();
+            if !self.base.alive(name) {
+                self.base.health_notify().notify_one();
             }
             true
         } else {
@@ -206,7 +141,7 @@ impl ProxyGroup for FallbackGroup {
         }
 
         // Fallback: first in list resolvable to a handler.
-        for name in &self.proxy_names {
+        for name in self.base.proxy_names() {
             if let Some(handler) = proxies.get(name) {
                 return Some(handler.clone());
             }
@@ -216,56 +151,18 @@ impl ProxyGroup for FallbackGroup {
 
     /// mihomo compat: GroupBase.onDialFailed() in groupbase.go
     fn on_dial_failed(&self, proxy_type: &str, err: &str) {
-        // mihomo compat: skip for built-in adapter types
-        match proxy_type {
-            "Direct" | "Compatible" | "Reject" | "Pass" | "RejectDrop" => return,
-            _ => {}
-        }
-
-        // mihomo compat: "connection refused" triggers immediate health check
-        if err.contains("connection refused") {
-            self.do_health_check();
-            return;
-        }
-
-        let mut failed_time = self.failed_time.lock();
-        let prev = self.failed_times.fetch_add(1, Ordering::Relaxed);
-        if prev == 0 {
-            // First failure
-            debug!("ProxyGroup: {} first failed", self.group_name);
-            *failed_time = Instant::now();
-        } else {
-            // Check if within test_timeout window
-            if failed_time.elapsed() > Duration::from_millis(self.test_timeout) {
-                self.failed_times.store(0, Ordering::Relaxed);
-                return;
-            }
-            let count = prev + 1;
-            debug!("ProxyGroup: {} failed count: {}", self.group_name, count);
-            if count >= self.max_failed_times {
-                warn!(
-                    "because {} failed multiple times, activate health check",
-                    self.group_name
-                );
-                self.do_health_check();
-            }
-        }
+        self.base
+            .on_dial_failed(proxy_type, err, || self.base.do_health_check());
     }
 
     /// mihomo compat: GroupBase.onDialSuccess() in groupbase.go
     fn on_dial_success(&self) {
-        if !self.failed_testing.load(Ordering::Relaxed) {
-            self.failed_times.store(0, Ordering::Relaxed);
-        }
+        self.base.on_dial_success();
     }
 
     /// mihomo compat: GroupBase.Touch() in groupbase.go
     fn touch(&self) {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-        self.last_touch.store(now, Ordering::Relaxed);
+        self.base.touch();
     }
 
     fn as_any_arc(self: Arc<Self>) -> Arc<dyn std::any::Any + Send + Sync> {
@@ -275,6 +172,8 @@ impl ProxyGroup for FallbackGroup {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
 
     fn make_store() -> Arc<ProxyStateStore> {
@@ -302,7 +201,7 @@ mod tests {
         );
         assert_eq!(group.name(), "fb");
         assert_eq!(group.group_type(), "Fallback");
-        assert_eq!(group.interval(), Duration::from_secs(600));
+        assert_eq!(group.base().interval(), Duration::from_secs(600));
         assert_eq!(group.test_url(), "http://test.example/204");
         assert_eq!(group.all(), vec!["a".to_string(), "b".to_string()]);
     }

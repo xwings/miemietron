@@ -1,18 +1,15 @@
 use std::collections::{HashMap, VecDeque};
 use std::hash::{DefaultHasher, Hash, Hasher};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use parking_lot::{Mutex, RwLock};
-use tokio::sync::Notify;
-use tracing::{debug, warn};
 
 use crate::dns::DnsResolver;
 use crate::proxy::OutboundHandler;
 
 use super::proxy_state::ProxyStateStore;
-use super::{HealthCheckOpts, ProxyGroup};
+use super::{GroupBase, HealthCheckOpts, ProxyGroup};
 
 /// Load-balancing strategy.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,15 +38,9 @@ impl LoadBalanceStrategy {
 /// several strategies. All strategies skip dead nodes (mihomo compat:
 /// loadbalance.go strategy functions check AliveForTestUrl).
 pub struct LoadBalanceGroup {
-    group_name: String,
-    proxy_names: Vec<String>,
+    /// mihomo compat: the embedded GroupBase (groupbase.go).
+    base: GroupBase,
     strategy: LoadBalanceStrategy,
-    test_url: String,
-    interval: Duration,
-    /// mihomo compat: expected-status ranges for the health check.
-    expected_status: Option<Vec<(u16, u16)>>,
-    /// Centralized state store for delay/alive tracking.
-    state_store: Arc<ProxyStateStore>,
     /// Round-robin index (only used by RoundRobin strategy).
     /// mihomo compat: loadbalance.go strategyRoundRobin advances the index
     /// by the number of entries scanned, so dead nodes are skipped.
@@ -57,19 +48,6 @@ pub struct LoadBalanceGroup {
     /// Sticky-session cache: destination -> proxy name (LRU, bounded).
     sticky_map: RwLock<HashMap<String, String>>,
     sticky_order: RwLock<VecDeque<String>>,
-    /// mihomo compat: onDialFailed tracking fields (from GroupBase).
-    failed_times: AtomicU32,
-    failed_time: Mutex<Instant>,
-    failed_testing: AtomicBool,
-    max_failed_times: u32,
-    test_timeout: u64,
-    /// mihomo compat: lazy health check — tracks when group was last used.
-    /// Epoch millis.
-    pub(crate) last_touch: Arc<AtomicU64>,
-    /// Whether this group uses lazy health checks.
-    pub(crate) lazy: bool,
-    /// mihomo compat: failure-driven health check trigger.
-    pub(crate) health_notify: Arc<Notify>,
 }
 
 const STICKY_CACHE_MAX: usize = 1024;
@@ -146,39 +124,16 @@ impl LoadBalanceGroup {
         state_store: Arc<ProxyStateStore>,
     ) -> Self {
         Self {
-            group_name: name,
-            proxy_names: proxies,
+            base: GroupBase::new(name, proxies, hc, state_store),
             strategy,
-            test_url: hc.url,
-            interval: Duration::from_secs(hc.interval_secs),
-            expected_status: hc.expected_status,
-            state_store,
             rr_idx: Mutex::new(0),
             sticky_map: RwLock::new(HashMap::new()),
             sticky_order: RwLock::new(VecDeque::new()),
-            failed_times: AtomicU32::new(0),
-            failed_time: Mutex::new(Instant::now()),
-            failed_testing: AtomicBool::new(false),
-            max_failed_times: hc.max_failed_times.unwrap_or(5),
-            test_timeout: hc.test_timeout.unwrap_or(5000),
-            last_touch: Arc::new(AtomicU64::new(0)),
-            lazy: hc.lazy,
-            health_notify: Arc::new(Notify::new()),
         }
     }
 
-    /// Mark whether a triggered health check is currently running.
-    /// mihomo compat: `failedTesting` flag in groupbase.go.
-    pub(crate) fn set_health_testing(&self, running: bool) {
-        self.failed_testing.store(running, Ordering::Relaxed);
-        if !running {
-            self.failed_times.store(0, Ordering::Relaxed);
-        }
-    }
-
-    /// The configured health check interval.
-    pub fn interval(&self) -> Duration {
-        self.interval
+    pub(crate) fn base(&self) -> &GroupBase {
+        &self.base
     }
 
     /// Run a health check against all proxies concurrently through their
@@ -188,30 +143,13 @@ impl LoadBalanceGroup {
         proxies: &HashMap<String, Arc<dyn OutboundHandler>>,
         dns: &Arc<DnsResolver>,
     ) {
-        super::health::run_health_check(
-            "load-balance",
-            &self.proxy_names,
-            &self.test_url,
-            self.test_timeout,
-            self.expected_status.clone(),
-            proxies,
-            dns,
-            &self.state_store,
-        )
-        .await;
-    }
-
-    /// Trigger an immediate health check via the background loop.
-    /// mihomo compat: matches GroupBase.healthCheck() in groupbase.go.
-    fn do_health_check(&self) {
-        if self.failed_testing.load(Ordering::Relaxed) {
-            return;
-        }
-        self.health_notify.notify_one();
+        self.base
+            .run_health_check("load-balance", proxies, dns)
+            .await;
     }
 
     fn alive(&self, name: &str) -> bool {
-        self.state_store.alive_for_url(name, &self.test_url)
+        self.base.alive(name)
     }
 
     /// mihomo compat: loadbalance.go strategyConsistentHashing — try
@@ -219,14 +157,15 @@ impl LoadBalanceGroup {
     /// traverse the whole list for any alive node, then fall back to the
     /// first proxy.
     fn pick_consistent_hash(&self, dst: &str) -> Option<String> {
-        if self.proxy_names.is_empty() {
+        let names = self.base.proxy_names();
+        if names.is_empty() {
             return None;
         }
         let mut key = hash_key(&get_key(dst));
-        let buckets = self.proxy_names.len() as i32;
+        let buckets = names.len() as i32;
         for _ in 0..MAX_RETRY {
             let idx = jump_hash(key, buckets) as usize;
-            let name = &self.proxy_names[idx];
+            let name = &names[idx];
             if self.alive(name) {
                 return Some(name.clone());
             }
@@ -235,13 +174,13 @@ impl LoadBalanceGroup {
 
         // when availability is poor, traverse the entire list to get the
         // available nodes (loadbalance.go:174-179)
-        for name in &self.proxy_names {
+        for name in names {
             if self.alive(name) {
                 return Some(name.clone());
             }
         }
 
-        self.proxy_names.first().cloned()
+        names.first().cloned()
     }
 
     /// mihomo compat: loadbalance.go strategyRoundRobin — scan from the
@@ -249,7 +188,8 @@ impl LoadBalanceGroup {
     /// number of entries consumed; fall back to the first proxy when
     /// nothing is alive.
     fn pick_round_robin(&self) -> Option<String> {
-        let length = self.proxy_names.len();
+        let names = self.base.proxy_names();
+        let length = names.len();
         if length == 0 {
             return None;
         }
@@ -258,7 +198,7 @@ impl LoadBalanceGroup {
         let mut found = None;
         while i < length {
             let id = (*idx + i) % length;
-            let name = &self.proxy_names[id];
+            let name = &names[id];
             i += 1;
             if self.alive(name) {
                 found = Some(name.clone());
@@ -266,7 +206,7 @@ impl LoadBalanceGroup {
             }
         }
         *idx = (*idx + i) % length;
-        found.or_else(|| self.proxy_names.first().cloned())
+        found.or_else(|| names.first().cloned())
     }
 
     fn pick_sticky(&self, dst: &str) -> Option<String> {
@@ -302,27 +242,25 @@ impl LoadBalanceGroup {
         dst: &str,
         proxies: &HashMap<String, Arc<dyn OutboundHandler>>,
     ) -> Option<String> {
-        if self.proxy_names.is_empty() {
+        let names = self.base.proxy_names();
+        if names.is_empty() {
             return None;
         }
         if let Some(cached) = self.pick_sticky(dst) {
-            if self.proxy_names.contains(&cached)
-                && proxies.contains_key(&cached)
-                && self.alive(&cached)
-            {
+            if self.base.contains(&cached) && proxies.contains_key(&cached) && self.alive(&cached) {
                 return Some(cached);
             }
         }
 
         let key = hash_key(&get_key(dst));
-        let buckets = self.proxy_names.len() as i32;
+        let buckets = names.len() as i32;
         for _ in 0..MAX_RETRY {
             let nanos = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_nanos() as u64;
             let idx = jump_hash(key.wrapping_add(nanos), buckets) as usize;
-            let name = &self.proxy_names[idx];
+            let name = &names[idx];
             if self.alive(name) {
                 self.insert_sticky(dst, name);
                 return Some(name.clone());
@@ -330,7 +268,7 @@ impl LoadBalanceGroup {
         }
 
         // mihomo compat: loadbalance.go:213-214 — cache and return proxies[0]
-        let first = self.proxy_names.first().cloned();
+        let first = names.first().cloned();
         if let Some(ref f) = first {
             self.insert_sticky(dst, f);
         }
@@ -340,7 +278,7 @@ impl LoadBalanceGroup {
 
 impl ProxyGroup for LoadBalanceGroup {
     fn name(&self) -> &str {
-        &self.group_name
+        self.base.name()
     }
 
     fn group_type(&self) -> &str {
@@ -354,7 +292,7 @@ impl ProxyGroup for LoadBalanceGroup {
     }
 
     fn all(&self) -> Vec<String> {
-        self.proxy_names.clone()
+        self.base.all()
     }
 
     fn select(&self, _name: &str) -> bool {
@@ -365,7 +303,7 @@ impl ProxyGroup for LoadBalanceGroup {
         &self,
         proxies: &HashMap<String, Arc<dyn OutboundHandler>>,
     ) -> Option<Arc<dyn OutboundHandler>> {
-        if self.proxy_names.is_empty() {
+        if self.base.proxy_names().is_empty() {
             return None;
         }
 
@@ -382,56 +320,18 @@ impl ProxyGroup for LoadBalanceGroup {
 
     /// mihomo compat: GroupBase.onDialFailed() in groupbase.go
     fn on_dial_failed(&self, proxy_type: &str, err: &str) {
-        // mihomo compat: skip for built-in adapter types
-        match proxy_type {
-            "Direct" | "Compatible" | "Reject" | "Pass" | "RejectDrop" => return,
-            _ => {}
-        }
-
-        // mihomo compat: "connection refused" triggers immediate health check
-        if err.contains("connection refused") {
-            self.do_health_check();
-            return;
-        }
-
-        let mut failed_time = self.failed_time.lock();
-        let prev = self.failed_times.fetch_add(1, Ordering::Relaxed);
-        if prev == 0 {
-            // First failure
-            debug!("ProxyGroup: {} first failed", self.group_name);
-            *failed_time = Instant::now();
-        } else {
-            // Check if within test_timeout window
-            if failed_time.elapsed() > Duration::from_millis(self.test_timeout) {
-                self.failed_times.store(0, Ordering::Relaxed);
-                return;
-            }
-            let count = prev + 1;
-            debug!("ProxyGroup: {} failed count: {}", self.group_name, count);
-            if count >= self.max_failed_times {
-                warn!(
-                    "because {} failed multiple times, activate health check",
-                    self.group_name
-                );
-                self.do_health_check();
-            }
-        }
+        self.base
+            .on_dial_failed(proxy_type, err, || self.base.do_health_check());
     }
 
     /// mihomo compat: GroupBase.onDialSuccess() in groupbase.go
     fn on_dial_success(&self) {
-        if !self.failed_testing.load(Ordering::Relaxed) {
-            self.failed_times.store(0, Ordering::Relaxed);
-        }
+        self.base.on_dial_success();
     }
 
     /// mihomo compat: GroupBase.Touch() in groupbase.go
     fn touch(&self) {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-        self.last_touch.store(now, Ordering::Relaxed);
+        self.base.touch();
     }
 
     fn as_any_arc(self: Arc<Self>) -> Arc<dyn std::any::Any + Send + Sync> {
