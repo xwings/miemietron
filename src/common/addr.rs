@@ -262,10 +262,7 @@ mod tests {
             Ipv4Addr::new(10, 0, 0, 1),
             443,
         )));
-        assert_eq!(
-            encode_socks5(&addr),
-            vec![0x01, 10, 0, 0, 1, 0x01, 0xbb]
-        );
+        assert_eq!(encode_socks5(&addr), vec![0x01, 10, 0, 0, 1, 0x01, 0xbb]);
     }
 
     #[test]

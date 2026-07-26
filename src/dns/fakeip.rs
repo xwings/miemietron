@@ -201,10 +201,12 @@ impl FakeIpPool {
         self.ip_to_domain.clear();
         self.domain_to_ip.clear();
         for entry in old.ip_to_domain.iter() {
-            self.ip_to_domain.insert(*entry.key(), entry.value().clone());
+            self.ip_to_domain
+                .insert(*entry.key(), entry.value().clone());
         }
         for entry in old.domain_to_ip.iter() {
-            self.domain_to_ip.insert(entry.key().clone(), *entry.value());
+            self.domain_to_ip
+                .insert(entry.key().clone(), *entry.value());
         }
         self.offset
             .store(old.offset.load(Ordering::Relaxed), Ordering::Relaxed);

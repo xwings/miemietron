@@ -338,11 +338,7 @@ mod tests {
 
     /// `build_client_config` is the expensive part; the cache is keyed on
     /// everything it reads, so identical options must return the same `Arc`.
-    fn cached(
-        skip: bool,
-        alpn: &[&str],
-        fp: Option<&str>,
-    ) -> Arc<ClientConfig> {
+    fn cached(skip: bool, alpn: &[&str], fp: Option<&str>) -> Arc<ClientConfig> {
         let key = TlsConfigKey {
             skip_cert_verify: skip,
             fingerprint: TlsFingerprint::from_str_opt(fp),
