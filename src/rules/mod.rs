@@ -2536,4 +2536,615 @@ mod tests {
             "updated_at must be set to load time, not 0"
         );
     }
+
+    // ---------------------------------------------------------------------
+    // Golden matcher corpus
+    //
+    // One rule per matcher kind, each with a unique target, so a case's
+    // expected target names exactly which arm fired. This pins the observable
+    // contract of `match_rules_detailed` — (Action, rule_type, payload) — and
+    // must stay byte-identical across any dispatch refactor.
+    //
+    // Rule order is load-bearing (first match wins, mihomo tunnel.go match()),
+    // so payloads are chosen to be mutually disjoint: no case can reach its
+    // intended rule by accident or be shadowed by an earlier one.
+    // ---------------------------------------------------------------------
+
+    fn golden_rules() -> Vec<RuleString> {
+        [
+            // Domain family.
+            "DOMAIN,exact.golden.test,R-domain",
+            "DOMAIN-SUFFIX,suffix.golden.test,R-domain-suffix",
+            "DOMAIN-SUFFIX-STRICT,strict.golden.test,R-domain-suffix-strict",
+            "DOMAIN-STAR,star.golden.test,R-domain-star",
+            "DOMAIN-KEYWORD,kwgolden,R-domain-keyword",
+            "DOMAIN-WILDCARD,wild?.golden.test,R-domain-wildcard",
+            r"DOMAIN-REGEX,^re[0-9]+\.golden\.test$,R-domain-regex",
+            // No geosite db in unit tests, so this arm is exercised as a
+            // non-match (it must not panic or match everything).
+            "GEOSITE,cn,R-geosite",
+            // Process family.
+            "PROCESS-NAME,goldencurl,R-process-name",
+            "PROCESS-PATH,/usr/bin/goldenwget,R-process-path",
+            "PROCESS-NAME-REGEX,^goldenre[0-9]+$,R-process-name-regex",
+            "PROCESS-PATH-REGEX,^/opt/goldenre[0-9]+$,R-process-path-regex",
+            "PROCESS-NAME-WILDCARD,goldenwc*,R-process-name-wildcard",
+            "PROCESS-PATH-WILDCARD,/opt/goldenwc*,R-process-path-wildcard",
+            // Port family.
+            "DST-PORT,10001-10005,R-dst-port",
+            "SRC-PORT,20001,R-src-port",
+            "IN-PORT,30001,R-in-port",
+            // Inbound family.
+            "IN-TYPE,socks,R-in-type",
+            "IN-USER,goldenuser,R-in-user",
+            "IN-NAME,goldenname,R-in-name",
+            // Misc.
+            "NETWORK,udp,R-network",
+            "UID,4242,R-uid",
+            "DSCP,42,R-dscp",
+            // IP family. Source rules come first so a private src_ip in a
+            // later SRC-GEOIP case can't shadow them.
+            "SRC-IP-CIDR,10.77.0.0/16,R-src-ip-cidr",
+            "SRC-IP-SUFFIX,0.0.0.88/8,R-src-ip-suffix",
+            // No ASN db in unit tests — exercised as a non-match.
+            "SRC-IP-ASN,64512,R-src-ip-asn",
+            "IP-CIDR,203.0.113.0/24,R-ip-cidr,no-resolve",
+            "IP-CIDR6,2001:db8::/32,R-ip-cidr6,no-resolve",
+            "IP-SUFFIX,0.0.0.99/8,R-ip-suffix,no-resolve",
+            "IP-ASN,64513,R-ip-asn,no-resolve",
+            "GEOIP,lan,R-geoip-lan,no-resolve",
+            "SRC-GEOIP,lan,R-src-geoip-lan",
+            // Logic family.
+            "AND,((DOMAIN,and.golden.test),(DST-PORT,10443)),R-and",
+            "OR,((DOMAIN,or1.golden.test),(DOMAIN,or2.golden.test)),R-or",
+            // Deliberately narrow: matches only domains WITHOUT "golden", so
+            // it cannot swallow the SUB-RULE and MATCH cases below.
+            "NOT,((DOMAIN-KEYWORD,golden)),R-not",
+            "SUB-RULE,(DOMAIN,sub.golden.test),golden-group",
+            "MATCH,DIRECT",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+    }
+
+    async fn golden_engine() -> RuleEngine {
+        let mut engine = RuleEngine::new(&golden_rules(), &HashMap::new())
+            .await
+            .unwrap();
+        let mut groups = HashMap::new();
+        groups.insert(
+            "golden-group".to_string(),
+            vec![
+                "DOMAIN,never.golden.test,R-subrule-first".to_string(),
+                "MATCH,R-subrule".to_string(),
+            ],
+        );
+        engine.set_sub_rules(&groups);
+        engine
+    }
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    #[tokio::test]
+    async fn golden_matcher_corpus() {
+        let engine = golden_engine().await;
+
+        // (case label, metadata, expected target, expected rule_type, expected payload)
+        let cases: Vec<(&str, RuleMetadata, &str, &str, &str)> = vec![
+            (
+                "domain exact",
+                RuleMetadata {
+                    domain: Some("exact.golden.test".into()),
+                    ..Default::default()
+                },
+                "R-domain",
+                "DOMAIN",
+                "exact.golden.test",
+            ),
+            (
+                "domain suffix, subdomain",
+                RuleMetadata {
+                    domain: Some("www.suffix.golden.test".into()),
+                    ..Default::default()
+                },
+                "R-domain-suffix",
+                "DOMAIN-SUFFIX",
+                "suffix.golden.test",
+            ),
+            (
+                "domain suffix, bare domain also matches",
+                RuleMetadata {
+                    domain: Some("suffix.golden.test".into()),
+                    ..Default::default()
+                },
+                "R-domain-suffix",
+                "DOMAIN-SUFFIX",
+                "suffix.golden.test",
+            ),
+            (
+                "domain suffix strict, subdomain only",
+                RuleMetadata {
+                    domain: Some("a.strict.golden.test".into()),
+                    ..Default::default()
+                },
+                "R-domain-suffix-strict",
+                "DOMAIN-SUFFIX-STRICT",
+                "strict.golden.test",
+            ),
+            (
+                "domain star, exactly one extra label",
+                RuleMetadata {
+                    domain: Some("one.star.golden.test".into()),
+                    ..Default::default()
+                },
+                "R-domain-star",
+                "DOMAIN-STAR",
+                "star.golden.test",
+            ),
+            (
+                "domain keyword",
+                RuleMetadata {
+                    domain: Some("host.kwgolden.example".into()),
+                    ..Default::default()
+                },
+                "R-domain-keyword",
+                "DOMAIN-KEYWORD",
+                "kwgolden",
+            ),
+            (
+                "domain wildcard, ? is one char",
+                RuleMetadata {
+                    domain: Some("wildx.golden.test".into()),
+                    ..Default::default()
+                },
+                "R-domain-wildcard",
+                "DOMAIN-WILDCARD",
+                "wild?.golden.test",
+            ),
+            (
+                "domain regex",
+                RuleMetadata {
+                    domain: Some("re42.golden.test".into()),
+                    ..Default::default()
+                },
+                "R-domain-regex",
+                "DOMAIN-REGEX",
+                r"^re[0-9]+\.golden\.test$",
+            ),
+            (
+                "process name, case-insensitive",
+                RuleMetadata {
+                    process_name: Some("GoldenCurl".into()),
+                    ..Default::default()
+                },
+                "R-process-name",
+                "PROCESS-NAME",
+                "goldencurl",
+            ),
+            (
+                "process path",
+                RuleMetadata {
+                    process_path: Some("/usr/bin/goldenwget".into()),
+                    ..Default::default()
+                },
+                "R-process-path",
+                "PROCESS-PATH",
+                "/usr/bin/goldenwget",
+            ),
+            (
+                "process name regex",
+                RuleMetadata {
+                    process_name: Some("goldenre7".into()),
+                    ..Default::default()
+                },
+                "R-process-name-regex",
+                "PROCESS-NAME-REGEX",
+                "^goldenre[0-9]+$",
+            ),
+            (
+                "process path regex",
+                RuleMetadata {
+                    process_path: Some("/opt/goldenre7".into()),
+                    ..Default::default()
+                },
+                "R-process-path-regex",
+                "PROCESS-PATH-REGEX",
+                "^/opt/goldenre[0-9]+$",
+            ),
+            (
+                "process name wildcard",
+                RuleMetadata {
+                    process_name: Some("goldenwcanything".into()),
+                    ..Default::default()
+                },
+                "R-process-name-wildcard",
+                "PROCESS-NAME-WILDCARD",
+                "goldenwc*",
+            ),
+            (
+                "process path wildcard",
+                RuleMetadata {
+                    process_path: Some("/opt/goldenwc/bin".into()),
+                    ..Default::default()
+                },
+                "R-process-path-wildcard",
+                "PROCESS-PATH-WILDCARD",
+                "/opt/goldenwc*",
+            ),
+            (
+                "dst port range",
+                RuleMetadata {
+                    dst_port: 10003,
+                    ..Default::default()
+                },
+                "R-dst-port",
+                "DST-PORT",
+                "10001-10005",
+            ),
+            (
+                "src port",
+                RuleMetadata {
+                    src_port: 20001,
+                    ..Default::default()
+                },
+                "R-src-port",
+                "SRC-PORT",
+                "20001",
+            ),
+            (
+                "in port",
+                RuleMetadata {
+                    in_port: Some(30001),
+                    ..Default::default()
+                },
+                "R-in-port",
+                "IN-PORT",
+                "30001",
+            ),
+            (
+                "in type, SOCKS expands to socks5",
+                RuleMetadata {
+                    in_type: Some("socks5"),
+                    ..Default::default()
+                },
+                "R-in-type",
+                "IN-TYPE",
+                "socks",
+            ),
+            (
+                "in user",
+                RuleMetadata {
+                    in_user: Some("goldenuser".into()),
+                    ..Default::default()
+                },
+                "R-in-user",
+                "IN-USER",
+                "goldenuser",
+            ),
+            (
+                "in name",
+                RuleMetadata {
+                    in_name: Some("goldenname".into()),
+                    ..Default::default()
+                },
+                "R-in-name",
+                "IN-NAME",
+                "goldenname",
+            ),
+            (
+                "network udp",
+                RuleMetadata {
+                    network: "udp",
+                    ..Default::default()
+                },
+                "R-network",
+                "NETWORK",
+                "udp",
+            ),
+            (
+                "uid",
+                RuleMetadata {
+                    uid: Some(4242),
+                    ..Default::default()
+                },
+                "R-uid",
+                "UID",
+                "4242",
+            ),
+            (
+                "dscp",
+                RuleMetadata {
+                    dscp: Some(42),
+                    ..Default::default()
+                },
+                "R-dscp",
+                "DSCP",
+                "42",
+            ),
+            (
+                "src ip cidr",
+                RuleMetadata {
+                    src_ip: Some(ip("10.77.1.2")),
+                    ..Default::default()
+                },
+                "R-src-ip-cidr",
+                "SRC-IP-CIDR",
+                "10.77.0.0/16",
+            ),
+            (
+                "src ip suffix, trailing octet",
+                RuleMetadata {
+                    src_ip: Some(ip("172.16.5.88")),
+                    ..Default::default()
+                },
+                "R-src-ip-suffix",
+                "SRC-IP-SUFFIX",
+                "0.0.0.88/8",
+            ),
+            (
+                "ip cidr v4",
+                RuleMetadata {
+                    dst_ip: Some(ip("203.0.113.7")),
+                    ..Default::default()
+                },
+                "R-ip-cidr",
+                "IP-CIDR",
+                "203.0.113.0/24",
+            ),
+            (
+                "ip cidr v6",
+                RuleMetadata {
+                    dst_ip: Some(ip("2001:db8::1")),
+                    ..Default::default()
+                },
+                "R-ip-cidr6",
+                "IP-CIDR6",
+                "2001:db8::/32",
+            ),
+            (
+                "ip suffix, trailing octet",
+                RuleMetadata {
+                    dst_ip: Some(ip("198.51.100.99")),
+                    ..Default::default()
+                },
+                "R-ip-suffix",
+                "IP-SUFFIX",
+                "0.0.0.99/8",
+            ),
+            (
+                "geoip lan pseudo-country needs no mmdb",
+                RuleMetadata {
+                    dst_ip: Some(ip("10.0.0.5")),
+                    ..Default::default()
+                },
+                "R-geoip-lan",
+                "GEOIP",
+                "lan",
+            ),
+            (
+                "src-geoip lan",
+                RuleMetadata {
+                    src_ip: Some(ip("192.168.9.9")),
+                    ..Default::default()
+                },
+                "R-src-geoip-lan",
+                "SRC-GEOIP",
+                "lan",
+            ),
+            (
+                "AND, both conditions",
+                RuleMetadata {
+                    domain: Some("and.golden.test".into()),
+                    dst_port: 10443,
+                    ..Default::default()
+                },
+                "R-and",
+                "AND",
+                "((DOMAIN,and.golden.test),(DST-PORT,10443))",
+            ),
+            (
+                "OR, second branch",
+                RuleMetadata {
+                    domain: Some("or2.golden.test".into()),
+                    ..Default::default()
+                },
+                "R-or",
+                "OR",
+                "((DOMAIN,or1.golden.test),(DOMAIN,or2.golden.test))",
+            ),
+            (
+                "NOT, inner condition false",
+                RuleMetadata {
+                    domain: Some("plain.example.org".into()),
+                    ..Default::default()
+                },
+                "R-not",
+                "NOT",
+                "((DOMAIN-KEYWORD,golden))",
+            ),
+            (
+                "SUB-RULE, gate matches then group is walked",
+                RuleMetadata {
+                    domain: Some("sub.golden.test".into()),
+                    ..Default::default()
+                },
+                "R-subrule",
+                "SUB-RULE",
+                "(DOMAIN,sub.golden.test)",
+            ),
+            (
+                "no rule matches an unmatched golden domain -> MATCH",
+                RuleMetadata {
+                    domain: Some("fallthrough.golden.test".into()),
+                    ..Default::default()
+                },
+                "DIRECT",
+                "MATCH",
+                "",
+            ),
+        ];
+
+        for (label, meta, want_target, want_type, want_payload) in cases {
+            let (action, rule_type, payload) = engine.match_rules_detailed(&meta);
+            let want_action = if want_target == "DIRECT" {
+                Action::Direct
+            } else {
+                Action::Proxy(want_target.to_string())
+            };
+            assert_eq!(action, want_action, "action for case '{label}'");
+            assert_eq!(rule_type, want_type, "rule_type for case '{label}'");
+            assert_eq!(payload, want_payload, "payload for case '{label}'");
+        }
+    }
+
+    /// The AND/OR/NOT arms must NOT match when their conditions fail; without
+    /// this the golden table above could pass on a matcher that says yes to
+    /// everything.
+    #[tokio::test]
+    async fn golden_logic_rules_reject_non_matches() {
+        let engine = golden_engine().await;
+
+        // AND with only the domain half satisfied (port is wrong) must fall
+        // through past R-and.
+        let (action, rule_type, _) = engine.match_rules_detailed(&RuleMetadata {
+            domain: Some("and.golden.test".into()),
+            dst_port: 9999,
+            ..Default::default()
+        });
+        assert_ne!(rule_type, "AND", "AND must not match on a partial condition");
+        assert_eq!(action, Action::Direct, "should fall through to MATCH");
+
+        // NOT must not fire when its inner condition holds.
+        let (_, rule_type, _) = engine.match_rules_detailed(&RuleMetadata {
+            domain: Some("unmatched.golden.test".into()),
+            ..Default::default()
+        });
+        assert_ne!(rule_type, "NOT");
+
+        // A SUB-RULE gate that fails must not consult the group at all.
+        let (_, rule_type, _) = engine.match_rules_detailed(&RuleMetadata {
+            domain: Some("notsub.golden.test".into()),
+            ..Default::default()
+        });
+        assert_ne!(rule_type, "SUB-RULE");
+    }
+
+    /// Nested logic rules must use the same pre-parsed matchers as top-level
+    /// ones. Before the `Prepared` refactor, nested rules recursed with
+    /// `rule_idx = usize::MAX`, missing every side table and re-parsing the
+    /// CIDR / port / range payload string on each match.
+    #[tokio::test]
+    async fn nested_logic_rules_match_ip_and_port_children() {
+        let rules: Vec<RuleString> = vec![
+            "AND,((IP-CIDR,198.18.0.0/16),(DST-PORT,8080-8090)),NestedProxy".to_string(),
+            "OR,((IP-SUFFIX,0.0.0.77/8),(UID,7777)),NestedOr".to_string(),
+            "NOT,((IP-CIDR,10.0.0.0/8)),NestedNot".to_string(),
+            "MATCH,DIRECT".to_string(),
+        ];
+        let engine = RuleEngine::new(&rules, &HashMap::new()).await.unwrap();
+
+        // Nested IP-CIDR + DST-PORT.
+        assert_eq!(
+            engine.match_rules(&RuleMetadata {
+                dst_ip: Some(ip("198.18.1.1")),
+                dst_port: 8085,
+                ..Default::default()
+            }),
+            Action::Proxy("NestedProxy".into())
+        );
+        // Right IP, wrong port -> AND fails.
+        assert_ne!(
+            engine.match_rules(&RuleMetadata {
+                dst_ip: Some(ip("198.18.1.1")),
+                dst_port: 9999,
+                ..Default::default()
+            }),
+            Action::Proxy("NestedProxy".into())
+        );
+        // Nested IP-SUFFIX branch of the OR.
+        assert_eq!(
+            engine.match_rules(&RuleMetadata {
+                dst_ip: Some(ip("203.0.113.77")),
+                ..Default::default()
+            }),
+            Action::Proxy("NestedOr".into())
+        );
+        // Nested UID branch of the OR.
+        assert_eq!(
+            engine.match_rules(&RuleMetadata {
+                dst_ip: Some(ip("8.8.8.8")),
+                uid: Some(7777),
+                ..Default::default()
+            }),
+            Action::Proxy("NestedOr".into())
+        );
+        // Nested NOT: 10.x is inside the inner CIDR, so NOT must not fire and
+        // we fall through to MATCH.
+        assert_eq!(
+            engine.match_rules(&RuleMetadata {
+                dst_ip: Some(ip("10.1.2.3")),
+                ..Default::default()
+            }),
+            Action::Direct
+        );
+    }
+
+    /// Timing harness for the linear rule walk. Not a correctness test — run
+    /// it explicitly to get a number:
+    ///   cargo test --release -- --ignored --nocapture rule_match_timing
+    #[tokio::test]
+    #[ignore]
+    async fn rule_match_timing() {
+        // A corpus shaped like openwrt/openclash/nx.yaml: mostly domain rules,
+        // a large IP-CIDR tail, and GEOIP + MATCH at the end.
+        let mut rules: Vec<RuleString> = Vec::with_capacity(7000);
+        for i in 0..4000 {
+            rules.push(format!("DOMAIN-SUFFIX,d{i}.example.com,P"));
+        }
+        for i in 0..1500 {
+            rules.push(format!("IP-CIDR,10.{}.{}.0/24,P,no-resolve", i / 256, i % 256));
+        }
+        for i in 0..500 {
+            rules.push(format!("DOMAIN-KEYWORD,kw{i},P"));
+        }
+        for i in 0..500 {
+            rules.push(format!("DST-PORT,{}-{},P", 20000 + i * 2, 20001 + i * 2));
+        }
+        for i in 0..500 {
+            rules.push(format!("IP-SUFFIX,0.0.{}.0/16,P,no-resolve", i % 256));
+        }
+        rules.push("GEOIP,CN,DIRECT,no-resolve".to_string());
+        rules.push("MATCH,P".to_string());
+
+        let engine = RuleEngine::new(&rules, &HashMap::new()).await.unwrap();
+        println!("rules: {}", engine.rule_count());
+
+        // Worst case: nothing matches until the very end, so every rule runs.
+        let meta = RuleMetadata {
+            domain: Some("no-such-domain.invalid".to_string()),
+            dst_ip: Some(ip("198.51.100.1")),
+            dst_port: 443,
+            network: "tcp",
+            ..Default::default()
+        };
+
+        // Warm up so we time steady state, not first-touch page faults.
+        for _ in 0..100 {
+            std::hint::black_box(engine.match_rules(&meta));
+        }
+
+        const N: u32 = 2000;
+        let start = std::time::Instant::now();
+        for _ in 0..N {
+            std::hint::black_box(engine.match_rules(&meta));
+        }
+        let elapsed = start.elapsed();
+        println!(
+            "full-walk match: {N} iters in {elapsed:?} => {:?}/match",
+            elapsed / N
+        );
+    }
 }
