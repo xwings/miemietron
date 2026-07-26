@@ -46,6 +46,25 @@ impl DnsCache {
         None
     }
 
+    /// Like [`Self::get`] but also returns the entry's REMAINING TTL in seconds
+    /// (at least 1), for advertising to a DNS client.
+    ///
+    /// mihomo compat: resolver.go ExchangeContext counts a cached answer's TTL
+    /// down by `time.Until(expireTime)` (util.go updateTTL) instead of replaying
+    /// the original TTL, so a client can't keep an address past its expiry.
+    pub fn get_with_ttl(&self, domain: &str) -> Option<(IpAddr, u32)> {
+        if let Some(entry) = self.entries.get(domain) {
+            let now = Instant::now();
+            if now < entry.expires_at {
+                let remaining = (entry.expires_at - now).as_secs().max(1);
+                return Some((entry.ip, remaining as u32));
+            }
+            drop(entry);
+            self.entries.remove(domain);
+        }
+        None
+    }
+
     /// Insert a DNS entry with a specific TTL in seconds.
     /// If ttl_secs is 0, the entry is not cached (mihomo compat).
     pub fn insert(&self, domain: String, ip: IpAddr, ttl_secs: u32) {

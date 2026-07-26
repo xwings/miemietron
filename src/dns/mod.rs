@@ -35,8 +35,11 @@ pub struct DnsResolver {
     /// Set after construction via `set_ruleset_checker()`.
     ruleset_checker: Option<DomainCheckerFn>,
     /// Reverse IP→domain mapping for redir-host mode and traffic logging.
-    /// Records every DNS resolution result (both FakeIP and real IPs).
-    /// Matches mihomo's dns/enhancer.go mapping LRU.
+    /// Matches mihomo's dns/enhancer.go mapping LRU: it is populated ONLY from
+    /// answers this resolver served to a DNS client (`resolve` / `resolve_v6`,
+    /// i.e. mihomo's withMapping/withHosts middleware) — never from the internal
+    /// rule-matching resolutions in `resolve_real_ip`, which would map shared
+    /// CDN addresses to the last domain that resolved to them.
     /// Value is (domain, expiry instant).
     ip_to_host: DashMap<IpAddr, (String, Instant)>,
     /// Cache for proxy server hostname resolution (avoids DNS storm).
@@ -197,31 +200,51 @@ impl DnsResolver {
     /// recorded in the ip_to_host mapping for reverse lookups, matching
     /// mihomo's withMapping() middleware in dns/middleware.go.
     pub async fn resolve(&self, domain: &str) -> Result<IpAddr> {
+        self.resolve_with_ttl(domain).await.map(|(ip, _)| ip)
+    }
+
+    /// `resolve()` plus the TTL to advertise to the DNS client.
+    ///
+    /// mihomo compat: the answer's TTL is the upstream record's TTL, counted
+    /// down on a cache hit (resolver.go ExchangeContext → updateMsgTTL); only
+    /// fake-ip answers get a synthetic TTL (`fake-ip-ttl`, default 1) and hosts
+    /// entries get 10 (middleware.go withHosts). Advertising a fixed TTL for
+    /// real answers makes clients pin a CDN address far longer than the CDN
+    /// intends, so they keep dialing an edge that has since stopped serving the
+    /// name (connection reset / certificate for another host).
+    pub async fn resolve_with_ttl(&self, domain: &str) -> Result<(IpAddr, u32)> {
         // Check hosts map first (highest priority, like /etc/hosts)
         if !self.hosts.is_empty() {
             if let Some(ip) = self.hosts.get(&domain.to_lowercase()) {
                 // mihomo compat: withHosts() also records into the mapping
                 self.record_ip_mapping(*ip, domain, 10);
-                return Ok(*ip);
+                return Ok((*ip, 10));
             }
-        }
-
-        // Check cache
-        if let Some(ip) = self.cache.get(domain) {
-            return Ok(ip);
         }
 
         // FakeIP mode: assign a fake IP — unless the domain is in the bypass filter.
         // Bypassed domains (e.g. *.lan, geosite:cn, NTP servers, music services)
         // get resolved to real IPs via upstream DNS instead.
+        //
+        // mihomo compat: middleware.go newHandler composes withFakeIP BEFORE
+        // withResolver, so the fake-ip pool is consulted ahead of the resolver's
+        // answer cache and is the only authority for non-bypassed domains. The
+        // cache lookup must NOT run first: `resolve_real_ip` (the rule-matching
+        // path, tunnel.go match()) caches REAL IPs under the same domain key,
+        // and a cache-first order hands those real IPs back to DNS clients —
+        // fake-ip silently stops applying to every domain that ever matched an
+        // IP rule, and the client then caches a CDN address for the full TTL.
         if let Some(ref pool) = self.fakeip {
             if self.should_bypass_fakeip(domain) {
                 // Filtered domain: resolve to real IP (redir-host behavior)
+                if let Some((ip, remaining)) = self.cache.get_with_ttl(domain) {
+                    return Ok((ip, remaining));
+                }
                 let (ip, ttl) = self.query_upstream_with_ttl(domain).await?;
                 self.cache.insert(domain.to_string(), ip, ttl);
                 // mihomo compat: withMapping() records bypassed FakeIP resolutions too
                 self.record_ip_mapping(ip, domain, ttl);
-                return Ok(ip);
+                return Ok((ip, ttl));
             }
             // mihomo compat: FakeIP allocations are NOT cached in the DNS cache.
             // They are already stored in the FakeIP pool which handles its own
@@ -231,15 +254,18 @@ impl DnsResolver {
             // Also record in ip_to_host for consistency (FakeIP pool is authoritative,
             // but the general mapping provides a unified reverse lookup path)
             self.record_ip_mapping(ip, domain, FAKEIP_TTL);
-            return Ok(ip);
+            return Ok((ip, FAKEIP_TTL));
         }
 
-        // Redir-host mode: query upstream
+        // Redir-host mode: cache, then upstream
+        if let Some((ip, remaining)) = self.cache.get_with_ttl(domain) {
+            return Ok((ip, remaining));
+        }
         let (ip, ttl) = self.query_upstream_with_ttl(domain).await?;
         self.cache.insert(domain.to_string(), ip, ttl);
         // mihomo compat: withMapping() records every upstream resolution
         self.record_ip_mapping(ip, domain, ttl);
-        Ok(ip)
+        Ok((ip, ttl))
     }
 
     /// Resolve a domain to a REAL IP, never a FakeIP.
@@ -275,10 +301,16 @@ impl DnsResolver {
         }
 
         // Query upstream for a real IP (full fallback + anti-poison pipeline).
+        //
+        // mihomo compat: this mirrors `resolver.ResolveIP` called from tunnel.go
+        // match(), which goes through the Resolver's own message cache and never
+        // reaches the enhancer mapping — only the DNS *server* middleware
+        // (withMapping / withHosts) populates ip→host. Recording here would map
+        // every CDN address to whichever domain resolved to it last, and
+        // preHandleMetadata would then rewrite an unrelated connection's host to
+        // that domain (wrong SNI → wrong certificate).
         let (ip, ttl) = self.query_upstream_with_ttl(domain).await?;
         self.cache.insert(domain.to_string(), ip, ttl);
-        // mihomo compat: withMapping() records every upstream resolution
-        self.record_ip_mapping(ip, domain, ttl);
         Ok(ip)
     }
 
@@ -309,6 +341,13 @@ impl DnsResolver {
 
     /// mihomo compat: withMapping() in dns/middleware.go.
     fn record_ip_mapping(&self, ip: IpAddr, domain: &str, ttl: u32) {
+        // mihomo compat: withMapping skips answers that are not global unicast
+        // (`if !ip.IsGlobalUnicast() { continue }`) — an ad-blocking upstream
+        // that answers 0.0.0.0/127.0.0.1 must not claim the reverse mapping for
+        // those addresses and rewrite unrelated connections' hosts.
+        if !is_global_unicast(&ip) {
+            return;
+        }
         let ttl = ttl.max(1);
         let expires_at = Instant::now() + std::time::Duration::from_secs(ttl as u64);
         if self.ip_to_host.len() > 4096 {
@@ -360,16 +399,21 @@ impl DnsResolver {
     /// (no fake-ip-range6 pool — the server answers NODATA for non-bypassed
     /// domains before calling this).
     pub async fn resolve_v6(&self, domain: &str) -> Result<IpAddr> {
+        self.resolve_v6_with_ttl(domain).await.map(|(ip, _)| ip)
+    }
+
+    /// `resolve_v6()` plus the TTL to advertise (see [`Self::resolve_with_ttl`]).
+    pub async fn resolve_v6_with_ttl(&self, domain: &str) -> Result<(IpAddr, u32)> {
         if !self.hosts.is_empty() {
             if let Some(ip) = self.hosts.get(&domain.to_lowercase()) {
                 if ip.is_ipv6() {
-                    return Ok(*ip);
+                    return Ok((*ip, 10));
                 }
             }
         }
         let cache_key = format!("AAAA:{domain}");
-        if let Some(ip) = self.cache.get(&cache_key) {
-            return Ok(ip);
+        if let Some((ip, remaining)) = self.cache.get_with_ttl(&cache_key) {
+            return Ok((ip, remaining));
         }
         let (ip, ttl) = if let Some(servers) = self.nameserver_policy_servers(domain) {
             upstream::resolve_via(domain, &servers, 28).await?
@@ -378,7 +422,7 @@ impl DnsResolver {
         };
         self.cache.insert(cache_key, ip, ttl);
         self.record_ip_mapping(ip, domain, ttl);
-        Ok(ip)
+        Ok((ip, ttl))
     }
 
     /// Forward a raw DNS query (non-A/AAAA types) to the first plain-UDP main
@@ -590,15 +634,8 @@ pub async fn process_dns_query(data: &[u8], resolver: &DnsResolver) -> Option<Ve
     const TYPE_HTTPS: u16 = 65;
 
     match qtype {
-        TYPE_A => match resolver.resolve(&domain).await {
-            Ok(ip) => {
-                let ttl = if resolver.is_fake_ip(&ip) {
-                    FAKEIP_TTL
-                } else {
-                    DNS_DEFAULT_TTL
-                };
-                Some(build_dns_response(id, &domain, ip, qtype, ttl))
-            }
+        TYPE_A => match resolver.resolve_with_ttl(&domain).await {
+            Ok((ip, ttl)) => Some(build_dns_response(id, &domain, ip, qtype, ttl)),
             Err(e) => {
                 debug!("DNS resolve failed for {}: {}", domain, e);
                 Some(build_dns_servfail(id, &domain, qtype))
@@ -610,15 +647,8 @@ pub async fn process_dns_query(data: &[u8], resolver: &DnsResolver) -> Option<Ve
             if !resolver.config.ipv6 {
                 return Some(build_dns_nodata(id, &domain, qtype));
             }
-            match resolver.resolve_v6(&domain).await {
-                Ok(ip) => {
-                    let ttl = if resolver.is_fake_ip(&ip) {
-                        FAKEIP_TTL
-                    } else {
-                        DNS_DEFAULT_TTL
-                    };
-                    Some(build_dns_response(id, &domain, ip, qtype, ttl))
-                }
+            match resolver.resolve_v6_with_ttl(&domain).await {
+                Ok((ip, ttl)) => Some(build_dns_response(id, &domain, ip, qtype, ttl)),
                 Err(e) => {
                     debug!("DNS AAAA resolve failed for {}: {}", domain, e);
                     Some(build_dns_servfail(id, &domain, qtype))
@@ -799,6 +829,28 @@ fn parse_dns_query(data: &[u8]) -> Option<(u16, String, u16)> {
 const FAKEIP_TTL: u32 = 1;
 const DNS_DEFAULT_TTL: u32 = 600;
 
+/// mihomo compat: Go's `netip.Addr.IsGlobalUnicast` — everything except the
+/// unspecified address, the IPv4 broadcast address, loopback, multicast and
+/// link-local unicast. RFC1918 private addresses ARE global unicast in Go.
+fn is_global_unicast(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            !v4.is_unspecified()
+                && !v4.is_broadcast()
+                && !v4.is_loopback()
+                && !v4.is_multicast()
+                && !v4.is_link_local()
+        }
+        IpAddr::V6(v6) => {
+            !v6.is_unspecified()
+                && !v6.is_loopback()
+                && !v6.is_multicast()
+                // fe80::/10 — `is_unicast_link_local` is still unstable
+                && (v6.segments()[0] & 0xffc0) != 0xfe80
+        }
+    }
+}
+
 /// Build a DNS response. The question type must match the original query.
 /// For AAAA queries with IPv4 FakeIP, return NODATA (0 answers, correct question type).
 /// mihomo compat: browsers send both A and AAAA queries; mismatched responses get discarded.
@@ -910,6 +962,87 @@ mod tests {
             proxy_dns_cache: DashMap::new(),
             proxy_dns_inflight: DashMap::new(),
         }
+    }
+
+    /// Helper: fake-ip resolver over 198.18.0.0/16 with an empty filter.
+    fn fakeip_test_resolver() -> DnsResolver {
+        let mut r = test_resolver();
+        r.fakeip = Some(FakeIpPool::new("198.18.0.0/16", &[], "blacklist").unwrap());
+        r
+    }
+
+    /// Regression: `resolve_real_ip` caches real IPs under the plain domain key
+    /// for rule matching. `resolve()` (the DNS-server path) must still answer
+    /// with a fake IP — mihomo composes withFakeIP ahead of the resolver cache,
+    /// so a real IP can never be served for a non-bypassed domain. Serving one
+    /// makes the client cache a CDN address for the full TTL and pins later
+    /// connections to a stale edge (wrong certificate).
+    #[tokio::test]
+    async fn fakeip_answer_is_not_shadowed_by_real_ip_cache() {
+        let r = fakeip_test_resolver();
+        let first = r.resolve("cdn.example.com").await.unwrap();
+        assert!(r.is_fake_ip(&first));
+
+        // What resolve_real_ip() does after an on-demand GEOIP/IP-CIDR lookup.
+        let real = IpAddr::V4(Ipv4Addr::new(104, 16, 1, 1));
+        r.cache.insert("cdn.example.com".to_string(), real, 300);
+
+        let second = r.resolve("cdn.example.com").await.unwrap();
+        assert_eq!(second, first, "resolve() returned the real IP {second}");
+    }
+
+    /// mihomo compat: fake-ip answers advertise TTL 1 so a client re-queries
+    /// instead of pinning a mapping the pool may have recycled.
+    #[tokio::test]
+    async fn fakeip_answer_advertises_ttl_one() {
+        let r = fakeip_test_resolver();
+        let (ip, ttl) = r.resolve_with_ttl("cdn.example.com").await.unwrap();
+        assert!(r.is_fake_ip(&ip));
+        assert_eq!(ttl, FAKEIP_TTL);
+    }
+
+    /// Regression: a real answer served from cache advertises the REMAINING TTL,
+    /// not a fixed 600 — otherwise a client holds a CDN address long past the
+    /// point the edge stops serving the name.
+    #[tokio::test]
+    async fn cached_real_answer_advertises_remaining_ttl() {
+        let r = test_resolver(); // redir-host mode (no fake-ip pool)
+        let real = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7));
+        r.cache.insert("direct.example.com".to_string(), real, 30);
+
+        let (ip, ttl) = r.resolve_with_ttl("direct.example.com").await.unwrap();
+        assert_eq!(ip, real);
+        assert!(
+            (1..=30).contains(&ttl),
+            "expected a counted-down TTL, got {ttl}"
+        );
+    }
+
+    /// Regression: the rule-matching resolution path must not claim the reverse
+    /// mapping. mihomo's enhancer mapping is written only by the DNS server
+    /// middleware; recording internal resolutions makes a shared CDN address
+    /// reverse-map to an unrelated domain, and preHandleMetadata then rewrites
+    /// the connection's host to it.
+    #[tokio::test]
+    async fn resolve_real_ip_does_not_record_reverse_mapping() {
+        let r = fakeip_test_resolver();
+        // An IP literal short-circuits before any upstream query.
+        let ip = r.resolve_real_ip("104.16.1.1").await.unwrap();
+        assert_eq!(r.reverse_lookup(&ip), None);
+    }
+
+    #[test]
+    fn record_ip_mapping_skips_non_global_unicast() {
+        let r = test_resolver();
+        for addr in ["0.0.0.0", "127.0.0.1", "255.255.255.255", "224.0.0.1"] {
+            let ip: IpAddr = addr.parse().unwrap();
+            r.record_ip_mapping(ip, "blocked.example.com", 600);
+            assert_eq!(r.reverse_lookup(&ip), None, "{addr} should not be mapped");
+        }
+        // A private address is global unicast in Go and must still be recorded.
+        let lan: IpAddr = "192.168.1.10".parse().unwrap();
+        r.record_ip_mapping(lan, "nas.lan", 600);
+        assert_eq!(r.reverse_lookup(&lan), Some("nas.lan".to_string()));
     }
 
     #[test]
