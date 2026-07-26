@@ -9,7 +9,7 @@ Proxy groups let a rule target a logical name (e.g. `Proxy`, `Auto`) that resolv
 ## Code Structure
 | File | Role |
 |------|------|
-| `src/proxy_group/mod.rs` | `ProxyGroup` trait, `HealthCheckOpts`, re-exports of all group types |
+| `src/proxy_group/mod.rs` | `ProxyGroup` trait, `GroupBase` (shared failure/health state), `HealthCheckOpts`, re-exports of all group types |
 | `src/proxy_group/selector.rs` | `SelectorGroup` — manual selection |
 | `src/proxy_group/url_test.rs` | `UrlTestGroup` — auto-select fastest within tolerance, force-pin support, `health_check` |
 | `src/proxy_group/fallback.rs` | `FallbackGroup` — first-alive-in-order, force-pin support |
@@ -18,14 +18,14 @@ Proxy groups let a rule target a logical name (e.g. `Proxy`, `Auto`) that resolv
 | `src/proxy_group/proxy_state.rs` | `ProxyStateStore` — per-proxy/per-URL delay + liveness, delay history |
 
 ## Key Types and Entry Points
-- `src/proxy_group/mod.rs:28` - `ProxyGroup` - trait: `now`/`all`/`select`/`clear_selection`/`get_proxy`/`on_dial_failed`/`on_dial_success`/`touch`.
-- `src/proxy_group/mod.rs:50` - `ProxyGroup::get_proxy` - resolves the group to a concrete `OutboundHandler` via the proxies map.
-- `src/proxy_group/selector.rs:23` - `SelectorGroup::new` - manual group; `get_proxy` (`:61`) returns the currently selected member.
-- `src/proxy_group/url_test.rs:59` - `UrlTestGroup::new` - auto group; `now` returns the fastest (`fast()`, `:281`), `health_check` at `:122`, `get_proxy` at `:306`.
-- `src/proxy_group/fallback.rs:47` - `FallbackGroup::new` - `get_proxy` (`:224`) returns the first alive member in config order, honoring a force-pin.
-- `src/proxy_group/load_balance.rs:103` - `LoadBalanceGroup::new` - `get_proxy` (`:188`) picks per `LoadBalanceStrategy` (`:14`).
-- `src/proxy_group/health.rs:109` - `spawn_health_checks` - spawns one tokio task per checkable group; singleflight `checking` flag prevents overlap.
-- `src/proxy_group/proxy_state.rs:17` - `ProxyStateStore` - shared store; `record_result` (`:37`), `alive_for_url` (`:71`), `delay_history` (`:115`).
+- `src/proxy_group/mod.rs:307` - `ProxyGroup` - trait: `now`/`all`/`select`/`clear_selection`/`get_proxy`/`on_dial_failed`/`on_dial_success`/`touch`.
+- `src/proxy_group/mod.rs:106` - `GroupBase` - mihomo's `adapter/outboundgroup/groupbase.go`, embedded as `base` by `UrlTestGroup`/`FallbackGroup`/`LoadBalanceGroup`. Owns the 14 fields the three used to declare identically (name, members, test URL, interval, expected-status, state store, failure counters, max-failed-times, test timeout, last-touch, lazy, health-notify) plus the shared methods: `touch` (`:297`), `on_dial_failed` (`:252`, which skips built-in adapter types and fires the check immediately on connection-refused), `on_dial_success` (`:290`), and the `failed_testing` guard in `do_health_check` (`:242`). URLTest overrides `do_health_check` to add its `fast_single.reset()`. `SelectorGroup` deliberately does **not** embed it — different shape, no failure tracking.
+- `src/proxy_group/selector.rs:45` - `SelectorGroup::new` - manual group; `get_proxy` (`:130`) returns the currently selected member.
+- `src/proxy_group/url_test.rs:36` - `UrlTestGroup::new` - auto group; `base` + `{tolerance, current_best, force_selected, fast_single}`. `now` returns the fastest (`fast()`, `:82`), `health_check` at `:70`, `get_proxy` at `:198`.
+- `src/proxy_group/fallback.rs:24` - `FallbackGroup::new` - `base` + `force_selected`; `get_proxy` (`:132`) returns the first alive member in config order, honoring a force-pin.
+- `src/proxy_group/load_balance.rs:119` - `LoadBalanceGroup::new` - `base` + `{strategy, rr_idx, sticky_map, sticky_order}`; `get_proxy` (`:302`) picks per `LoadBalanceStrategy` (`:16`).
+- `src/proxy_group/health.rs:222` - `spawn_health_checks` - spawns one tokio task per checkable group; singleflight `checking` flag prevents overlap. Reads `lazy` / `last_touch` / `health_notify` off `base` through the `HealthCheckable` enum.
+- `src/proxy_group/proxy_state.rs:17` - `ProxyStateStore` - shared store; `record_result` (`:37`), `alive_for_url` (`:102`), `delay_history` (`:134`).
 
 ## Interactions
 - `ProxyManager::resolve`/`resolve_depth` in [outbounds.md](outbounds.md) call `now`/`get_proxy` to chase group chains (up to 10 levels); a member missing from the handler map propagates as the no-silent-DIRECT-fallback error.
@@ -35,7 +35,7 @@ Proxy groups let a rule target a logical name (e.g. `Proxy`, `Auto`) that resolv
 - Selections are persisted across restarts through the store (`src/store.rs`).
 
 ## How to Test
-- `cargo test proxy_group` — all group + health + state-store tests; pass = `test result: ok`.
+- `cargo test proxy_group` — all group + health + state-store tests; pass = `test result: ok`. The `GroupBase` tests in `mod.rs` cover the failure-counter semantics (built-in skip, connection-refused fast path, max-failed-times, reset-on-success, reset-on-health-testing-clear) once for all three groups.
 - Integration: launch with a config containing `select`/`url-test`/`fallback`/`load-balance` groups, then `curl http://127.0.0.1:9090/proxies` and `PUT /proxies/<group>` to verify selection and live delay.
 
 ## Open Gaps / Roadmap

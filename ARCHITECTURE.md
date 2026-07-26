@@ -6,7 +6,7 @@ Same CLI, same config, same REST API — for the OpenClash runtime surface.
 Anything outside that surface is explicitly carved out below; swap the binary
 for the in-scope set.
 
-**Single static musl binary, ~30k lines of Rust, 511 tests.**
+**Single static musl binary, ~40k lines of Rust, 565 tests.**
 
 This file is the control center: mission, scope, boot/connection flow, the
 OpenClash contract, and an Index of the per-subsystem docs under

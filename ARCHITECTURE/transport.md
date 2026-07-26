@@ -11,7 +11,8 @@ The transport subsystem provides the shared stream-layer building blocks that ev
 |------|------|
 | `src/transport/mod.rs` | Module re-exports for the transport layer |
 | `src/transport/tcp.rs` | `ConnectOpts`, `connect` — TCP dial with SO_MARK + socket2 keepalive |
-| `src/transport/tls.rs` | `TlsOptions`, `wrap_tls`, `TlsConnector` — rustls client TLS |
+| `src/transport/tls.rs` | `TlsOptions`, `wrap_tls`, `TlsConnector` — rustls client TLS + the process-wide `ClientConfig` cache |
+| `src/transport/stack.rs` | `Secured` / `Layered` stream enums, `TransportSpec`, `wrap_transport` — the shared TLS→WS/gRPC/H2/XHTTP composition used by vmess/vless/trojan |
 | `src/transport/ws.rs` | `WsOptions`, `wrap_ws`/`connect`, `WsStream`, early-data variant |
 | `src/transport/grpc.rs` | `GrpcStream`, `connect_grpc` — gRPC framing over H2 |
 | `src/transport/h2_transport.rs` | `H2Stream`, `connect_h2` — HTTP/2 stream transport |
@@ -23,7 +24,8 @@ The transport subsystem provides the shared stream-layer building blocks that ev
 - `src/transport/tcp.rs:10` - `ConnectOpts` - dial options; `from_proxy_config` pulls routing-mark + keepalive from config.
 - `src/transport/tcp.rs:35` - `connect(addr, opts)` - TCP dial; applies `socket2::TcpKeepalive` before connect, matching `keepalive.SetNetDialer()`.
 - `src/transport/tls.rs:24` - `wrap_tls(stream, opts)` - rustls client handshake using `TlsOptions` (sni / skip-cert-verify / alpn / fingerprint).
-- `src/transport/tls.rs:42` - `TlsConnector::new` - builds the rustls connector honoring a browser fingerprint string.
+- `src/transport/tls.rs:88` - `TlsConnector::new` - builds the rustls connector honoring a browser fingerprint string. The `ClientConfig` (crypto provider + the ~150 webpki trust anchors) is **cached process-wide** in `TLS_CONFIGS` (`:68`), a `DashMap` keyed by `TlsConfigKey` (`:51`) = skip-cert-verify + fingerprint + *effective* ALPN (post-`default_alpn_for` fallback, so callers that arrive at the same ALPN share an entry). Only the per-dial `ServerName` is rebuilt. mihomo compat: the Go side builds its trust store exactly once in `globalCertPool` (`component/ca/config.go:18`). Reality is deliberately excluded — it mixes per-connection ephemeral key material into the config.
+- `src/transport/stack.rs:183` - `wrap_transport(stream, spec)` - applies one `TransportSpec` (`:172`): optional `SecuritySpec::Tls`/`Reality`, then the `TransportKind` layer, returning `Layered<Secured<S>>`. Both enums delegate `AsyncRead`/`AsyncWrite` by hand so every layer stays **statically dispatched** — no `Box<dyn>` vtable hop on the data path. `tls_options` (`:279`) and `transport_kind` (`:242`) are the shared spec builders; the ALPN decision stays in each adapter because the three protocols disagree (see [outbounds.md](outbounds.md)).
 - `src/transport/ws.rs:34` - `wrap_ws(stream, opts)` - WebSocket client upgrade; `connect_with_early_data` (`:77`) for 0-RTT-style early data.
 - `src/transport/grpc.rs:217` - `connect_grpc(stream, service_name, host)` - gRPC transport producing a `GrpcStream` (`:20`).
 - `src/transport/h2_transport.rs:134` - `connect_h2(stream, host, path)` - HTTP/2 transport producing an `H2Stream` (`:13`).

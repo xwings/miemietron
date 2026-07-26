@@ -8,14 +8,17 @@ sequential rule chain (first match wins) and returns the routing `Action`
 matchers and rule providers (RULE-SET). Part of OpenClash runtime parity.
 
 ## Status
-`done`. Full mihomo rule-type parity for the in-scope set; 78 rule tests pass.
+`done`. Full mihomo rule-type parity for the in-scope set; 89 rule tests pass.
 The resolve-on-demand path (`needs_ip_resolution` / `rule_resolves_dst_ip`) was
-added to fix the fake-ip domestic-routing leak and is covered by five new tests.
+added to fix the fake-ip domestic-routing leak and is covered by five tests.
+`golden_matcher_corpus` pins the matched `(Action, rule_type, payload)` for
+every rule kind — including nested logic rules — and is the guard the
+`RuleKind`/`Prepared` refactor was validated against.
 
 ## Code Structure
 | File | Role |
 |------|------|
-| `src/rules/mod.rs` | `RuleEngine`, parsing, sequential matcher, resolve-on-demand, port/cidr pre-parsing |
+| `src/rules/mod.rs` | `RuleEngine`, parsing, `RuleKind` dispatch, per-family matchers, resolve-on-demand, `Prepared` payload pre-parsing |
 | `src/rules/geoip.rs` | `GeoIpMatcher` — MaxMind country + ASN lookup |
 | `src/rules/geosite.rs` | `GeoSiteMatcher` — geosite domain-set membership |
 | `src/rules/domain.rs` | `DomainMatcher` — domain/suffix/keyword tree for providers |
@@ -31,11 +34,14 @@ added to fix the fake-ip domestic-routing leak and is covered by five new tests.
 - `src/rules/mod.rs` - `match_rules_detailed_filtered` - same scan with an optional adapter filter; the UDP path passes a closure so a matched rule whose adapter can't do UDP is skipped and evaluation continues (mihomo `tunnel.go match()` `!adapter.SupportUDP()` → continue).
 - `src/rules/mod.rs` - `match_rules` - thin wrapper returning just the `Action`.
 - `src/rules/mod.rs` - `provider_domain_match` / `ProviderDomainIndex` - per-provider domain lookup used by `rule-set:<name>` entries in `dns.fake-ip-filter` (see [dns.md](dns.md)).
-- `src/rules/mod.rs:571` - `needs_ip_resolution` - **new**: true when the scan reaches a dst-IP rule before any earlier match, signalling the caller to resolve a real IP (mihomo lazy `ResolveIP`).
-- `src/rules/mod.rs:597` - `match_single_rule` - per-rule-type dispatch (MATCH/NETWORK/SRC-PORT/PROCESS-*/GEOIP/IP-CIDR/...).
-- `src/rules/mod.rs:1183` - `target_to_action` - maps target string → `Action` (DIRECT/REJECT/REJECT-DROP/Proxy).
-- `src/rules/mod.rs:1196` - `rule_resolves_dst_ip` - **new** free fn: true for GEOIP/IP-CIDR/IP-CIDR6/IP-SUFFIX/IP-ASN without `no-resolve` (mihomo `ShouldResolveIP()`); `SRC-*` rules never trigger destination resolution.
-- `src/rules/mod.rs:502` - `provider_info` - load-time snapshot of provider ruleCount/updatedAt for the REST API.
+- `src/rules/mod.rs:890` - `needs_ip_resolution` - true when the scan reaches a dst-IP rule before any earlier match, signalling the caller to resolve a real IP (mihomo lazy `ResolveIP`).
+- `src/rules/mod.rs:59` - `RuleKind` - a `Copy` enum with one variant per rule type, computed once at parse time. `rule_type: String` stays on `ParsedRule` for `rule_type_display` / `GET /rules` / unknown-type passthrough; `RuleKind` is purely the dispatch key, so the walk over ~7k rules compares a discriminant instead of running a 36-arm string match per rule per connection.
+- `src/rules/mod.rs:113` - `Prepared` - the rule's pre-parsed payload (`Cidr` / `Suffix` / `Ports` / `Asn` / `Ranges` / `Regex` / `None`), built at parse time and stored **on** the rule. It replaced six `HashMap<usize, _>` side tables keyed by rule index: that removes a hash+probe per IP/port/regex rule per connection, and it fixes nested logic rules, which used to recurse with `rule_idx = usize::MAX` and therefore re-parsed their CIDR/port payload string on every match. A payload that fails to parse gets `Prepared::None` and falls back to the string path, which fails identically.
+- `src/rules/mod.rs:922` - `match_single_rule` - dispatches on `rule.kind` to one per-family matcher and applies `target_to_action` once: `match_domain_rule` (`:965`), `match_ip_rule` (`:1006`, which picks src-vs-dst IP once then runs geoip/asn/cidr/suffix), `match_port_rule` (`:1043`), `match_process_rule` (`:1060`), `match_inbound_rule` (`:1090`, IN-TYPE/IN-USER/IN-NAME/UID/DSCP). `match_logic_rule` (`:1144`) returns `Option<Action>` directly because AND/OR/NOT/SUB-RULE choose their own target.
+- `src/rules/mod.rs:1553` - `target_to_action` - maps target string → `Action` (DIRECT/REJECT/REJECT-DROP/Proxy).
+- `src/rules/mod.rs:1755` - `is_subdomain_of` - the shared label-boundary check behind DOMAIN-SUFFIX / DOMAIN-STAR ("oexample.com" must not match the suffix "example.com").
+- `src/rules/mod.rs` - `rule_resolves_dst_ip` - free fn: true for GEOIP/IP-CIDR/IP-CIDR6/IP-SUFFIX/IP-ASN without `no-resolve` (mihomo `ShouldResolveIP()`); `SRC-*` rules never trigger destination resolution. `is_src` / `no_resolve` are precomputed from `params` at parse time, so `parse_params` no longer runs per connection.
+- `src/rules/mod.rs:783` - `provider_info` - load-time snapshot of provider ruleCount/updatedAt for the REST API.
 
 ## Interactions
 - [conn.md](conn.md): `handle_tcp_inner` and `resolve_udp_action` build a `RuleMetadata`, call `needs_ip_resolution`, then `match_rules_detailed`/`match_rules`. dst_ip blanking for FakeIP happens there.
@@ -43,7 +49,9 @@ added to fix the fake-ip domestic-routing leak and is covered by five new tests.
 - The resolved `Action::Proxy(name)` is dispatched to the [outbounds.md](outbounds.md) / [proxy_group.md](proxy_group.md) layer by the connection manager.
 
 ## How to Test
-- `cargo test rules` — pass = output contains `test result: ok` (78 tests).
+- `cargo test rules` — pass = output contains `test result: ok` (89 tests).
+- Matcher parity: `cargo test golden_matcher_corpus` — the table-driven corpus over all rule kinds. Any dispatch/prepared-payload change must leave it untouched and green.
+- Hot-path timing (not a correctness gate): `cargo test --release --offline -- --ignored --nocapture rule_match_timing` builds a ~7k-rule engine and times N matches.
 - Resolve-on-demand specifically: `cargo test needs_ip_resolution` and `cargo test resolve_on_demand` cover the reached-IP-rule, earlier-domain-match, `no-resolve`, no-IP-rule, and proxy→direct-after-resolve cases.
 - Integration: `timeout 30 target/debug/miemietron -d <openclash-dir> -f <config.yaml>`, then `curl` a domestic (e.g. `GEOIP,CN,DIRECT`) and a foreign URL through `127.0.0.1:7890` and confirm via `GET /connections` that the rule + chain match expectations.
 
