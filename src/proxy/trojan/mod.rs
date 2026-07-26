@@ -11,12 +11,9 @@ use crate::config::proxy::{GrpcOpts, H2Opts, ProxyConfig, RealityOpts, WsOpts};
 use crate::dns::DnsResolver;
 use crate::proxy::{OutboundHandler, ProxyStream};
 use crate::transport::fingerprint::TlsFingerprint;
-use crate::transport::grpc;
-use crate::transport::h2_transport;
-use crate::transport::reality::{self, RealityConfig};
+use crate::transport::reality::RealityConfig;
+use crate::transport::stack::{self, SecuritySpec, TransportSpec};
 use crate::transport::tcp::{self, ConnectOpts};
-use crate::transport::tls::{self, TlsOptions};
-use crate::transport::ws::{self, WsOptions};
 
 use header::{encode_request, hex_sha224, TrojanStream, CMD_TCP};
 
@@ -131,57 +128,47 @@ impl TrojanOutbound {
         Ok(Some(config))
     }
 
-    /// Build TLS options. Trojan always requires TLS.
-    fn tls_options(&self) -> TlsOptions {
-        TlsOptions {
-            sni: self.sni.clone(),
-            skip_cert_verify: self.skip_cert_verify,
-            alpn: self.alpn.clone(),
-            fingerprint: self.fingerprint.clone(),
-        }
+    /// The security + transport chain this config asks for.
+    fn transport_spec(&self) -> Result<TransportSpec> {
+        Ok(TransportSpec {
+            label: "Trojan",
+            security: self.security_for()?,
+            transport: stack::transport_kind(
+                &self.network,
+                &self.sni,
+                self.ws_opts.as_ref(),
+                self.grpc_opts.as_ref(),
+                self.h2_opts.as_ref(),
+                // Trojan has no XHTTP transport in mihomo.
+                None,
+            )?,
+        })
     }
 
-    fn grpc_service_name(&self) -> String {
-        self.grpc_opts
-            .as_ref()
-            .and_then(|o| o.grpc_service_name.clone())
-            .unwrap_or_else(|| "GunService".to_string())
-    }
-
-    fn h2_host_path(&self) -> (String, String) {
-        let host = self
-            .h2_opts
-            .as_ref()
-            .and_then(|o| o.host.first().cloned())
-            .unwrap_or_else(|| self.sni.clone());
-        let path = self
-            .h2_opts
-            .as_ref()
-            .and_then(|o| o.path.clone())
-            .unwrap_or_else(|| "/".to_string());
-        (host, path)
-    }
-
-    fn build_ws_options(&self) -> WsOptions {
-        let mut ws_options = WsOptions {
-            host: self.sni.clone(),
-            path: "/".to_string(),
-            headers: Vec::new(),
-        };
-
-        if let Some(ref opts) = self.ws_opts {
-            if let Some(ref path) = opts.path {
-                ws_options.path = path.clone();
-            }
-            for (key, value) in &opts.headers {
-                ws_options.headers.push((key.clone(), value.clone()));
-                if key.to_lowercase() == "host" {
-                    ws_options.host = value.clone();
-                }
-            }
+    /// Reality or TLS, and the ALPN the transport dictates. Trojan has no
+    /// `tls:` option — the protocol mandates TLS, so there is no plain arm.
+    fn security_for(&self) -> Result<SecuritySpec> {
+        if let Some(reality_config) = self.build_reality_config()? {
+            debug!("Trojan [{}]: using Reality transport", self.name);
+            return Ok(SecuritySpec::Reality(reality_config));
         }
 
-        ws_options
+        let base = stack::tls_options(
+            &self.sni,
+            self.skip_cert_verify,
+            &self.alpn,
+            self.fingerprint.as_deref(),
+        );
+        Ok(SecuritySpec::Tls(match self.network.as_str() {
+            // mihomo compat: trojan.go:95-97 — WS uses DefaultWebsocketALPN
+            // (["http/1.1"]) unless the config sets an explicit `alpn`. Unlike
+            // VMess/VLESS, an explicit `alpn` is *not* overridden here.
+            "ws" if self.alpn.is_empty() => base.with_alpn(vec!["http/1.1".to_string()]),
+            "ws" => base,
+            // gRPC and H2 require ALPN h2, config `alpn` ignored.
+            "grpc" | "h2" => base.with_alpn(vec!["h2".to_string()]),
+            _ => base,
+        }))
     }
 }
 
@@ -209,130 +196,93 @@ impl OutboundHandler for TrojanOutbound {
     ) -> Result<Box<dyn ProxyStream>> {
         let tcp_stream = self.dial_server(dns).await?;
 
-        // Check if Reality transport is configured.
-        if let Some(reality_config) = self.build_reality_config()? {
-            debug!("Trojan [{}]: using Reality transport", self.name);
+        let stream = stack::wrap_transport(tcp_stream, self.transport_spec()?).await?;
+        let header = encode_request(&self.password_hash, CMD_TCP, target);
+        Ok(Box::new(TrojanStream::new(stream, header)))
+    }
+}
 
-            let reality_stream = reality::wrap_reality(tcp_stream, &reality_config)
-                .await
-                .context("Trojan: Reality handshake failed")?;
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-            match self.network.as_str() {
-                "ws" => {
-                    let ws_opts = self.build_ws_options();
-                    let ws_stream = ws::wrap_ws(reality_stream, &ws_opts)
-                        .await
-                        .context("Trojan: WebSocket upgrade over Reality failed")?;
-
-                    let header = encode_request(&self.password_hash, CMD_TCP, target);
-                    let trojan_stream = TrojanStream::new(ws_stream, header);
-                    Ok(Box::new(trojan_stream))
-                }
-                "grpc" => {
-                    let service_name = self.grpc_service_name();
-                    let grpc_stream = grpc::connect_grpc(reality_stream, &service_name, &self.sni)
-                        .await
-                        .context("Trojan: gRPC connect over Reality failed")?;
-
-                    let header = encode_request(&self.password_hash, CMD_TCP, target);
-                    let trojan_stream = TrojanStream::new(grpc_stream, header);
-                    Ok(Box::new(trojan_stream))
-                }
-                "h2" => {
-                    let (host, path) = self.h2_host_path();
-                    let h2_stream = h2_transport::connect_h2(reality_stream, &host, &path)
-                        .await
-                        .context("Trojan: H2 connect over Reality failed")?;
-
-                    let header = encode_request(&self.password_hash, CMD_TCP, target);
-                    let trojan_stream = TrojanStream::new(h2_stream, header);
-                    Ok(Box::new(trojan_stream))
-                }
-                _ => {
-                    let header = encode_request(&self.password_hash, CMD_TCP, target);
-                    let trojan_stream = TrojanStream::new(reality_stream, header);
-                    Ok(Box::new(trojan_stream))
-                }
-            }
-        } else {
-            // Standard TLS transport (Trojan always requires TLS).
-            match self.network.as_str() {
-                "ws" => {
-                    // mihomo compat: trojan.go:95-97 — WS uses DefaultWebsocketALPN
-                    // (["http/1.1"]) unless the config sets an explicit `alpn`.
-                    let ws_alpn = if self.alpn.is_empty() {
-                        vec!["http/1.1".to_string()]
-                    } else {
-                        self.alpn.clone()
-                    };
-                    let tls_opts = self.tls_options().with_alpn(ws_alpn);
-                    let tls_stream = tls::wrap_tls(tcp_stream, &tls_opts)
-                        .await
-                        .context("Trojan: TLS handshake failed")?;
-
-                    let ws_opts = self.build_ws_options();
-                    let ws_stream = ws::wrap_ws(tls_stream, &ws_opts)
-                        .await
-                        .context("Trojan: WebSocket upgrade failed")?;
-
-                    let header = encode_request(&self.password_hash, CMD_TCP, target);
-                    let trojan_stream = TrojanStream::new(ws_stream, header);
-                    Ok(Box::new(trojan_stream))
-                }
-                "grpc" => {
-                    // gRPC requires TLS with ALPN=h2
-                    let tls_opts = TlsOptions {
-                        sni: self.sni.clone(),
-                        skip_cert_verify: self.skip_cert_verify,
-                        alpn: vec!["h2".to_string()],
-                        fingerprint: self.fingerprint.clone(),
-                    };
-                    let tls_stream = tls::wrap_tls(tcp_stream, &tls_opts)
-                        .await
-                        .context("Trojan: TLS handshake for gRPC failed")?;
-
-                    let service_name = self.grpc_service_name();
-                    let grpc_stream = grpc::connect_grpc(tls_stream, &service_name, &self.sni)
-                        .await
-                        .context("Trojan: gRPC connect failed")?;
-
-                    let header = encode_request(&self.password_hash, CMD_TCP, target);
-                    let trojan_stream = TrojanStream::new(grpc_stream, header);
-                    Ok(Box::new(trojan_stream))
-                }
-                "h2" => {
-                    // H2 requires TLS with ALPN=h2
-                    let tls_opts = TlsOptions {
-                        sni: self.sni.clone(),
-                        skip_cert_verify: self.skip_cert_verify,
-                        alpn: vec!["h2".to_string()],
-                        fingerprint: self.fingerprint.clone(),
-                    };
-                    let tls_stream = tls::wrap_tls(tcp_stream, &tls_opts)
-                        .await
-                        .context("Trojan: TLS handshake for H2 failed")?;
-
-                    let (host, path) = self.h2_host_path();
-                    let h2_stream = h2_transport::connect_h2(tls_stream, &host, &path)
-                        .await
-                        .context("Trojan: H2 connect failed")?;
-
-                    let header = encode_request(&self.password_hash, CMD_TCP, target);
-                    let trojan_stream = TrojanStream::new(h2_stream, header);
-                    Ok(Box::new(trojan_stream))
-                }
-                _ => {
-                    // TLS only (standard Trojan).
-                    let tls_opts = self.tls_options();
-                    let tls_stream = tls::wrap_tls(tcp_stream, &tls_opts)
-                        .await
-                        .context("Trojan: TLS handshake failed")?;
-
-                    let header = encode_request(&self.password_hash, CMD_TCP, target);
-                    let trojan_stream = TrojanStream::new(tls_stream, header);
-                    Ok(Box::new(trojan_stream))
-                }
-            }
+    /// The ALPN a given `network` + `alpn` combination ends up sending. Trojan
+    /// has no `tls:` option, so there is always a TLS layer.
+    fn effective_alpn(network: &str, alpn: &str) -> Vec<String> {
+        let yaml = format!(
+            r#"
+name: test
+type: trojan
+server: proxy.example.com
+port: 443
+password: secret
+network: {network}
+alpn: {alpn}
+"#
+        );
+        let config: ProxyConfig = serde_yaml::from_str(&yaml).unwrap();
+        match TrojanOutbound::new(&config)
+            .unwrap()
+            .security_for()
+            .unwrap()
+        {
+            SecuritySpec::Tls(opts) => opts.alpn,
+            SecuritySpec::None => panic!("Trojan always uses TLS"),
+            SecuritySpec::Reality(_) => panic!("no reality-opts in this config"),
         }
+    }
+
+    #[test]
+    fn ws_defaults_to_http11_only_when_alpn_is_unset() {
+        // mihomo compat: trojan.go:95-97 — DefaultWebsocketALPN, but an
+        // explicit `alpn` wins. This is where Trojan differs from VMess/VLESS,
+        // which override the config unconditionally.
+        assert_eq!(effective_alpn("ws", "[]"), vec!["http/1.1".to_string()]);
+        assert_eq!(
+            effective_alpn("ws", "[h2, http/1.1]"),
+            vec!["h2".to_string(), "http/1.1".to_string()]
+        );
+    }
+
+    #[test]
+    fn grpc_and_h2_force_h2_alpn() {
+        for network in ["grpc", "h2"] {
+            assert_eq!(
+                effective_alpn(network, "[http/1.1]"),
+                vec!["h2".to_string()],
+                "network {network}"
+            );
+        }
+    }
+
+    #[test]
+    fn tcp_keeps_the_config_alpn() {
+        assert_eq!(
+            effective_alpn("tcp", "[h2, http/1.1]"),
+            vec!["h2".to_string(), "http/1.1".to_string()]
+        );
+        assert!(effective_alpn("tcp", "[]").is_empty());
+    }
+
+    #[test]
+    fn reality_takes_precedence_over_tls() {
+        let yaml = r#"
+name: test
+type: trojan
+server: proxy.example.com
+port: 443
+password: secret
+network: grpc
+client-fingerprint: chrome
+reality-opts:
+  public-key: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+  short-id: 01020304
+"#;
+        let config: ProxyConfig = serde_yaml::from_str(yaml).unwrap();
+        let outbound = TrojanOutbound::new(&config).unwrap();
+        assert!(matches!(
+            outbound.security_for().unwrap(),
+            SecuritySpec::Reality(_)
+        ));
     }
 }

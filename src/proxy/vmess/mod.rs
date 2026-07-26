@@ -11,11 +11,8 @@ use crate::common::addr::Address;
 use crate::config::proxy::{GrpcOpts, H2Opts, ProxyConfig, WsOpts};
 use crate::dns::DnsResolver;
 use crate::proxy::{OutboundHandler, ProxyStream};
-use crate::transport::grpc;
-use crate::transport::h2_transport;
+use crate::transport::stack::{self, SecuritySpec, TransportSpec};
 use crate::transport::tcp::{self, ConnectOpts};
-use crate::transport::tls::{self, TlsOptions};
-use crate::transport::ws::{self, WsOptions};
 
 use crypto::VmessStream;
 use header::{encode_request_header, parse_uuid, VmessSecurity, CMD_TCP};
@@ -112,58 +109,51 @@ impl VmessOutbound {
         Ok(stream)
     }
 
-    /// Build TLS options.
-    fn tls_options(&self) -> TlsOptions {
-        TlsOptions {
-            sni: self.sni.clone(),
-            skip_cert_verify: self.skip_cert_verify,
-            alpn: self.alpn.clone(),
-            fingerprint: self.fingerprint.clone(),
-        }
+    /// The security + transport chain this config asks for.
+    fn transport_spec(&self) -> Result<TransportSpec> {
+        Ok(TransportSpec {
+            label: "VMess",
+            security: self.security_for(),
+            transport: stack::transport_kind(
+                &self.network,
+                &self.sni,
+                self.ws_opts.as_ref(),
+                self.grpc_opts.as_ref(),
+                self.h2_opts.as_ref(),
+                // VMess has no XHTTP transport in mihomo.
+                None,
+            )?,
+        })
     }
 
-    fn grpc_service_name(&self) -> String {
-        self.grpc_opts
-            .as_ref()
-            .and_then(|o| o.grpc_service_name.clone())
-            .unwrap_or_else(|| "GunService".to_string())
-    }
-
-    fn h2_host_path(&self) -> (String, String) {
-        let host = self
-            .h2_opts
-            .as_ref()
-            .and_then(|o| o.host.first().cloned())
-            .unwrap_or_else(|| self.sni.clone());
-        let path = self
-            .h2_opts
-            .as_ref()
-            .and_then(|o| o.path.clone())
-            .unwrap_or_else(|| "/".to_string());
-        (host, path)
-    }
-
-    /// Build WebSocket options from config.
-    fn build_ws_options(&self) -> WsOptions {
-        let mut ws_options = WsOptions {
-            host: self.sni.clone(),
-            path: "/".to_string(),
-            headers: Vec::new(),
-        };
-
-        if let Some(ref opts) = self.ws_opts {
-            if let Some(ref path) = opts.path {
-                ws_options.path = path.clone();
-            }
-            for (key, value) in &opts.headers {
-                ws_options.headers.push((key.clone(), value.clone()));
-                if key.to_lowercase() == "host" {
-                    ws_options.host = value.clone();
-                }
-            }
+    /// TLS or nothing — VMess has no Reality path in mihomo. Where TLS applies,
+    /// the transport dictates the ALPN.
+    fn security_for(&self) -> SecuritySpec {
+        // mihomo compat: every transport routes its TLS through
+        // `streamTLSConn` (`vmess.go`), whose whole body is inside
+        // `if v.option.TLS` — and gRPC's `gun.Config` gets a nil `tlsConfig`
+        // unless `option.TLS` (`vmess.go` NewVmess). So `tls: false` means
+        // plain TCP / ws / h2c / gRPC-over-h2c, never an implicit TLS layer.
+        if !self.tls {
+            return SecuritySpec::None;
         }
 
-        ws_options
+        let base = stack::tls_options(
+            &self.sni,
+            self.skip_cert_verify,
+            &self.alpn,
+            self.fingerprint.as_deref(),
+        );
+        SecuritySpec::Tls(match self.network.as_str() {
+            // mihomo compat: vmess.go:132 forces ALPN http/1.1 for WebSocket
+            // regardless of config `alpn` (WS needs HTTP/1.1).
+            "ws" => base.with_alpn(vec!["http/1.1".to_string()]),
+            // mihomo compat: `streamTLSConn(_, isH2: true)` overrides NextProtos
+            // with ["h2"] for h2, and NewVmess's gun config hardcodes the same
+            // for gRPC.
+            "grpc" | "h2" => base.with_alpn(vec!["h2".to_string()]),
+            _ => base,
+        })
     }
 
     /// Encode the VMess request header and wrap a transport stream into
@@ -210,84 +200,8 @@ impl OutboundHandler for VmessOutbound {
     ) -> Result<Box<dyn ProxyStream>> {
         let tcp_stream = self.dial_server(dns).await?;
 
-        match self.network.as_str() {
-            "ws" => {
-                // WebSocket transport (optionally over TLS).
-                if self.tls {
-                    // mihomo compat: vmess.go:132 forces ALPN http/1.1 for WebSocket
-                    // regardless of config `alpn` (WS needs HTTP/1.1).
-                    let tls_opts = self.tls_options().with_alpn(vec!["http/1.1".to_string()]);
-                    let tls_stream = tls::wrap_tls(tcp_stream, &tls_opts)
-                        .await
-                        .context("VMess: TLS handshake failed")?;
-
-                    let ws_opts = self.build_ws_options();
-                    let ws_stream = ws::wrap_ws(tls_stream, &ws_opts)
-                        .await
-                        .context("VMess: WebSocket upgrade failed")?;
-
-                    Ok(self.wrap_vmess(ws_stream, target))
-                } else {
-                    let ws_opts = self.build_ws_options();
-                    let ws_stream = ws::wrap_ws(tcp_stream, &ws_opts)
-                        .await
-                        .context("VMess: WebSocket upgrade failed")?;
-
-                    Ok(self.wrap_vmess(ws_stream, target))
-                }
-            }
-            "grpc" => {
-                // gRPC requires TLS with ALPN=h2
-                let tls_opts = TlsOptions {
-                    sni: self.sni.clone(),
-                    skip_cert_verify: self.skip_cert_verify,
-                    alpn: vec!["h2".to_string()],
-                    fingerprint: self.fingerprint.clone(),
-                };
-                let tls_stream = tls::wrap_tls(tcp_stream, &tls_opts)
-                    .await
-                    .context("VMess: TLS handshake for gRPC failed")?;
-
-                let service_name = self.grpc_service_name();
-                let grpc_stream = grpc::connect_grpc(tls_stream, &service_name, &self.sni)
-                    .await
-                    .context("VMess: gRPC connect failed")?;
-
-                Ok(self.wrap_vmess(grpc_stream, target))
-            }
-            "h2" => {
-                // H2 requires TLS with ALPN=h2
-                let tls_opts = TlsOptions {
-                    sni: self.sni.clone(),
-                    skip_cert_verify: self.skip_cert_verify,
-                    alpn: vec!["h2".to_string()],
-                    fingerprint: self.fingerprint.clone(),
-                };
-                let tls_stream = tls::wrap_tls(tcp_stream, &tls_opts)
-                    .await
-                    .context("VMess: TLS handshake for H2 failed")?;
-
-                let (host, path) = self.h2_host_path();
-                let h2_stream = h2_transport::connect_h2(tls_stream, &host, &path)
-                    .await
-                    .context("VMess: H2 connect failed")?;
-
-                Ok(self.wrap_vmess(h2_stream, target))
-            }
-            _ => {
-                // Plain TCP or TLS-only transport.
-                if self.tls {
-                    let tls_opts = self.tls_options();
-                    let tls_stream = tls::wrap_tls(tcp_stream, &tls_opts)
-                        .await
-                        .context("VMess: TLS handshake failed")?;
-
-                    Ok(self.wrap_vmess(tls_stream, target))
-                } else {
-                    Ok(self.wrap_vmess(tcp_stream, target))
-                }
-            }
-        }
+        let stream = stack::wrap_transport(tcp_stream, self.transport_spec()?).await?;
+        Ok(self.wrap_vmess(stream, target))
     }
 }
 
@@ -441,5 +355,61 @@ mod tests {
         config.network = None;
         let outbound = VmessOutbound::new(&config).unwrap();
         assert_eq!(outbound.network, "tcp");
+    }
+
+    /// The ALPN a given `network` + `tls` + `alpn` combination ends up sending,
+    /// or `None` when no TLS layer is used at all.
+    fn effective_alpn(network: &str, tls: bool, alpn: &[&str]) -> Option<Vec<String>> {
+        let mut config = make_vmess_config();
+        config.network = Some(network.to_string());
+        config.tls = Some(tls);
+        config.alpn = Some(alpn.iter().map(|s| s.to_string()).collect());
+        match VmessOutbound::new(&config).unwrap().security_for() {
+            SecuritySpec::Tls(opts) => Some(opts.alpn),
+            SecuritySpec::None => None,
+            SecuritySpec::Reality(_) => panic!("VMess has no Reality path"),
+        }
+    }
+
+    #[test]
+    fn ws_forces_http11_alpn_over_the_config() {
+        // mihomo compat: vmess.go:132.
+        assert_eq!(
+            effective_alpn("ws", true, &["h2", "http/1.1"]),
+            Some(vec!["http/1.1".to_string()])
+        );
+    }
+
+    #[test]
+    fn grpc_and_h2_force_h2_alpn() {
+        for network in ["grpc", "h2"] {
+            assert_eq!(
+                effective_alpn(network, true, &["http/1.1"]),
+                Some(vec!["h2".to_string()]),
+                "network {network}"
+            );
+        }
+    }
+
+    #[test]
+    fn tcp_keeps_the_config_alpn() {
+        assert_eq!(
+            effective_alpn("tcp", true, &["h2", "http/1.1"]),
+            Some(vec!["h2".to_string(), "http/1.1".to_string()])
+        );
+    }
+
+    #[test]
+    fn tls_false_adds_no_security_layer_for_any_network() {
+        // mihomo compat: `streamTLSConn` (vmess.go) is a no-op unless
+        // `option.TLS`, and NewVmess leaves gun's tlsConfig nil — so gRPC and
+        // H2 run over h2c, they do not silently gain TLS.
+        for network in ["tcp", "ws", "grpc", "h2"] {
+            assert_eq!(
+                effective_alpn(network, false, &[]),
+                None,
+                "network {network}"
+            );
+        }
     }
 }
