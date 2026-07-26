@@ -668,9 +668,17 @@ mod tests {
         let result = encode_request_header(&uuid, CMD_TCP, VmessSecurity::Aes128Gcm, &target);
 
         // Wire = authID(16) + encLen(2+16) + connNonce(8) + encPayload(N+16).
-        // Minimal plaintext ("example.com"=11, padding 0):
-        // 1+16+16+1+1+1+1+1 + (2+1+1+11) + 0 + 4 = 58; wire >= 16+18+8+(58+16)=116.
-        assert!(result.header_bytes.len() >= 16 + 18 + 8 + (58 + 16));
+        // Plaintext for "example.com" (11 bytes):
+        //   1+16+16+1+1+1+1+1 + (2+1+1+11) + padding + 4 = 57 + padding
+        // and `padding_len` is `rng % 16`, so the wire length is pinned to
+        // 16+18+8+(57+16) = 115 at padding 0 and 130 at padding 15. Both ends
+        // are asserted: a loose lower bound alone was flaky whenever the RNG
+        // handed back a padding length of 0.
+        assert!(
+            (115..=130).contains(&result.header_bytes.len()),
+            "unexpected wire length {}",
+            result.header_bytes.len()
+        );
         assert_ne!(result.body_key, [0u8; 16]);
         assert_ne!(result.body_iv, [0u8; 16]);
     }
