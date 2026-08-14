@@ -22,9 +22,9 @@ use tokio::sync::{mpsc, Mutex as TokioMutex, Notify};
 use tracing::{debug, error, warn};
 
 use super::frame::{
-    decode_string_map, encode_header, encode_string_map, Header, CMD_ALERT, CMD_FIN,
-    CMD_HEART_REQUEST, CMD_HEART_RESPONSE, CMD_PSH, CMD_SERVER_SETTINGS, CMD_SETTINGS, CMD_SYN,
-    CMD_SYNACK, CMD_UPDATE_PADDING_SCHEME, CMD_WASTE, HEADER_OVERHEAD,
+    decode_string_map, encode_data_frames, encode_header, encode_string_map, Header, CMD_ALERT,
+    CMD_FIN, CMD_HEART_REQUEST, CMD_HEART_RESPONSE, CMD_PSH, CMD_SERVER_SETTINGS, CMD_SETTINGS,
+    CMD_SYN, CMD_SYNACK, CMD_UPDATE_PADDING_SCHEME, CMD_WASTE, HEADER_OVERHEAD,
 };
 use super::padding::{PaddingFactory, CHECK_MARK};
 
@@ -111,12 +111,21 @@ impl SessionInner {
 
     /// Write a data frame for `sid`. Returns the number of payload bytes
     /// written (equal to `data.len()` on success).
+    ///
+    /// mihomo compat: session.go writeDataFrame — a write longer than
+    /// [`MAX_FRAME_DATA_LEN`] is split into several PSH frames, since the
+    /// header length field is a u16. The whole frame sequence goes out in ONE
+    /// `write_conn_framed` call so a single stream write stays contiguous
+    /// relative to other streams' data and to control frames.
     pub async fn write_data_frame(self: &Arc<Self>, sid: u32, data: &[u8]) -> io::Result<usize> {
         if self.is_closed() {
             return Err(io::Error::new(io::ErrorKind::BrokenPipe, "session closed"));
         }
-        let frame = self.build_frame(CMD_PSH, sid, data);
-        self.write_conn_framed(&frame).await?;
+        if data.is_empty() {
+            return Ok(0);
+        }
+        self.write_conn_framed(&encode_data_frames(sid, data))
+            .await?;
         Ok(data.len())
     }
 

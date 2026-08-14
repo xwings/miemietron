@@ -1023,9 +1023,11 @@ impl ConnectionManager {
             use tokio::io::AsyncReadExt;
             let mut tmp = [0u8; SNIFF_PEEK_SIZE];
             // mihomo compat: dispatcher.go sniffDomain — the first peek has a
-            // 1s deadline; a timeout means the peer sent nothing (likely a
-            // server-speaks-first protocol): cache the failure, log, and CLOSE
-            // the connection ("Consider adding skip").
+            // 1s deadline. A timeout means the peer sent nothing yet, which is
+            // valid for a server-speaks-first protocol (SMTP/IMAP/FTP/SSH/…),
+            // so sniffing must NOT close the connection merely because this
+            // deadline expired: fall through and relay without a sniffed
+            // domain. Failure accounting belongs to the shared Fail arm below.
             let first = tokio::time::timeout(
                 SNIFF_PEEK_TIMEOUT,
                 AsyncReadExt::read(&mut *stream, &mut tmp),
@@ -1042,12 +1044,8 @@ impl ConnectionManager {
                     sniffer::SniffAttempt::Fail
                 }
                 Err(_) => {
-                    sniff_cache.record_failure(dst);
-                    tracing::error!(
-                        "[Sniffer] [{}] may not have any sent data, Consider adding skip",
-                        dst.ip()
-                    );
-                    return None;
+                    debug!("[Sniffer] [{}] the data length not enough", dst.ip());
+                    sniffer::SniffAttempt::Fail
                 }
             };
 

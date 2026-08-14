@@ -1345,7 +1345,7 @@ dependencies = [
 
 [[package]]
 name = "miemietron"
-version = "0.2.12-dev"
+version = "0.2.13-dev"
 dependencies = [
  "aes",
  "aes-gcm",
