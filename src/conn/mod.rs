@@ -237,8 +237,14 @@ async fn resolve_ip_on_demand(
         && rules.needs_ip_resolution(rule_meta)
     {
         if let Some(host) = rule_meta.domain.clone() {
-            if let Ok(ip) = dns.resolve_real_ip(&host).await {
-                rule_meta.dst_ip = Some(ip);
+            match dns.resolve_real_ip(&host).await {
+                Ok(ip) => rule_meta.dst_ip = Some(ip),
+                // mihomo compat: match() ignores the error and falls through
+                // with a nil dst_ip. Log it — a failure here silently disables
+                // every destination-IP rule (GEOIP / IP-CIDR / IP-SUFFIX /
+                // IP-ASN) for this connection, so domestic traffic that should
+                // hit `GEOIP,CN,DIRECT` falls to the catch-all instead.
+                Err(e) => debug!("resolve-on-demand failed for {}: {}", host, e),
             }
         }
     }

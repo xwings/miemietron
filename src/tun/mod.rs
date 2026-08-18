@@ -42,10 +42,13 @@ pub async fn run_tun(
     // mihomo compat: with a userspace stack + auto-route, the proxy's own
     // outbound sockets must bypass the TUN. mihomo binds them to the physical
     // default interface (dialer.DefaultInterfaceFinder), not a firewall mark.
+    // mihomo compat: dialer.go:89-95 — an explicit `interface-name` outranks the
+    // finder, so the detected value goes in its own slot rather than overwriting
+    // the configured one.
     if config.auto_detect_interface {
         if let Some(iface) = route::detect_default_interface().await {
             info!("Auto-detected outbound interface: {}", iface);
-            crate::transport::tcp::set_default_outbound_interface(Some(iface));
+            crate::transport::tcp::set_detected_outbound_interface(Some(iface));
         } else {
             tracing::warn!("auto-detect-interface enabled but could not detect default interface");
         }

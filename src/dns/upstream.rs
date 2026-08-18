@@ -3,7 +3,7 @@ use base64::Engine;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpStream, UdpSocket};
+use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use tracing::{debug, warn};
 
@@ -488,13 +488,13 @@ async fn resolve_udp(domain: &str, server: &str, qtype: u16) -> Result<(IpAddr, 
         .parse()
         .map_err(|e| anyhow::anyhow!("invalid DNS server address {server}: {e}"))?;
 
-    let socket = UdpSocket::bind("0.0.0.0:0").await?;
-
-    // mihomo compat: DNS sockets go through the dialer which applies
-    // DefaultRoutingMark (SO_MARK) only when routing-mark is configured.
-    // When routing-mark is not set, GID 65534 (set by OpenClash via procd)
-    // is the sole firewall bypass mechanism. Do NOT hardcode SO_MARK here —
-    // it interferes with GID-only bypass on some OpenClash configurations.
+    // mihomo compat: DNS sockets go through the dialer, which binds them to
+    // DefaultInterface (dialer.go:183-189) and applies DefaultRoutingMark
+    // (SO_MARK) only when routing-mark is configured. When routing-mark is not
+    // set, GID 65534 (set by OpenClash via procd) is the sole firewall bypass
+    // mechanism. Do NOT hardcode SO_MARK here — it interferes with GID-only
+    // bypass on some OpenClash configurations.
+    let socket = crate::transport::tcp::bind_udp_default_interface()?;
 
     socket.connect(addr).await?;
 
@@ -602,14 +602,19 @@ async fn resolve_dot(domain: &str, server: &str, qtype: u16) -> Result<(IpAddr, 
         }
     }
 
-    // No pooled connection, create a new one
-    let tcp_stream = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        TcpStream::connect(&sock_addr),
-    )
+    // No pooled connection, create a new one.
+    //
+    // mihomo compat: DoT dials through the dialer (dns/client.go:68), so it
+    // binds to the global outbound interface like every other outbound.
+    // No hardcoded SO_MARK — GID 65534 handles bypass.
+    let tcp_stream = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let target = tokio::net::lookup_host(&sock_addr)
+            .await?
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("no address for DoT server {sock_addr}"))?;
+        crate::transport::tcp::connect(target, &crate::transport::tcp::ConnectOpts::default()).await
+    })
     .await??;
-
-    // mihomo compat: no hardcoded SO_MARK — GID 65534 handles bypass.
 
     let tls_opts = TlsOptions {
         sni: sni.clone(),

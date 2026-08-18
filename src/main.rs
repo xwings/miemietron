@@ -377,6 +377,10 @@ impl AppState {
             }
         }
 
+        // mihomo compat: executor.go:412 — re-apply the global outbound interface
+        // on reload, clearing it when the new config drops the key.
+        transport::tcp::set_default_outbound_interface(new_config.interface_name.clone());
+
         *self.dns_resolver.write() = Arc::new(new_dns);
         *self.rule_engine.write() = new_rules;
         *self.proxy_manager.write() = Arc::new(new_proxies);
@@ -654,6 +658,15 @@ impl Engine {
         // mihomo compat: inbound listeners keep-alive follows disable-keep-alive
         // (keepalive.SetDisableKeepAlive applies to inbound ListenConfig too).
         transport::tcp::set_inbound_keepalive_disabled(self.config.disable_keep_alive);
+
+        // mihomo compat: executor.go:412 `dialer.DefaultInterface.Store(general.Interface)`
+        // — the top-level `interface-name` is the global fallback every outbound
+        // dial binds to when it doesn't name its own interface (dialer.go:89-91).
+        // Must be set before any listener or the TUN starts.
+        if let Some(iface) = self.config.interface_name.as_deref() {
+            info!("Binding outbound sockets to interface {}", iface);
+        }
+        transport::tcp::set_default_outbound_interface(self.config.interface_name.clone());
 
         // Build proxy state store (shared between ProxyManager and AppState)
         let proxy_state_store = Arc::new(proxy_group::proxy_state::ProxyStateStore::new());

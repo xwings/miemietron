@@ -432,7 +432,9 @@ impl DnsResolver {
     pub async fn forward_raw_query(&self, query: &[u8]) -> Result<Vec<u8>> {
         let server = upstream::plain_udp_server(&self.config)
             .ok_or_else(|| anyhow::anyhow!("no plain-UDP nameserver for passthrough"))?;
-        let socket = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
+        // mihomo compat: the passthrough relay dials through the dialer too, so
+        // it binds to the global outbound interface (dialer.go:183-189).
+        let socket = crate::transport::tcp::bind_udp_default_interface()?;
         socket.connect(&server).await?;
         socket.send(query).await?;
         let mut buf = vec![0u8; 4096];
