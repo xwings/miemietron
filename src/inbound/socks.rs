@@ -8,15 +8,18 @@ use anyhow::{anyhow, Result};
 use dashmap::DashMap;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, warn};
 
 use crate::common::addr::Address;
-use crate::conn::ConnectionManager;
-use crate::proxy::OutboundPacketConn;
-use crate::rules::Action;
+use crate::conn::{
+    udp::{self, UdpInbound},
+    ConnectionManager,
+};
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 // SOCKS5 constants
 const SOCKS5_VERSION: u8 = 0x05;
@@ -174,22 +177,12 @@ async fn handle_socks5(
 
             // Per-session NAT table: keyed by (client_addr, target) to reuse
             // OutboundPacketConn across datagrams to the same destination.
-            let nat_table: Arc<DashMap<(SocketAddr, Address), SocksUdpSession>> =
+            let nat_table: Arc<DashMap<(SocketAddr, Address), mpsc::Sender<Vec<u8>>>> =
                 Arc::new(DashMap::new());
             let timeout_dur = Duration::from_secs(60);
 
-            // Spawn a reaper task to clean up idle sessions
-            let reaper_table = nat_table.clone();
-            let reaper_handle = tokio::spawn(async move {
-                let mut interval = tokio::time::interval(Duration::from_secs(30));
-                loop {
-                    interval.tick().await;
-                    let now = Instant::now();
-                    reaper_table.retain(|_key, session: &mut SocksUdpSession| {
-                        now.duration_since(session.last_active) < timeout_dur
-                    });
-                }
-            });
+            let cancelled = CancellationToken::new();
+            let relay_cancelled = cancelled.clone();
 
             // Spawn the main UDP relay task
             let cm = conn_manager.clone();
@@ -260,115 +253,48 @@ async fn handle_socks5(
 
                     let nat_key = (src, target.clone());
 
-                    // Check if we already have a session for this (src, target) pair
-                    if let Some(mut session) = nat_table.get_mut(&nat_key) {
-                        session.last_active = Instant::now();
-                        let pc = session.outbound.clone();
-                        let target_clone = target.clone();
-                        tokio::spawn(async move {
-                            if let Err(e) = pc.send_to(&data, &target_clone).await {
-                                debug!("SOCKS5 UDP send error: {}", e);
-                            }
-                        });
+                    // Register the queue before spawning the worker. All
+                    // fragments of a handshake must reach the same sniffer.
+                    let Some((tx, rx)) = udp::enqueue(&nat_table, nat_key.clone(), data) else {
                         continue;
-                    }
-
-                    // Save the raw SOCKS5 header (atyp + addr portion) for
-                    // building response headers on the reverse path — only
-                    // needed when creating a new session.
-                    let header_bytes = buf[3..data_offset].to_vec();
-
-                    // New session: resolve action through rule engine and create
-                    // OutboundPacketConn
-                    let cm_ref = cm.clone();
-                    let nat_ref = nat_table.clone();
-                    let sock_ref = udp_socket.clone();
-
+                    };
+                    let cm = cm.clone();
+                    let nat = nat_table.clone();
+                    let socket = udp_socket.clone();
+                    let cancel = relay_cancelled.clone();
+                    let header = buf[3..data_offset].to_vec();
+                    let domain = match target {
+                        Address::Domain(host, _) => Some(host),
+                        Address::Ip(_) => None,
+                    };
                     tokio::spawn(async move {
-                        match create_socks_udp_session(src, dst_sockaddr, &data, &target, &cm_ref)
-                            .await
-                        {
-                            Ok(outbound) => {
-                                let pc_rev = outbound.clone();
-                                // Re-check under the entry lock: a concurrent
-                                // datagram may have registered a session for
-                                // this key while we were dialing. Keep the
-                                // registered one and drop ours (the datagram
-                                // already went out through our outbound).
-                                match nat_ref.entry(nat_key.clone()) {
-                                    dashmap::mapref::entry::Entry::Occupied(_) => return,
-                                    dashmap::mapref::entry::Entry::Vacant(v) => {
-                                        v.insert(SocksUdpSession {
-                                            outbound,
-                                            last_active: Instant::now(),
-                                        });
-                                    }
+                        let relay = cm.handle_udp(
+                            UdpInbound {
+                                src,
+                                dst: dst_sockaddr,
+                                conn_type: "socks5",
+                                domain,
+                            },
+                            rx,
+                            timeout_dur,
+                            |data| {
+                                let socket = socket.clone();
+                                let mut response =
+                                    Vec::with_capacity(3 + header.len() + data.len());
+                                response.extend_from_slice(&[0, 0, 0]);
+                                response.extend_from_slice(&header);
+                                response.extend_from_slice(&data);
+                                async move {
+                                    socket.send_to(&response, src).await?;
+                                    Ok(())
                                 }
-
-                                // Spawn reverse-path relay: outbound -> client
-                                let nat_rev = nat_ref.clone();
-                                let nat_key_rev = nat_key;
-                                let header_for_reply = header_bytes;
-                                tokio::spawn(async move {
-                                    let mut rbuf = vec![0u8; 65535];
-                                    loop {
-                                        let recv = tokio::time::timeout(
-                                            timeout_dur,
-                                            pc_rev.recv_from(&mut rbuf),
-                                        )
-                                        .await;
-
-                                        match recv {
-                                            Ok(Ok((rn, _from))) => {
-                                                if rn == 0 {
-                                                    break;
-                                                }
-                                                // Update last_active timestamp
-                                                if let Some(mut s) = nat_rev.get_mut(&nat_key_rev) {
-                                                    s.last_active = Instant::now();
-                                                }
-                                                // Build SOCKS5 UDP response:
-                                                // RSV(0x0000) + FRAG(0x00) + ATYP + ADDR + PORT + DATA
-                                                let mut reply = Vec::with_capacity(
-                                                    3 + header_for_reply.len() + rn,
-                                                );
-                                                reply.extend_from_slice(&[0, 0, 0]); // RSV + FRAG
-                                                reply.extend_from_slice(&header_for_reply); // ATYP + addr + port
-                                                reply.extend_from_slice(&rbuf[..rn]);
-                                                if let Err(e) = sock_ref.send_to(&reply, src).await
-                                                {
-                                                    debug!("SOCKS5 UDP reverse send error: {}", e);
-                                                    break;
-                                                }
-                                            }
-                                            Ok(Err(e)) => {
-                                                debug!("SOCKS5 UDP proxy recv error: {}", e);
-                                                break;
-                                            }
-                                            Err(_) => {
-                                                debug!(
-                                                    "SOCKS5 UDP session {} -> {} timed out",
-                                                    src, nat_key_rev.1
-                                                );
-                                                break;
-                                            }
-                                        }
-                                    }
-                                    // Remove only OUR session — a session
-                                    // recreated for this key after we exit
-                                    // must not be torn down by us.
-                                    nat_rev.remove_if(&nat_key_rev, |_, s| {
-                                        Arc::ptr_eq(&s.outbound, &pc_rev)
-                                    });
-                                });
-                            }
-                            Err(e) => {
-                                debug!(
-                                    "SOCKS5 UDP session creation failed for {} -> {}: {}",
-                                    src, target, e
-                                );
-                            }
+                            },
+                        );
+                        tokio::select! {
+                            result = relay => if let Err(error) = result { debug!("SOCKS5 UDP session {} error: {}", src, error); },
+                            _ = cancel.cancelled() => {},
                         }
+                        nat.remove_if(&nat_key, |_, existing| existing.same_channel(&tx));
                     });
                 }
             });
@@ -377,7 +303,7 @@ async fn handle_socks5(
             let mut ctrl_buf = [0u8; 1];
             let _ = stream.read(&mut ctrl_buf).await;
             relay_handle.abort();
-            reaper_handle.abort();
+            cancelled.cancel();
         }
         _ => {
             send_reply(&mut stream, REP_CMD_NOT_SUPPORTED, &dst).await?;
@@ -386,79 +312,6 @@ async fn handle_socks5(
     }
 
     Ok(())
-}
-
-/// A live SOCKS5 UDP session tracked in the NAT table.
-struct SocksUdpSession {
-    /// Outbound channel (trait object — works for DIRECT, SS, or any proxy).
-    outbound: Arc<dyn OutboundPacketConn>,
-    /// Last time a datagram was seen on this session.
-    last_active: Instant,
-}
-
-/// Create a new SOCKS5 UDP session: perform rule matching via the
-/// ConnectionManager, obtain an OutboundPacketConn via the handler's
-/// `connect_datagram`, and send the initial datagram.
-///
-/// Mirrors the TUN module's `create_udp_session` but for SOCKS5 inbound.
-async fn create_socks_udp_session(
-    src: SocketAddr,
-    dst: SocketAddr,
-    initial_data: &[u8],
-    target: &Address,
-    conn_manager: &ConnectionManager,
-) -> Result<Arc<dyn OutboundPacketConn>> {
-    // Run rule engine to decide action. Domain targets pass the parsed host
-    // through so DOMAIN rules can match (dst is a 0.0.0.0 placeholder then).
-    let domain_override = match target {
-        Address::Domain(host, _) => Some(host.clone()),
-        Address::Ip(_) => None,
-    };
-    let (action, domain) = conn_manager
-        .resolve_udp_action(src, dst, "socks5", domain_override)
-        .await;
-
-    let dns = conn_manager.dns_resolver();
-    let proxies = conn_manager.proxy_manager();
-
-    debug!(
-        "SOCKS5 UDP {} -> {} ({}) => {:?}",
-        src,
-        target,
-        domain.as_deref().unwrap_or(""),
-        action
-    );
-
-    match action {
-        Action::Reject | Action::RejectDrop => Err(anyhow!(
-            "SOCKS5 UDP packet rejected by rule engine: {src} -> {dst}"
-        )),
-
-        Action::Direct => {
-            let handler = proxies
-                .resolve("DIRECT")
-                .ok_or_else(|| anyhow!("DIRECT handler not found"))?;
-
-            let pc: Arc<dyn OutboundPacketConn> =
-                Arc::from(handler.connect_datagram(target, dns).await?);
-
-            debug!("SOCKS5 UDP DIRECT session: {} -> {}", src, target);
-
-            pc.send_to(initial_data, target).await?;
-            Ok(pc)
-        }
-
-        Action::Proxy(ref proxy_name) => {
-            // No silent DIRECT fallback — see ProxyManager::dial_proxy_udp.
-            let pc = proxies.dial_proxy_udp(proxy_name, target, dns).await?;
-            debug!(
-                "SOCKS5 UDP proxy '{}' session: {} -> {}",
-                proxy_name, src, target
-            );
-            pc.send_to(initial_data, target).await?;
-            Ok(pc)
-        }
-    }
 }
 
 /// Read a SOCKS5 address (ATYP + addr + port).

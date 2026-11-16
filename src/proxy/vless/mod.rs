@@ -1,22 +1,24 @@
 pub mod header;
+mod packet;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use tokio::net::TcpStream;
 use tracing::debug;
 
 use crate::common::addr::Address;
 use crate::config::proxy::{GrpcOpts, H2Opts, ProxyConfig, RealityOpts, WsOpts};
 use crate::dns::DnsResolver;
-use crate::proxy::{OutboundHandler, ProxyStream};
+use crate::proxy::{OutboundHandler, OutboundPacketConn, ProxyStream};
 use crate::transport::fingerprint::TlsFingerprint;
 use crate::transport::reality::RealityConfig;
 use crate::transport::stack::{self, SecuritySpec, TransportSpec};
 use crate::transport::tcp::{self, ConnectOpts};
 use crate::transport::xhttp::XHttpConfig;
 
-use header::{encode_request_with_flow, parse_uuid, VlessStream, CMD_TCP};
+use header::{encode_request_with_flow, parse_uuid, VlessStream, CMD_TCP, CMD_UDP};
 
 /// VLESS outbound proxy handler.
 pub struct VlessOutbound {
@@ -129,8 +131,6 @@ impl OutboundHandler for VlessOutbound {
     }
 
     fn supports_udp(&self) -> bool {
-        // UDP relay (connect_datagram) is not yet implemented for VLESS; this
-        // flag only mirrors config, so requesting UDP errors at runtime.
         self.udp
     }
 
@@ -144,6 +144,36 @@ impl OutboundHandler for VlessOutbound {
 
         let stream = stack::wrap_transport(tcp_stream, self.transport_spec()?).await?;
         Ok(Box::new(VlessStream::new(stream, header)))
+    }
+
+    async fn connect_datagram(
+        &self,
+        target: &Address,
+        dns: Arc<DnsResolver>,
+    ) -> Result<Box<dyn OutboundPacketConn>> {
+        if !self.udp {
+            anyhow::bail!("VLESS: UDP is disabled");
+        }
+        // Vision UDP uses XUDP/mux framing in mihomo. Sending ordinary UDP
+        // framing with a Vision addon would produce an incompatible stream.
+        if self.flow.as_deref().is_some_and(|flow| !flow.is_empty()) {
+            anyhow::bail!("VLESS: UDP with XTLS flow requires XUDP, which is not implemented");
+        }
+        // mihomo compat: ListenPacketContext resolves UDP destinations before
+        // creating its fixed-destination packet connection.
+        let remote = match target {
+            Address::Domain(host, port) => {
+                Address::ip(SocketAddr::new(dns.resolve_real_ip(host).await?, *port))
+            }
+            Address::Ip(_) => target.clone(),
+        };
+        let tcp_stream = self.dial_server(&dns).await?;
+        let stream = stack::wrap_transport(tcp_stream, self.transport_spec()?).await?;
+        let header = encode_request_with_flow(&self.uuid, CMD_UDP, &remote, None);
+        Ok(Box::new(packet::VlessPacketConn::new(
+            VlessStream::new(stream, header),
+            remote,
+        )))
     }
 }
 
@@ -244,6 +274,52 @@ impl VlessOutbound {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn udp_connect_uses_datagram_command_and_honors_disabled_flag() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config: ProxyConfig = serde_yaml::from_str(&format!(
+            "name: udp\ntype: vless\nserver: 127.0.0.1\nport: {}\nuuid: 11111111-2222-3333-4444-555555555555\nudp: false\n",
+            listener.local_addr().unwrap().port()
+        )).unwrap();
+        let target = Address::ip("1.2.3.4:443".parse().unwrap());
+        let dns = Arc::new(
+            DnsResolver::new(&crate::config::DnsConfig::default())
+                .await
+                .unwrap(),
+        );
+        assert!(VlessOutbound::new(&config)
+            .unwrap()
+            .connect_datagram(&target, dns.clone())
+            .await
+            .is_err());
+
+        config.udp = Some(true);
+        let peer = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 30];
+            stream.read_exact(&mut request).await.unwrap();
+            assert_eq!(
+                &request[17..],
+                b"\x00\x02\x01\xbb\x01\x01\x02\x03\x04\x00\x02hi"
+            );
+            stream.write_all(b"\x00\x00\x00\x02ok").await.unwrap();
+        });
+        let packets = VlessOutbound::new(&config)
+            .unwrap()
+            .connect_datagram(&target, dns)
+            .await
+            .unwrap();
+        packets.send_to(b"hi", &target).await.unwrap();
+        let mut buf = [0; 16];
+        let (n, from) = packets.recv_from(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"ok");
+        assert_eq!(from, target);
+        peer.await.unwrap();
+    }
 
     fn parse_xhttp(alpn: &str) -> ProxyConfig {
         serde_yaml::from_str(&format!(

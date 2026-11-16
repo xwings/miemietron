@@ -1,3 +1,5 @@
+pub mod udp;
+
 use anyhow::Result;
 use dashmap::DashMap;
 use pin_project_lite::pin_project;
@@ -550,6 +552,36 @@ async fn detect_process(
     }
 }
 
+fn hosts_ip(
+    config: &crate::config::MiemieConfig,
+    dns: &crate::dns::DnsResolver,
+    domain: Option<&str>,
+) -> Option<std::net::IpAddr> {
+    let domain = domain?;
+    config
+        .hosts
+        .iter()
+        .find(|(host, _)| host.eq_ignore_ascii_case(domain))
+        .and_then(|(_, ip)| ip.parse().ok())
+        .filter(|ip| !dns.is_fake_ip(ip))
+}
+
+fn sniff_tcp(
+    data: &[u8],
+    config: &crate::config::SnifferConfig,
+    port: u16,
+) -> sniffer::SniffAttempt {
+    let protocol = if data.first() == Some(&0x16) {
+        "TLS"
+    } else {
+        "HTTP"
+    };
+    if config.protocol_override(protocol, port).is_none() {
+        return sniffer::SniffAttempt::Fail;
+    }
+    sniffer::sniff_domain_ex(data)
+}
+
 /// Maximum number of bytes to peek for sniffing (TLS ClientHello / HTTP headers).
 const SNIFF_PEEK_SIZE: usize = 1024;
 
@@ -815,13 +847,7 @@ impl ConnectionManager {
         // here; the IP is used both for rule matching (set BEFORE matching,
         // tunnel.go:329-332, so IP-CIDR/GEOIP rules match the hosts-mapped
         // address) and for the dial target override below.
-        let hosts_ip: Option<std::net::IpAddr> = domain.as_deref().and_then(|d| {
-            config
-                .hosts
-                .get(&d.to_lowercase())
-                .and_then(|s| s.parse::<std::net::IpAddr>().ok())
-                .filter(|ip| !dns.is_fake_ip(ip))
-        });
+        let hosts_ip = hosts_ip(&config, &dns, domain.as_deref());
 
         let mut rule_meta = RuleMetadata {
             domain: domain.clone(),
@@ -988,7 +1014,7 @@ impl ConnectionManager {
         let domain_from_mapping = domain.is_some() && !domain_from_inbound && !is_fakeip_dst;
 
         let sniff_cfg = config.sniffer.as_ref();
-        let sniff_override = sniff_cfg.and_then(|s| s.should_sniff(dst.port()));
+        let sniff_enabled = sniff_cfg.is_some_and(|s| s.tcp_enabled(dst.port()));
 
         // mihomo compat: check if the existing domain is in the force-domain list.
         // If so, never skip sniffing and never cache failures.
@@ -1025,7 +1051,7 @@ impl ConnectionManager {
         // Set when the sniffed host replaces the metadata host — mihomo's
         // replaceDomain also blanks DstIP so rules match the new domain.
         let mut sniff_overrode = false;
-        if sniff_override.is_some() && should_override && !skip_sniff {
+        if sniff_enabled && should_override && !skip_sniff {
             use tokio::io::AsyncReadExt;
             let mut tmp = [0u8; SNIFF_PEEK_SIZE];
             // mihomo compat: dispatcher.go sniffDomain — the first peek has a
@@ -1043,7 +1069,7 @@ impl ConnectionManager {
                 Ok(Ok(0)) => sniffer::SniffAttempt::Fail,
                 Ok(Ok(n)) => {
                     peek_buf.extend_from_slice(&tmp[..n]);
-                    sniffer::sniff_domain_ex(&peek_buf)
+                    sniff_tcp(&peek_buf, sniff_cfg.unwrap(), dst.port())
                 }
                 Ok(Err(e)) => {
                     debug!("Sniff peek read failed: {}", e);
@@ -1055,31 +1081,29 @@ impl ConnectionManager {
                 }
             };
 
-            // mihomo compat: on errNeedAtLeastData, peek again with a fresh 1s
-            // deadline until the needed length is buffered, then re-sniff once.
-            if let sniffer::SniffAttempt::NeedMore(needed) = verdict {
-                let needed = needed.min(5 + 16384 + 256); // TLS record cap
-                let deadline = tokio::time::Instant::now() + SNIFF_PEEK_TIMEOUT;
-                while peek_buf.len() < needed {
-                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-                    if remaining.is_zero() {
+            // All further reads share one deadline and a bounded buffer.
+            // TLS records, HTTP headers and h2 CONTINUATION frames may each
+            // require several reads before the domain becomes available.
+            let deadline = tokio::time::Instant::now() + SNIFF_PEEK_TIMEOUT;
+            while let sniffer::SniffAttempt::NeedMore(needed) = verdict {
+                if needed <= peek_buf.len() || needed > 64 * 1024 {
+                    verdict = sniffer::SniffAttempt::Fail;
+                    break;
+                }
+                let limit = (needed - peek_buf.len()).min(tmp.len());
+                match tokio::time::timeout_at(
+                    deadline,
+                    AsyncReadExt::read(&mut *stream, &mut tmp[..limit]),
+                )
+                .await
+                {
+                    Ok(Ok(0)) | Ok(Err(_)) | Err(_) => {
+                        verdict = sniffer::SniffAttempt::Fail;
                         break;
                     }
-                    match tokio::time::timeout(
-                        remaining,
-                        AsyncReadExt::read(&mut *stream, &mut tmp),
-                    )
-                    .await
-                    {
-                        Ok(Ok(0)) => break,
-                        Ok(Ok(n)) => peek_buf.extend_from_slice(&tmp[..n]),
-                        _ => break,
-                    }
+                    Ok(Ok(n)) => peek_buf.extend_from_slice(&tmp[..n]),
                 }
-                verdict = match sniffer::sniff_domain_ex(&peek_buf) {
-                    sniffer::SniffAttempt::NeedMore(_) => sniffer::SniffAttempt::Fail,
-                    v => v,
-                };
+                verdict = sniff_tcp(&peek_buf, sniff_cfg.unwrap(), dst.port());
             }
 
             match verdict {
@@ -1094,7 +1118,15 @@ impl ConnectionManager {
                             .unwrap_or(false);
                     if can_replace {
                         sniff_cache.record_success(dst);
-                        let override_dst = sniff_override.unwrap_or(false);
+                        let protocol = if peek_buf.first() == Some(&0x16) {
+                            "TLS"
+                        } else {
+                            "HTTP"
+                        };
+                        let override_dst = sniff_cfg
+                            .unwrap()
+                            .protocol_override(protocol, dst.port())
+                            .unwrap_or(false);
                         if override_dst {
                             debug!(
                                 "[Sniffer] Sniff TCP [{}]-->[{}] success, replace domain [{:?}]-->[{}]",
@@ -1124,7 +1156,7 @@ impl ConnectionManager {
                     );
                 }
             }
-        } else if skip_sniff && sniff_override.is_some() && should_override {
+        } else if skip_sniff && sniff_enabled && should_override {
             debug!("[Sniffer] Skip sniffing[{}] due to multiple failures", dst);
         }
 
@@ -1150,12 +1182,13 @@ impl ConnectionManager {
     /// can match; `dst` is a placeholder 0.0.0.0 in that case.
     ///
     /// Returns the `Action` to take and the resolved domain (if any).
-    pub async fn resolve_udp_action(
+    async fn resolve_udp_action(
         &self,
         src: SocketAddr,
         dst: SocketAddr,
         conn_type: &'static str,
-        domain_override: Option<String>,
+        domain: Option<String>,
+        sniff_overrode: bool,
     ) -> (Action, Option<String>) {
         let dns = self.app.dns_resolver();
         let rules = self.app.rule_engine();
@@ -1166,21 +1199,21 @@ impl ConnectionManager {
             rt.mode.clone()
         };
 
-        let domain = domain_override.or_else(|| dns.reverse_lookup(&dst.ip()));
-
         // mihomo compat: clear FakeIP from dst_ip (same as TCP path); an
         // inbound-supplied domain uses an unspecified placeholder IP that must
         // not leak into IP rules either.
-        let rule_dst_ip =
-            if dns.is_fake_ip(&dst.ip()) || (domain.is_some() && dst.ip().is_unspecified()) {
-                None
-            } else {
-                Some(dst.ip())
-            };
+        let rule_dst_ip = if sniff_overrode
+            || dns.is_fake_ip(&dst.ip())
+            || (domain.is_some() && dst.ip().is_unspecified())
+        {
+            None
+        } else {
+            Some(dst.ip())
+        };
 
         let mut rule_meta = RuleMetadata {
             domain: domain.clone(),
-            dst_ip: rule_dst_ip,
+            dst_ip: hosts_ip(&config, &dns, domain.as_deref()).or(rule_dst_ip),
             src_ip: Some(src.ip()),
             dst_port: dst.port(),
             src_port: src.port(),
@@ -1261,16 +1294,6 @@ impl ConnectionManager {
         }
 
         (action, domain)
-    }
-
-    /// Get the current proxy manager (for resolving proxy names to handlers).
-    pub fn proxy_manager(&self) -> Arc<crate::proxy::ProxyManager> {
-        self.app.proxy_manager()
-    }
-
-    /// Get the current DNS resolver.
-    pub fn dns_resolver(&self) -> Arc<crate::dns::DnsResolver> {
-        self.app.dns_resolver()
     }
 
     /// Get a snapshot of all active connections (for API).

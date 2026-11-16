@@ -22,9 +22,9 @@ datapath: packets are read from the device and terminated in userspace.
 
 ## Key Types and Entry Points
 - `src/tun/mod.rs` — `run_tun`: opens the device, sets the auto-detected outbound interface (loop avoidance), installs routes when `auto-route`, then runs the smoltcp userspace stack for all stack types.
-- `run_gvisor_stack` — pumps the `SmolStack` channels: TCP → `ConnectionManager::handle_tcp`; UDP → `handle_tun_udp_flow` (dials the proxy, relays replies back via the flow's `reply`); DNS-hijacked flows → `handle_hijacked_dns_{tcp,udp}` → internal resolver.
+- `run_gvisor_stack` — pumps the `SmolStack` channels: TCP → `ConnectionManager::handle_tcp`; UDP → `handle_tun_udp_flow` (passes the flow receiver to shared `ConnectionManager::handle_udp` for QUIC sniffing, routing, and reply relay); DNS-hijacked flows → `handle_hijacked_dns_{tcp,udp}` → internal resolver.
 - `parse_dns_hijack_targets` / `dns_hijack_matches` — mihomo `ShouldHijackDns` (strip `udp://`/`tcp://`, `any`→`0.0.0.0`; match exact entry or unspecified-addr + port 53).
-- `run_tproxy_udp_listener` / `run_udp_relay` — the standalone `tproxy-port` inbound UDP path (IP_TRANSPARENT), independent of the TUN datapath.
+- `run_tproxy_udp_listener` / `run_udp_relay` — standalone `tproxy-port` UDP (IP_TRANSPARENT); installs a bounded `conn::udp::enqueue` queue before using the same sniff/route/relay path as TUN and SOCKS5.
 - `src/tun/device.rs` — `TunDevice::open` allocates the TUN fd and issues `TUNSETIFF`.
 - `src/tun/route.rs` — `setup_routes` (default route into the TUN table); `detect_default_interface` (parses `ip route get 1.1.1.1`).
 

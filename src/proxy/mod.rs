@@ -725,8 +725,7 @@ impl ProxyManager {
     /// operator asked for a tunnel. The caller is expected to drop the
     /// datagram on error (UDP is best-effort).
     ///
-    /// Used by `inbound::socks::create_socks_udp_session` and
-    /// `tun::create_udp_session`.
+    /// Used by the shared `conn::udp` sniff/route/relay path.
     pub async fn dial_proxy_udp(
         &self,
         proxy_name: &str,

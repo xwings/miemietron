@@ -257,12 +257,12 @@ fn default_cors_private_network() -> bool {
     true
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct SnifferConfig {
     #[serde(default)]
     pub enable: bool,
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub override_destination: bool,
     #[serde(default)]
     pub sniff: HashMap<String, SniffProtocolConfig>,
@@ -270,12 +270,27 @@ pub struct SnifferConfig {
     pub force_domain: Vec<String>,
     #[serde(default)]
     pub skip_domain: Vec<String>,
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub force_dns_mapping: bool,
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub parse_pure_ip: bool,
     #[serde(flatten)]
     pub extra: HashMap<String, serde_yaml::Value>,
+}
+
+impl Default for SnifferConfig {
+    fn default() -> Self {
+        Self {
+            enable: false,
+            override_destination: true,
+            sniff: HashMap::new(),
+            force_domain: Vec::new(),
+            skip_domain: Vec::new(),
+            force_dns_mapping: true,
+            parse_pure_ip: true,
+            extra: HashMap::new(),
+        }
+    }
 }
 
 /// Per-protocol sniffing configuration (e.g. TLS, HTTP, QUIC).
@@ -289,29 +304,70 @@ pub struct SniffProtocolConfig {
 }
 
 impl SnifferConfig {
-    /// Check whether sniffing should be attempted for the given destination port.
-    /// Returns the effective override-destination flag for that port.
-    /// An empty `sniff` map registers zero sniffers — nothing is sniffed.
-    pub fn should_sniff(&self, dst_port: u16) -> Option<bool> {
+    /// The named protocol owns its ports and override policy. QUIC is only
+    /// dispatched on UDP; HTTP and TLS are only dispatched on TCP.
+    pub fn protocol_override(&self, protocol: &str, dst_port: u16) -> Option<bool> {
         if !self.enable {
             return None;
         }
-        if self.sniff.is_empty() {
-            // mihomo compat: an empty `sniff:` map registers zero sniffers —
-            // nothing is sniffed (config.go parseSniffer + dispatcher.go
-            // SupportPort). The old sniff-all fallback silently overrode
-            // destinations mihomo would never touch.
-            return None;
-        }
-        for pcfg in self.sniff.values() {
-            if port_matches(&pcfg.ports, dst_port) {
+        for (name, pcfg) in &self.sniff {
+            if name.eq_ignore_ascii_case(protocol) {
+                let default_port = if protocol.eq_ignore_ascii_case("HTTP") {
+                    80
+                } else {
+                    443
+                };
+                if !(if pcfg.ports.is_empty() {
+                    dst_port == default_port
+                } else {
+                    port_matches(&pcfg.ports, dst_port)
+                }) {
+                    return None;
+                }
                 let ovr = pcfg
                     .override_destination
                     .unwrap_or(self.override_destination);
                 return Some(ovr);
             }
         }
-        None // port not in any protocol's list
+        None // An empty map registers no sniffers.
+    }
+
+    pub fn tcp_enabled(&self, dst_port: u16) -> bool {
+        self.protocol_override("HTTP", dst_port).is_some()
+            || self.protocol_override("TLS", dst_port).is_some()
+    }
+
+    fn validate(&self) -> Result<()> {
+        for (protocol, config) in &self.sniff {
+            if !["HTTP", "TLS", "QUIC"]
+                .iter()
+                .any(|p| protocol.eq_ignore_ascii_case(p))
+            {
+                anyhow::bail!("not find the sniffer[{protocol}]");
+            }
+            for port in &config.ports {
+                let valid = match port {
+                    serde_yaml::Value::Number(n) => {
+                        n.as_u64().is_some_and(|n| n <= u16::MAX as u64)
+                    }
+                    serde_yaml::Value::String(s) => match s.split_once('-') {
+                        Some((start, end)) => {
+                            match (start.trim().parse::<u16>(), end.trim().parse::<u16>()) {
+                                (Ok(start), Ok(end)) => start <= end,
+                                _ => false,
+                            }
+                        }
+                        None => s.trim().parse::<u16>().is_ok(),
+                    },
+                    _ => false,
+                };
+                if !valid {
+                    anyhow::bail!("invalid sniffer port: {port:?}");
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Check if a domain is in the force-domain list (suffix matching with `+.`).
@@ -331,7 +387,7 @@ fn port_matches(specs: &[serde_yaml::Value], port: u16) -> bool {
         match spec {
             serde_yaml::Value::Number(n) => {
                 if let Some(p) = n.as_u64() {
-                    if p as u16 == port {
+                    if p == u64::from(port) {
                         return true;
                     }
                 }
@@ -468,6 +524,9 @@ impl MiemieConfig {
         let config: Self = serde_yaml::from_value(value)
             .map_err(|e| anyhow::anyhow!("failed to parse config: {e}"))?;
         config.validate_listeners()?;
+        if let Some(sniffer) = &config.sniffer {
+            sniffer.validate()?;
+        }
         // mihomo compat: tunnel/mode.go and log/level.go UnmarshalText — an
         // unknown mode or log-level fails the config load (case-insensitive).
         let mode = config.mode.to_lowercase();
@@ -712,6 +771,43 @@ another-unknown:
         assert_eq!(config.port, 0);
         assert!(config.proxies.is_empty());
         assert!(config.rules.is_empty());
+
+        let sniffer: SnifferConfig = serde_yaml::from_str("{}").unwrap();
+        assert!(sniffer.override_destination);
+        assert!(sniffer.force_dns_mapping);
+        assert!(sniffer.parse_pure_ip);
+        assert!(!sniffer.enable);
+        assert_eq!(sniffer.tcp_enabled(443), false);
+    }
+
+    #[test]
+    fn sniffer_protocols_own_their_ports_and_override_policy() {
+        let sniff: SnifferConfig = serde_yaml::from_str(
+            "enable: true\nsniff:\n  hTtP: {}\n  TLS: {ports: [443, 8443], override-destination: false}\n  QUIC: {ports: [443, '8000-8100']}\n",
+        ).unwrap();
+        assert_eq!(sniff.protocol_override("HTTP", 80), Some(true));
+        assert_eq!(sniff.protocol_override("HTTP", 443), None);
+        assert_eq!(sniff.protocol_override("TLS", 443), Some(false));
+        assert_eq!(sniff.protocol_override("TLS", 8443), Some(false));
+        assert_eq!(sniff.protocol_override("QUIC", 443), Some(true));
+        assert_eq!(sniff.protocol_override("QUIC", 8050), Some(true));
+        assert!(!sniff.tcp_enabled(8050));
+        assert!(sniff.tcp_enabled(8443));
+        let default_ports: SnifferConfig =
+            serde_yaml::from_str("enable: true\nsniff: {TLS: {}, QUIC: {}}\n").unwrap();
+        assert_eq!(default_ports.protocol_override("TLS", 443), Some(true));
+        assert_eq!(default_ports.protocol_override("QUIC", 443), Some(true));
+        assert_eq!(default_ports.protocol_override("QUIC", 80), None);
+    }
+
+    #[test]
+    fn sniffer_rejects_unknown_protocols_and_invalid_ports() {
+        let error = MiemieConfig::parse_str("sniffer: {sniff: {SMTP: {}}}\n").unwrap_err();
+        assert_eq!(error.to_string(), "not find the sniffer[SMTP]");
+        for port in ["65536", "-1", "'9000-8000'", "'invalid'"] {
+            let yaml = format!("sniffer: {{sniff: {{QUIC: {{ports: [{port}]}}}}}}\n");
+            assert!(MiemieConfig::parse_str(&yaml).is_err(), "{yaml}");
+        }
     }
 
     #[test]

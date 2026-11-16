@@ -1,6 +1,6 @@
 [package]
 name = "miemietron"
-version = "0.2.18-dev"
+version = "0.2.19-dev"
 edition = "2021"
 description = "High-performance proxy kernel for low-powered routers"
 license = "MIT"
@@ -24,6 +24,10 @@ ring = "0.17"
 sha2 = "0.10"
 md-5 = "0.10"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
+# ML-KEM-768 half of the X25519MLKEM768 hybrid key share REALITY servers now
+# require. Pure Rust: the ring provider has no ML-KEM, and aws-lc-rs would drag
+# a C toolchain into the static musl builds.
+ml-kem = { version = "0.3.4", features = ["zeroize"] }
 base64 = "0.22"
 hmac = "0.12"
 hex = "0.4"
@@ -50,6 +54,8 @@ hyper = { version = "1", features = ["full"] }
 # HTTP/2 & gRPC transport
 h2 = "0.4"
 http = "1"
+# HPACK decoding for HTTP/2 cleartext sniffing (h2 keeps its decoder private).
+loona-hpack = "0.4.3"
 
 # WebSocket transport
 tokio-tungstenite = "0.26"

@@ -30,7 +30,7 @@ Only tested on vanilla OpenWrt with OpenClash. The firmware used for testing is 
 
 ### Transports
 - **TLS** with browser fingerprinting (Chrome, Firefox, Safari, iOS, Android)
-- **Reality** protocol (x25519, camouflage SNI)
+- **Reality** protocol (X25519 and X25519MLKEM768 key shares, camouflage SNI)
 - **WebSocket** with early data
 - **gRPC** / **HTTP/2** / **XHTTP** (`stream-one`, `stream-up`, `packet-up` over H2)
 
@@ -41,7 +41,8 @@ Only tested on vanilla OpenWrt with OpenClash. The firmware used for testing is 
 
 ### Network
 - **TUN mode** with auto-route, iptables/nftables REDIRECT/TPROXY
-- **TCP + UDP** relay (SS UDP with per-packet AEAD)
+- **TCP + UDP** relay (SS UDP with per-packet AEAD; VLESS UDP over TLS/Reality)
+- **Sniffing** — HTTP/1 Host, HTTP/2 authority, TLS SNI, QUIC v1/v2/draft-29 SNI
 - **Inbound** — HTTP proxy, SOCKS5, mixed port, redir-port, tproxy-port
 - **DNS** — FakeIP, DoH, DoT, UDP/TCP, anti-poison fallback, nameserver-policy, proxy-server-nameserver
 - **Sniffer** — TLS SNI + HTTP Host extraction

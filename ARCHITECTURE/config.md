@@ -42,3 +42,8 @@ Parse mihomo-format `config.yaml` into strongly-typed Rust structs that drive ev
 - The `listeners:` block is intentionally rejected (out of scope); OpenClash drives inbounds via top-level port fields and `tun:` only.
 - `experimental`, `tunnels`, `iptables`, and `tls` are parsed into typed/`serde_yaml::Value` fields but are not all fully consumed downstream.
 - Unknown keys are silently captured in `extra` maps for forward-compat; no schema-strict mode.
+
+`SnifferConfig::protocol_override(protocol, port)` selects only the requested
+protocol's policy. HTTP/TLS are TCP, QUIC is UDP. Empty protocol ports default to
+80/443/443; destination override, pure-IP parsing and DNS mapping default true.
+`parse_str` validates names and port ranges; see [sniffer.md](sniffer.md).

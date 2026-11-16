@@ -6,7 +6,7 @@ Same CLI, same config, same REST API — for the OpenClash runtime surface.
 Anything outside that surface is explicitly carved out below; swap the binary
 for the in-scope set.
 
-**Single static musl binary, ~40k lines of Rust, 565 tests.**
+**Single static musl binary, ~40k lines of Rust, 606 tests.**
 
 This file is the control center: mission, scope, boot/connection flow, the
 OpenClash contract, and an Index of the per-subsystem docs under
@@ -30,7 +30,7 @@ Anything outside the lists below fails the config load with mihomo's verbatim
 |-------|-------|
 | Outbounds | `direct` / `reject` (built-in + user-defined), `ss`, `ssr`, `socks5`, `http`, `vmess`, `vless`, `trojan`, `snell`, `anytls` |
 | Inbounds | http, socks5, mixed, redir, tproxy, tun (system + gvisor). Configured via top-level `port` / `socks-port` / `mixed-port` / `redir-port` / `tproxy-port` / `tun:` only — the mihomo `listeners:` block is out of scope (rejected at load time). |
-| Transports | TCP, TLS, WS, gRPC, H2, XHTTP-over-H2, XTLS-Vision, Reality. **Reality is functional** via a pinned rustls fork that carries the auth in the TLS 1.3 ClientHello session ID (`support-x25519mlkem768` is not implemented and errors rather than downgrading) — see [ARCHITECTURE/transport.md](ARCHITECTURE/transport.md). |
+| Transports | TCP, TLS, WS, gRPC, H2, XHTTP-over-H2, XTLS-Vision, Reality. **Reality is functional**: the auth rides in the TLS 1.3 ClientHello session ID. Without `support-x25519mlkem768` a pinned rustls fork produces the X25519-only hello; with it the hello carries the X25519MLKEM768 hybrid key share that Xray servers require since 2026-09, built in-tree — see [ARCHITECTURE/transport.md](ARCHITECTURE/transport.md). |
 | DNS | UDP, TCP, DoT (`tls://`), DoH (`https://`), system, fakeip, nameserver-policy, fallback with GeoIP anti-poison. `fake-ip-filter` supports plain patterns, `geosite:` and `rule-set:` entries. |
 | Rule providers | yaml + text formats (classical / domain / ipcidr); mrs format for `domain` behavior (OpenClash's meta-rules-dat lists) |
 | REST API | the routes implemented under `src/api/`: `/configs`, `/proxies`, `/group{,s}`, `/rules`, `/connections`, `/providers/proxies`, `/providers/rules`, `/dns/query`, `/logs`, `/traffic`, `/version`, `/memory`, UI. `/providers/rules` is partial-but-honest — see [ARCHITECTURE/api.md](ARCHITECTURE/api.md). |
@@ -46,7 +46,6 @@ Anything outside the lists below fails the config load with mihomo's verbatim
 | MRS rule provider with `ipcidr` behavior | Only `domain`-behavior mrs is implemented (what OpenClash ships for its CN lists); ipcidr mrs errors at provider load, never a silent text fallback |
 | REST: `/cache/*`, `/doh`, real `/restart`, real `/upgrade/*` | Niche operator endpoints; `/upgrade` is dangerous on appliances anyway |
 | Rule provider runtime reload (`PUT /providers/rules/:name`) | Providers are merged into the engine at construction; `PUT` returns 503. Edit config and reload to re-ingest. |
-| QUIC sniffer | Tied to QUIC stack |
 | `convert-ruleset`, `generate` CLI subcommands | Offline tooling, not runtime |
 | `--ext-ctl-pipe` (Windows named-pipe controller) | Linux-only target. The flag is **accepted as a no-op** for invocation parity with mihomo wrappers; supplying it does nothing. |
 
@@ -65,7 +64,7 @@ src/
 │                        shadowsocks/, ssr/, vmess/, vless/, trojan/
 ├── proxy_group/         Selector, URL-test, Fallback, Load-balance, health
 ├── rules/               Rule engine, providers, geoip, geosite, process
-├── sniffer/             TLS SNI + HTTP Host extraction
+├── sniffer/             HTTP Host / HTTP2 authority, TLS / QUIC SNI extraction
 ├── transport/           TLS, WS, gRPC, H2, Reality, fingerprint, TCP+keepalive
 ├── tun/                 TUN device, routing rules, iptables/nftables
 ├── stack/               System (SO_ORIGINAL_DST) + gvisor (smoltcp)
@@ -206,6 +205,7 @@ Release profile: `opt-level = "z"`, LTO, single codegen unit, stripped,
 |-------|---------|
 | `tokio` | Async runtime |
 | `rustls` + `tokio-rustls` | TLS (no OpenSSL) |
+| `ml-kem` + `x25519-dalek` | X25519MLKEM768 hybrid key share for Reality (pure Rust — the ring provider has no ML-KEM) |
 | `axum` | REST API framework |
 | `h2`, `tokio-tungstenite` | HTTP/2 + WebSocket transports |
 | `smoltcp` | Userspace TCP/IP stack (gvisor mode) |
@@ -320,7 +320,7 @@ before implementation rather than after mistakes.
 | Outbounds | [ARCHITECTURE/outbounds.md](ARCHITECTURE/outbounds.md) | Protocol adapters, `ProxyManager`, anytls |
 | Proxy Groups | [ARCHITECTURE/proxy_group.md](ARCHITECTURE/proxy_group.md) | Selector / url-test / fallback / load-balance, health |
 | Rules | [ARCHITECTURE/rules.md](ARCHITECTURE/rules.md) | Rule engine, matchers, providers, resolve-on-demand |
-| Sniffer | [ARCHITECTURE/sniffer.md](ARCHITECTURE/sniffer.md) | TLS SNI + HTTP Host extraction |
+| Sniffer | [ARCHITECTURE/sniffer.md](ARCHITECTURE/sniffer.md) | HTTP Host / HTTP2 authority, TLS / QUIC SNI extraction |
 | Transport | [ARCHITECTURE/transport.md](ARCHITECTURE/transport.md) | TCP+keepalive, TLS, WS, gRPC, H2, Reality, fingerprint |
 | TUN | [ARCHITECTURE/tun.md](ARCHITECTURE/tun.md) | TUN device, routes, iptables/nftables |
 | Stack | [ARCHITECTURE/stack.md](ARCHITECTURE/stack.md) | System (SO_ORIGINAL_DST) + gvisor (smoltcp) stacks |

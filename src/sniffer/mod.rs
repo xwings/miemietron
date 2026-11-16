@@ -1,4 +1,7 @@
-// Protocol sniffer - extract domain from TLS ClientHello SNI and HTTP Host header.
+// Protocol sniffers for HTTP, TLS, and QUIC.
+
+mod http;
+pub mod quic;
 
 use dashmap::DashMap;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -84,9 +87,8 @@ impl SniffCache {
 
 /// Sniff the domain from a connection's initial bytes.
 ///
-/// Tries TLS SNI first (if the data starts with 0x16), then QUIC Initial
-/// packets, then HTTP Host header. Returns `None` if no domain can be
-/// extracted.
+/// Tries TLS SNI first (if the data starts with 0x16), then HTTP Host.
+/// QUIC uses a stateful UDP sniffer in `quic`.
 /// Test convenience wrapper over [`sniff_domain_ex`] — the connection path
 /// uses the three-way result directly (it needs NeedMore for the re-peek).
 #[cfg(test)]
@@ -113,35 +115,11 @@ pub fn sniff_domain_ex(data: &[u8]) -> SniffAttempt {
         return SniffAttempt::NeedMore(1);
     }
 
-    // TLS handshake starts with 0x16
     if data[0] == 0x16 {
-        if data.len() < 5 {
-            return SniffAttempt::NeedMore(5);
-        }
-        let record_len = u16::from_be_bytes([data[3], data[4]]) as usize;
-        let needed = 5 + record_len;
-        if data.len() < needed {
-            return SniffAttempt::NeedMore(needed);
-        }
-        return match extract_tls_sni(data) {
-            Some(host) => SniffAttempt::Found(host),
-            None => SniffAttempt::Fail,
-        };
+        return sniff_tls(data);
     }
 
-    // QUIC long header: form bit (0x80) set. No version check is done here —
-    // extract_quic_sni heuristically hunts for the embedded ClientHello.
-    if data.len() > 5 && (data[0] & 0x80) != 0 {
-        if let Some(sni) = extract_quic_sni(data) {
-            return SniffAttempt::Found(sni);
-        }
-    }
-
-    // Try HTTP Host header
-    match extract_http_host(data) {
-        Some(host) => SniffAttempt::Found(host),
-        None => SniffAttempt::Fail,
-    }
+    http::sniff_http(data)
 }
 
 /// mihomo compat: metadata.IsDomainName (net/dnsmessage rules) — the sniffed
@@ -161,210 +139,151 @@ pub fn is_domain_name(host: &str) -> bool {
         })
 }
 
-/// Extract SNI from a QUIC Initial packet.
-///
-/// QUIC Initial packets contain a CRYPTO frame with a TLS ClientHello.
-/// We attempt to find the ClientHello within the unencrypted Initial packet
-/// payload and extract SNI from it. This only works for the initial
-/// unencrypted packet (before key establishment).
-///
-/// Note: Full QUIC Initial decryption requires deriving keys from the DCID.
-/// This simplified version looks for the TLS ClientHello signature directly
-/// in the packet data, which works for many real-world QUIC implementations
-/// where the Initial packet is not yet encrypted with application keys.
-fn extract_quic_sni(data: &[u8]) -> Option<String> {
-    // Look for TLS ClientHello signature (0x01 = handshake type, followed by
-    // 3-byte length, then TLS version 0x0303) anywhere in the QUIC packet.
-    // This is a heuristic that works because the CRYPTO frame contains a raw
-    // TLS ClientHello message.
-    for i in 0..data.len().saturating_sub(10) {
-        // ClientHello: handshake_type=0x01, then 3 bytes length, then
-        // client_version 0x0303 (TLS 1.2 in ClientHello)
-        if data[i] == 0x01 && i + 6 < data.len() && data[i + 4] == 0x03 && data[i + 5] == 0x03 {
-            // Try to parse as a TLS ClientHello starting at offset i
-            // Reconstruct a fake TLS record: 0x16 0x03 0x01 [length] [handshake]
-            let remaining = &data[i..];
-            if remaining.len() > 4 {
-                let hs_len = ((remaining[1] as usize) << 16)
-                    | ((remaining[2] as usize) << 8)
-                    | (remaining[3] as usize);
-                if hs_len > 0 && i + 4 + hs_len <= data.len() {
-                    // Build a fake TLS record around this ClientHello
-                    let record_len = 4 + hs_len; // handshake header + body
-                    let mut fake_record = Vec::with_capacity(5 + record_len);
-                    fake_record.push(0x16); // TLS record type: Handshake
-                    fake_record.push(0x03);
-                    fake_record.push(0x01); // TLS version
-                    fake_record.push((record_len >> 8) as u8);
-                    fake_record.push((record_len & 0xff) as u8);
-                    fake_record.extend_from_slice(&remaining[..record_len.min(remaining.len())]);
-                    if let Some(sni) = extract_tls_sni(&fake_record) {
-                        return Some(sni);
-                    }
-                }
-            }
-        }
-    }
-    None
-}
-
-/// Extract the Host header from an HTTP request.
-///
-/// Recognises requests starting with common HTTP methods:
-/// GET, POST, PUT, DELETE, HEAD, CONNECT, OPTIONS, PATCH, TRACE.
+#[cfg(test)]
 fn extract_http_host(data: &[u8]) -> Option<String> {
-    // Quick check: is this an HTTP request?
-    let http_methods: &[&[u8]] = &[
-        b"GET ",
-        b"POST ",
-        b"PUT ",
-        b"DELETE ",
-        b"HEAD ",
-        b"CONNECT ",
-        b"OPTIONS ",
-        b"PATCH ",
-        b"TRACE ",
-    ];
-
-    let is_http = http_methods.iter().any(|m| data.starts_with(m));
-    if !is_http {
-        return None;
+    match http::sniff_http(data) {
+        SniffAttempt::Found(host) => Some(host),
+        _ => None,
     }
-
-    // Scan for "Host:" header (case-insensitive).
-    // HTTP headers are separated by \r\n. We search for \r\nHost: or
-    // check if it's the first header after the request line.
-    let text = match std::str::from_utf8(data) {
-        Ok(s) => s,
-        Err(_) => {
-            // Try partial — headers should be ASCII
-            let valid_len = data.iter().position(|&b| b > 0x7F).unwrap_or(data.len());
-            if valid_len == 0 {
-                return None;
-            }
-            std::str::from_utf8(&data[..valid_len]).ok()?
-        }
-    };
-
-    // Look for the Host header (case-insensitive, no per-line allocation)
-    for line in text.split("\r\n").skip(1) {
-        if line.is_empty() {
-            // End of headers
-            break;
-        }
-        if line.len() >= 5 && line.as_bytes()[..5].eq_ignore_ascii_case(b"Host:") {
-            let host = line[5..].trim();
-            if host.contains(']') {
-                // IPv6 literal like [::1]:80 — not a domain
-                return None;
-            }
-            // Strip port suffix if present (e.g., "example.com:443")
-            let domain = if let Some(colon) = host.rfind(':') {
-                &host[..colon]
-            } else {
-                host
-            };
-            if !domain.is_empty() {
-                return Some(domain.to_string());
-            }
-        }
-    }
-
-    None
 }
 
-/// Extract SNI from a TLS ClientHello message.
-fn extract_tls_sni(data: &[u8]) -> Option<String> {
-    // TLS record layer
-    if data.len() < 5 || data[0] != 0x16 {
-        return None; // Not a TLS handshake
-    }
-
-    let record_len = u16::from_be_bytes([data[3], data[4]]) as usize;
-    if data.len() < 5 + record_len {
-        return None;
-    }
-
-    let hs = &data[5..];
-    if hs.is_empty() || hs[0] != 0x01 {
-        return None; // Not ClientHello
-    }
-
-    if hs.len() < 4 {
-        return None;
-    }
-    let hs_len = ((hs[1] as usize) << 16) | ((hs[2] as usize) << 8) | (hs[3] as usize);
-    if hs.len() < 4 + hs_len {
-        return None;
-    }
-
-    let ch = &hs[4..];
-    // Skip: version(2) + random(32) + session_id_len(1) + session_id
-    // Layout: ch[0..2]=client_version, ch[2..34]=random, ch[34]=session_id_len,
-    // ch[35..]=session_id. mihomo reads the length byte at the same offset
-    // (tls_sniffer.go: data[38] including the 4-byte handshake header).
-    if ch.len() < 35 {
-        return None;
-    }
-    let session_id_len = ch[34] as usize;
-    let mut pos = 35 + session_id_len;
-
-    // Skip cipher suites
-    if pos + 2 > ch.len() {
-        return None;
-    }
-    let cipher_len = u16::from_be_bytes([ch[pos], ch[pos + 1]]) as usize;
-    pos += 2 + cipher_len;
-
-    // Skip compression methods
-    if pos + 1 > ch.len() {
-        return None;
-    }
-    let comp_len = ch[pos] as usize;
-    pos += 1 + comp_len;
-
-    // Extensions
-    if pos + 2 > ch.len() {
-        return None;
-    }
-    let ext_len = u16::from_be_bytes([ch[pos], ch[pos + 1]]) as usize;
-    pos += 2;
-
-    let ext_end = pos + ext_len;
-    while pos + 4 <= ext_end && pos + 4 <= ch.len() {
-        let ext_type = u16::from_be_bytes([ch[pos], ch[pos + 1]]);
-        let ext_data_len = u16::from_be_bytes([ch[pos + 2], ch[pos + 3]]) as usize;
-        pos += 4;
-
-        if ext_type == 0x0000 {
-            // SNI extension
-            if pos + 2 > ch.len() {
-                return None;
+pub(super) fn sniff_tls(data: &[u8]) -> SniffAttempt {
+    let mut offset = 0;
+    let mut hello = Vec::new();
+    loop {
+        if data.len() < offset + 5 {
+            return SniffAttempt::NeedMore(offset + 5);
+        }
+        if data[offset] != 0x16 || data[offset + 1] != 3 {
+            return SniffAttempt::Fail;
+        }
+        let length = u16::from_be_bytes([data[offset + 3], data[offset + 4]]) as usize;
+        if length == 0 || length > 16384 || hello.len() + length > 64 * 1024 {
+            return SniffAttempt::Fail;
+        }
+        let end = offset + 5 + length;
+        let previous = hello.len();
+        hello.extend_from_slice(&data[offset + 5..end.min(data.len())]);
+        match read_client_hello(&hello) {
+            SniffAttempt::NeedMore(want) if data.len() < end => {
+                return SniffAttempt::NeedMore(offset + 5 + (want - previous).min(length));
             }
-            let sni_list_len = u16::from_be_bytes([ch[pos], ch[pos + 1]]) as usize;
-            let mut sni_pos = pos + 2;
-            let sni_end = sni_pos + sni_list_len;
+            SniffAttempt::NeedMore(_) => offset = end,
+            result => return result,
+        }
+    }
+}
 
-            while sni_pos + 3 <= sni_end && sni_pos + 3 <= ch.len() {
-                let name_type = ch[sni_pos];
-                let name_len = u16::from_be_bytes([ch[sni_pos + 1], ch[sni_pos + 2]]) as usize;
-                sni_pos += 3;
+#[cfg(test)]
+fn extract_tls_sni(data: &[u8]) -> Option<String> {
+    match sniff_tls(data) {
+        SniffAttempt::Found(host) => Some(host),
+        _ => None,
+    }
+}
 
-                if name_type == 0 && sni_pos + name_len <= ch.len() {
-                    // Use from_utf8 on slice to avoid .to_vec() allocation
-                    return std::str::from_utf8(&ch[sni_pos..sni_pos + name_len])
-                        .ok()
-                        .map(|s| s.to_string());
+/// Shared TLS/QUIC ClientHello parser. A complete server_name field is enough;
+/// trailing padding need not arrive. All lengths remain inside the declared
+/// handshake, extensions, and name-list boundaries.
+fn read_client_hello(data: &[u8]) -> SniffAttempt {
+    fn parse(data: &[u8]) -> Result<String, SniffAttempt> {
+        if data.is_empty() {
+            return Err(SniffAttempt::NeedMore(1));
+        }
+        if data[0] != 1 {
+            return Err(SniffAttempt::Fail);
+        }
+        if data.len() < 4 {
+            return Err(SniffAttempt::NeedMore(4));
+        }
+        let total =
+            4 + ((usize::from(data[1]) << 16) | (usize::from(data[2]) << 8) | usize::from(data[3]));
+        let need = |end| {
+            if end > total {
+                Err(SniffAttempt::Fail)
+            } else if end > data.len() {
+                Err(SniffAttempt::NeedMore(end))
+            } else {
+                Ok(())
+            }
+        };
+        let u16_at = |pos| u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
+        let mut pos = 38; // handshake header, legacy_version, random
+        need(pos + 1)?;
+        let session = usize::from(data[pos]);
+        if session > 32 {
+            return Err(SniffAttempt::Fail);
+        }
+        pos += 1 + session;
+        need(pos + 2)?;
+        let ciphers = u16_at(pos);
+        if ciphers % 2 != 0 {
+            return Err(SniffAttempt::Fail);
+        }
+        pos += 2 + ciphers;
+        need(pos + 1)?;
+        let compression = usize::from(data[pos]);
+        pos += 1 + compression;
+        need(pos + 2)?;
+        let extensions_end = pos + 2 + u16_at(pos);
+        if extensions_end != total {
+            return Err(SniffAttempt::Fail);
+        }
+        pos += 2;
+        while pos < extensions_end {
+            need(pos + 4)?;
+            let kind = u16_at(pos);
+            let extension_end = pos + 4 + u16_at(pos + 2);
+            if extension_end > extensions_end {
+                return Err(SniffAttempt::Fail);
+            }
+            pos += 4;
+            if kind != 0 {
+                if extension_end == extensions_end {
+                    return Err(SniffAttempt::Fail);
                 }
-
-                sni_pos += name_len;
+                need(extension_end)?;
+                pos = extension_end;
+                continue;
+            }
+            if pos + 2 > extension_end {
+                return Err(SniffAttempt::Fail);
+            }
+            need(pos + 2)?;
+            let names_end = pos + 2 + u16_at(pos);
+            if names_end != extension_end {
+                return Err(SniffAttempt::Fail);
+            }
+            pos += 2;
+            while pos < names_end {
+                if pos + 3 > names_end {
+                    return Err(SniffAttempt::Fail);
+                }
+                need(pos + 3)?;
+                let name_type = data[pos];
+                let name_end = pos + 3 + u16_at(pos + 1);
+                if name_end > names_end {
+                    return Err(SniffAttempt::Fail);
+                }
+                pos += 3;
+                need(name_end)?;
+                if name_type == 0 {
+                    let name = std::str::from_utf8(&data[pos..name_end])
+                        .map_err(|_| SniffAttempt::Fail)?;
+                    if name.ends_with('.') {
+                        return Err(SniffAttempt::Fail);
+                    }
+                    return Ok(name.to_string());
+                }
+                pos = name_end;
             }
         }
-
-        pos += ext_data_len;
+        Err(SniffAttempt::Fail)
     }
-
-    None
+    match parse(data) {
+        Ok(host) => SniffAttempt::Found(host),
+        Err(verdict) => verdict,
+    }
 }
 
 #[cfg(test)]
@@ -385,7 +304,7 @@ mod tests {
     /// Build a minimal, RFC-conformant TLS 1.2 ClientHello with a single SNI
     /// extension: version(2) + random(32) + session_id_len(1) + session_id +
     /// cipher_suites + compression + extensions.
-    fn build_client_hello(sni: &str) -> Vec<u8> {
+    pub(super) fn build_client_hello(sni: &str) -> Vec<u8> {
         let sni_bytes = sni.as_bytes();
 
         // SNI extension data:
@@ -461,6 +380,49 @@ mod tests {
     fn extract_sni_from_client_hello() {
         let packet = build_client_hello("example.com");
         assert_eq!(extract_tls_sni(&packet), Some("example.com".to_string()));
+    }
+
+    #[test]
+    fn tls_client_hello_across_records_and_partial_reads() {
+        let original = build_client_hello("fragmented.example.com");
+        let hello = &original[5..];
+        let mut wire = Vec::new();
+        for part in hello.chunks(17) {
+            wire.extend_from_slice(&[0x16, 3, 3]);
+            wire.extend_from_slice(&(part.len() as u16).to_be_bytes());
+            wire.extend_from_slice(part);
+        }
+        for n in 0..wire.len() {
+            assert!(matches!(sniff_tls(&wire[..n]), SniffAttempt::NeedMore(want) if want > n));
+        }
+        assert_eq!(
+            extract_tls_sni(&wire).as_deref(),
+            Some("fragmented.example.com")
+        );
+    }
+
+    #[test]
+    fn client_hello_prefix_recovers_sni_before_trailing_padding() {
+        let packet = build_client_hello("prefix.example.com");
+        let mut hello = packet[5..].to_vec();
+        let old_len = hello.len();
+        let padding = 20000;
+        let length = hello.len() + 4 + padding - 4;
+        hello[1..4].copy_from_slice(&(length as u32).to_be_bytes()[1..]);
+        // Existing minimal fixture has the extension length at offset 45.
+        let extensions = u16::from_be_bytes([hello[45], hello[46]]) + 4 + padding as u16;
+        hello[45..47].copy_from_slice(&extensions.to_be_bytes());
+        hello.extend_from_slice(&[0, 0x15]);
+        hello.extend_from_slice(&(padding as u16).to_be_bytes());
+        hello.resize(hello.len() + padding, 0);
+        assert!(
+            matches!(read_client_hello(&hello[..old_len]), SniffAttempt::Found(host) if host == "prefix.example.com")
+        );
+
+        // A name cannot escape its own extension/list by using trailing bytes.
+        let mut malformed = packet[5..].to_vec();
+        malformed[54..56].copy_from_slice(&u16::MAX.to_be_bytes());
+        assert!(matches!(read_client_hello(&malformed), SniffAttempt::Fail));
     }
 
     #[test]

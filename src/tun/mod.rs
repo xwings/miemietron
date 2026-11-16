@@ -7,15 +7,16 @@ use std::mem::MaybeUninit;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::os::unix::io::AsRawFd;
 use std::sync::Arc;
-use tokio::time::{Duration, Instant};
+use tokio::sync::mpsc;
+use tokio::time::Duration;
 use tracing::{debug, error, info, warn};
 
-use crate::common::addr::Address;
 use crate::config::TunConfig;
-use crate::conn::ConnectionManager;
+use crate::conn::{
+    udp::{self, UdpInbound},
+    ConnectionManager,
+};
 use crate::dns::DnsResolver;
-use crate::proxy::OutboundPacketConn;
-use crate::rules::Action;
 use crate::stack::smol::SmolStack;
 use crate::stack::system;
 use device::TunDevice;
@@ -247,70 +248,36 @@ async fn handle_hijacked_dns_tcp(
 /// the userspace-stack equivalent of the TPROXY UDP relay — proxied UDP is
 /// actually proxied (not leaked DIRECT) and replies reach the client.
 async fn handle_tun_udp_flow(
-    mut flow: crate::stack::smol::SmolUdpFlow,
+    flow: crate::stack::smol::SmolUdpFlow,
     conn_manager: &ConnectionManager,
-    dns: &Arc<DnsResolver>,
+    _dns: &Arc<DnsResolver>,
     udp_timeout: Duration,
 ) -> Result<()> {
     let src = flow.src;
     let dst = flow.dst;
 
-    // First datagram drives session creation (and rule matching).
-    let first = match flow.rx.recv().await {
-        Some(d) => d,
-        None => return Ok(()),
-    };
-    let session = create_udp_session(src, dst, &first, conn_manager, dns, "tun").await?;
-    let outbound = session.outbound;
-    let target = session.target;
-
-    // Reverse path: outbound -> client, back through the stack.
-    let reply = flow.reply.clone();
-    let pc_rev = outbound.clone();
-    let reverse = tokio::spawn(async move {
-        let mut rbuf = vec![0u8; 65535];
-        loop {
-            match tokio::time::timeout(udp_timeout, pc_rev.recv_from(&mut rbuf)).await {
-                Ok(Ok((rn, _))) if rn > 0 => {
-                    if !reply.send(rbuf[..rn].to_vec()).await {
-                        break; // client flow gone
+    conn_manager
+        .handle_udp(
+            UdpInbound {
+                src,
+                dst,
+                conn_type: "tun",
+                domain: None,
+            },
+            flow.rx,
+            udp_timeout,
+            |packet| {
+                let reply = flow.reply.clone();
+                async move {
+                    if reply.send(packet).await {
+                        Ok(())
+                    } else {
+                        Err(anyhow::anyhow!("TUN UDP client flow closed"))
                     }
                 }
-                Ok(Ok(_)) => break, // 0-length = closed
-                Ok(Err(e)) => {
-                    debug!("TUN UDP proxy recv error: {}", e);
-                    break;
-                }
-                Err(_) => break, // idle timeout
-            }
-        }
-    });
-
-    // Forward path: client -> outbound.
-    loop {
-        match tokio::time::timeout(udp_timeout, flow.rx.recv()).await {
-            Ok(Some(data)) => {
-                if let Err(e) = outbound.send_to(&data, &target).await {
-                    debug!("TUN UDP send {} -> {} error: {}", src, target, e);
-                    break;
-                }
-            }
-            Ok(None) => break, // client flow closed
-            Err(_) => break,   // idle timeout
-        }
-    }
-    reverse.abort();
-    Ok(())
-}
-
-/// A live UDP session tracked in the NAT table.
-struct UdpSession {
-    /// Outbound channel (trait object — works for Direct, SS, or any future protocol).
-    outbound: Arc<dyn OutboundPacketConn>,
-    /// Last time a datagram was seen on this session.
-    last_active: Instant,
-    /// The target address for the proxy (domain or IP).
-    target: Address,
+            },
+        )
+        .await
 }
 
 /// Receive a UDP datagram via `recvmsg`, extracting both the source address
@@ -396,7 +363,7 @@ fn recvmsg_orig_dst(
 async fn run_udp_relay(
     port: u16,
     conn_manager: Arc<ConnectionManager>,
-    dns: Arc<DnsResolver>,
+    _dns: Arc<DnsResolver>,
     timeout_secs: u64,
 ) -> Result<()> {
     let socket = match system::create_udp_tproxy_socket(port).await {
@@ -411,26 +378,14 @@ async fn run_udp_relay(
     };
 
     let listener = Arc::new(socket);
-    let nat_table: Arc<DashMap<(SocketAddr, SocketAddr), UdpSession>> = Arc::new(DashMap::new());
+    let nat_table: Arc<DashMap<(SocketAddr, SocketAddr), mpsc::Sender<Vec<u8>>>> =
+        Arc::new(DashMap::new());
     let timeout_dur = Duration::from_secs(timeout_secs);
 
     info!(
         "UDP relay listening on port {} (timeout {}s)",
         port, timeout_secs
     );
-
-    // Spawn a reaper task to clean up idle sessions
-    let reaper_table = nat_table.clone();
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(30));
-        loop {
-            interval.tick().await;
-            let now = Instant::now();
-            reaper_table.retain(|_key, session: &mut UdpSession| {
-                now.duration_since(session.last_active) < timeout_dur
-            });
-        }
-    });
 
     let raw_fd = listener.as_raw_fd();
     let mut buf = vec![0u8; 65535];
@@ -454,173 +409,23 @@ async fn run_udp_relay(
         let data = buf[..n].to_vec();
         let key = (src_addr, orig_dst);
 
-        // Check if we already have a session for this (src, dst) pair
-        if let Some(mut session) = nat_table.get_mut(&key) {
-            session.last_active = Instant::now();
-            let target = session.target.clone();
-            let pc = session.outbound.clone();
-            tokio::spawn(async move {
-                if let Err(e) = pc.send_to(&data, &target).await {
-                    debug!(
-                        "UDP relay send error for {} -> {}: {}",
-                        src_addr, orig_dst, e
-                    );
-                }
-            });
+        let Some((tx, rx)) = udp::enqueue(&nat_table, key, data) else {
             continue;
-        }
-
-        // New session: create a proxy-side socket and set up the reverse path
+        };
         let nat = nat_table.clone();
-        let _listener_clone = listener.clone();
         let cm = conn_manager.clone();
-        let dns_ref = dns.clone();
-
         tokio::spawn(async move {
-            match create_udp_session(src_addr, orig_dst, &data, &cm, &dns_ref, "tproxy").await {
-                Ok(session) => {
-                    let outbound = session.outbound;
-                    let target = session.target;
-
-                    let pc_rev = outbound.clone();
-                    nat.insert(
-                        (src_addr, orig_dst),
-                        UdpSession {
-                            outbound,
-                            last_active: Instant::now(),
-                            target: target.clone(),
-                        },
-                    );
-
-                    // Spawn reverse-path relay: outbound -> client
-                    let nat_rev = nat.clone();
-                    tokio::spawn(async move {
-                        let mut rbuf = vec![0u8; 65535];
-                        loop {
-                            let recv =
-                                tokio::time::timeout(timeout_dur, pc_rev.recv_from(&mut rbuf))
-                                    .await;
-
-                            match recv {
-                                Ok(Ok((rn, _))) => {
-                                    if rn == 0 {
-                                        break;
-                                    }
-                                    if let Some(mut s) = nat_rev.get_mut(&(src_addr, orig_dst)) {
-                                        s.last_active = Instant::now();
-                                    }
-                                    if let Err(e) = send_udp_from(orig_dst, src_addr, &rbuf[..rn]) {
-                                        debug!(
-                                            "UDP reverse send {} -> {} error: {}",
-                                            orig_dst, src_addr, e
-                                        );
-                                        break;
-                                    }
-                                }
-                                Ok(Err(e)) => {
-                                    debug!("UDP proxy recv error: {}", e);
-                                    break;
-                                }
-                                Err(_) => {
-                                    debug!("UDP session {} -> {} timed out", src_addr, orig_dst);
-                                    break;
-                                }
-                            }
-                        }
-                        nat_rev.remove(&(src_addr, orig_dst));
-                    });
-                }
-                Err(e) => {
-                    debug!(
-                        "Failed to create UDP session {} -> {}: {}",
-                        src_addr, orig_dst, e
-                    );
-                }
+            let result = cm.handle_udp(
+                UdpInbound { src: src_addr, dst: orig_dst, conn_type: "tproxy", domain: None },
+                rx,
+                timeout_dur,
+                |data| async move { send_udp_from(orig_dst, src_addr, &data).map_err(Into::into) },
+            ).await;
+            if let Err(error) = result {
+                debug!("UDP session {} -> {} error: {}", src_addr, orig_dst, error);
             }
+            nat.remove_if(&key, |_, existing| existing.same_channel(&tx));
         });
-    }
-}
-
-/// Result of creating a UDP session -- contains the outbound channel and target.
-struct UdpSessionResult {
-    outbound: Arc<dyn OutboundPacketConn>,
-    target: Address,
-}
-
-/// Create a new UDP session: perform rule matching, obtain an OutboundPacketConn
-/// via the handler's `connect_datagram`, and send the initial datagram.
-async fn create_udp_session(
-    src: SocketAddr,
-    dst: SocketAddr,
-    initial_data: &[u8],
-    conn_manager: &ConnectionManager,
-    dns: &Arc<DnsResolver>,
-    conn_type: &'static str,
-) -> Result<UdpSessionResult> {
-    // Run rule engine to decide action
-    let (action, domain) = conn_manager
-        .resolve_udp_action(src, dst, conn_type, None)
-        .await;
-
-    // mihomo: preHandleMetadata -- drop if FakeIP reverse lookup failed
-    if domain.is_none() && dns.is_fake_ip(&dst.ip()) {
-        debug!("fake DNS record {} missing", dst.ip());
-        return Err(anyhow::anyhow!("fake DNS record {} missing", dst.ip()));
-    }
-
-    let target = if let Some(ref domain) = domain {
-        Address::domain(domain, dst.port())
-    } else {
-        Address::ip(dst)
-    };
-
-    debug!(
-        "UDP {} -> {} ({}) => {:?}",
-        src,
-        target,
-        domain.as_deref().unwrap_or(""),
-        action
-    );
-
-    let dns_arc = dns.clone();
-    let proxies = conn_manager.proxy_manager();
-
-    match action {
-        Action::Reject | Action::RejectDrop => {
-            // Drop the packet by returning an error
-            Err(anyhow::anyhow!(
-                "UDP packet rejected by rule engine: {src} -> {dst}"
-            ))
-        }
-
-        Action::Direct => {
-            let handler = proxies
-                .resolve("DIRECT")
-                .ok_or_else(|| anyhow::anyhow!("DIRECT handler not found"))?;
-
-            let pc: Arc<dyn OutboundPacketConn> =
-                Arc::from(handler.connect_datagram(&target, dns_arc).await?);
-
-            debug!("UDP DIRECT session: {} -> {}", src, dst);
-
-            pc.send_to(initial_data, &target).await?;
-
-            Ok(UdpSessionResult {
-                outbound: pc,
-                target,
-            })
-        }
-
-        Action::Proxy(ref proxy_name) => {
-            // No silent DIRECT fallback — see ProxyManager::dial_proxy_udp.
-            let pc = proxies.dial_proxy_udp(proxy_name, &target, dns_arc).await?;
-            debug!("UDP proxy '{}' session: {} -> {}", proxy_name, src, dst);
-            pc.send_to(initial_data, &target).await?;
-            Ok(UdpSessionResult {
-                outbound: pc,
-                target,
-            })
-        }
     }
 }
 

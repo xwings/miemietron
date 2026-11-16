@@ -6,7 +6,7 @@ The outbounds subsystem implements every proxy protocol miemietron dials traffic
 The **anytls** outbound deserves a dedicated note. It is a session-multiplexed, padding-shaped TLS protocol: a single TCP+TLS tunnel is pooled and carries many logical streams. The wire protocol frames each message as `[cmd:1][sid:4][len:2][data:len]` big-endian (see `frame.rs`), with command bytes for WASTE/SYN/PSH/FIN/SETTINGS/etc. A `PaddingFactory` (`padding.rs`) shapes TLS record payload sizes per a default scheme to resist traffic analysis, and idle sessions are kept in a LIFO pool swept by a background task honoring `idle-session-timeout` (≤5s floored to 30s) and `min-idle-session`. The TCP path is complete; UDP is a deliberate stub.
 
 ## Status
-`done` for the in-scope outbound set. All listed protocols load, dial, and relay; `proxy::*` tests plus `anytls` tests pass. anytls UDP is intentionally unimplemented (TCP-only), tracked under Open Gaps.
+TCP is implemented for the in-scope outbound set; `proxy::*` tests plus `anytls` tests pass. anytls UDP is intentionally unimplemented (TCP-only), tracked under Open Gaps.
 
 ## Code Structure
 | File | Role |
@@ -62,3 +62,12 @@ The **anytls** outbound deserves a dedicated note. It is a session-multiplexed, 
 - **anytls UDP is not implemented** — deliberate stub; `supports_udp` returns `false` at `src/proxy/anytls/mod.rs:266`. TCP/stream multiplexing is complete. A future sing/uot port would let it return `self.udp`.
 - Out-of-scope outbounds (`hysteria`/`hysteria2`/`tuic`/`wireguard`/`ssh`/config-defined `dns`/`mieru`/etc.) remain rejected at load with `unsupport proxy type: <T>` — by design, not a gap.
 - User-defined `direct`'s full `BasicOption` (interface-name, ip-version) is accepted for parity but not every field is wired; routing-mark is honored.
+
+VLESS `connect_datagram` now implements fixed-destination CommandUDP (2), using
+the configured TLS/Reality/WS/gRPC/H2 transport and two-byte big-endian packet
+lengths (`src/proxy/vless/packet.rs`). Read/write halves are independent; partial
+reads survive cancellation and short receive buffers preserve the packet.
+`udp: false` fails before dialing. `cargo test proxy::vless` covers wire framing,
+real local TCP connection, response versions, cancellation and truncation.
+XUDP, packet-addr, and UDP with XTLS flow remain unsupported; nonempty flow
+returns an explicit error. VLESS Reality nodes without flow can use the standard UDP path.

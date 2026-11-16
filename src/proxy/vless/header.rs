@@ -11,6 +11,7 @@ const VLESS_VERSION: u8 = 0x00;
 
 /// VLESS command types.
 pub const CMD_TCP: u8 = 0x01;
+pub const CMD_UDP: u8 = 0x02;
 
 /// Parse a UUID string "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" into 16 raw bytes.
 pub fn parse_uuid(s: &str) -> Result<[u8; 16], &'static str> {
@@ -152,6 +153,12 @@ impl<T: AsyncRead + AsyncWrite + Unpin> AsyncRead for VlessStream<T> {
                         // Still reading version + addon_len
                         2 - this.resp_buf.len()
                     } else {
+                        if this.resp_buf[0] != VLESS_VERSION {
+                            return Poll::Ready(Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "unexpected VLESS response version",
+                            )));
+                        }
                         // We know the addon length
                         let addon_len = this.resp_buf[1] as usize;
                         let total = 2 + addon_len;
