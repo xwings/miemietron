@@ -69,17 +69,12 @@ pub(crate) async fn run_health_check(
             let result =
                 tokio::time::timeout(timeout, measure_unified_delay(&handler, &url, &dns)).await;
             match result {
-                Ok(Ok((ms, status))) => {
-                    let delay = if ms > u16::MAX as u64 {
-                        u16::MAX
-                    } else {
-                        ms as u16
-                    };
+                Ok(Ok((delay, status))) => {
                     let satisfied = expected
                         .as_deref()
                         .is_none_or(|r| status_matches(status, r));
                     if satisfied {
-                        debug!("{} {}: {}ms", kind, name, ms);
+                        debug!("{} {}: {}ms", kind, name, delay);
                         store.record_result(&name, &url, Some(delay));
                     } else {
                         // mihomo compat: adapter.go URLTest — unexpected status

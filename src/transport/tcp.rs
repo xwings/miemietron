@@ -37,8 +37,16 @@ pub fn set_detected_outbound_interface(iface: Option<String>) {
 /// mihomo compat: `dialer.go:89-95` — a dial's own `interface-name` wins, then
 /// the configured `DefaultInterface`, then the auto-detect finder.
 fn default_outbound_interface() -> Option<String> {
-    let configured = CONFIG_OUTBOUND_INTERFACE.read().ok().and_then(|g| g.clone());
-    configured.or_else(|| DETECTED_OUTBOUND_INTERFACE.read().ok().and_then(|g| g.clone()))
+    let configured = CONFIG_OUTBOUND_INTERFACE
+        .read()
+        .ok()
+        .and_then(|g| g.clone());
+    configured.or_else(|| {
+        DETECTED_OUTBOUND_INTERFACE
+            .read()
+            .ok()
+            .and_then(|g| g.clone())
+    })
 }
 
 /// Public accessor for the global default outbound interface (used by the
@@ -106,6 +114,9 @@ pub async fn connect(addr: SocketAddr, opts: &ConnectOpts) -> Result<TcpStream> 
     };
 
     let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+    // mihomo compat: Go's net.Dialer enables TCP_NODELAY by default. Delaying
+    // small TLS records here stalls REALITY and nested TLS handshakes.
+    socket.set_nodelay(true)?;
 
     // Set SO_MARK for TUN loop prevention
     if let Some(mark) = opts.routing_mark {
@@ -200,4 +211,18 @@ static INBOUND_KEEPALIVE_DISABLED: std::sync::atomic::AtomicBool =
 /// Set at boot from the config's `disable-keep-alive`.
 pub fn set_inbound_keepalive_disabled(disabled: bool) {
     INBOUND_KEEPALIVE_DISABLED.store(disabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn outbound_tcp_disables_nagle() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let stream = connect(listener.local_addr().unwrap(), &ConnectOpts::default())
+            .await
+            .unwrap();
+        assert!(stream.nodelay().unwrap());
+    }
 }

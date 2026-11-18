@@ -4,6 +4,7 @@ mod load_balance;
 pub mod proxy_state;
 mod selector;
 mod url_test;
+pub(crate) use url_test::{measure_unified_delay, set_unified_delay};
 
 pub use fallback::FallbackGroup;
 pub use load_balance::{LoadBalanceGroup, LoadBalanceStrategy};

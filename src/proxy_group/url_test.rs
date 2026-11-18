@@ -1,8 +1,9 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::time::Instant;
 
 use crate::common::addr::Address;
 use crate::common::singledo::SingleDo;
@@ -235,15 +236,6 @@ impl ProxyGroup for UrlTestGroup {
     }
 }
 
-/// Parse the HTTP status code from a response status line ("HTTP/1.1 204 ...").
-fn parse_status_line(buf: &[u8]) -> Option<u16> {
-    let s = std::str::from_utf8(buf).ok()?;
-    if !s.starts_with("HTTP/") {
-        return None;
-    }
-    s.get(9..12)?.trim().parse().ok()
-}
-
 /// No-verify TLS client config for HTTPS health probes, built once.
 static PROBE_TLS_CONFIG: std::sync::LazyLock<Arc<rustls::ClientConfig>> =
     std::sync::LazyLock::new(|| {
@@ -260,77 +252,196 @@ static PROBE_TLS_CONFIG: std::sync::LazyLock<Arc<rustls::ClientConfig>> =
         )
     });
 
-/// Send an HTTP HEAD request, read the status line, and shut the stream down.
-async fn head_status<S>(stream: &mut S, req: &str) -> anyhow::Result<Option<u16>>
-where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
-{
-    stream.write_all(req.as_bytes()).await?;
-    let mut buf = [0u8; 256];
-    let n = stream.read(&mut buf).await?;
-    let status = parse_status_line(&buf[..n]);
-    let _ = stream.shutdown().await;
-    Ok(status)
+/// mihomo compat: adapter.UnifiedDelay is applied at startup and config reload.
+static UNIFIED_DELAY: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn set_unified_delay(enabled: bool) {
+    UNIFIED_DELAY.store(enabled, Ordering::Relaxed);
 }
 
-/// Measure latency by connecting through a proxy and sending an HTTP HEAD request.
-/// Returns the total elapsed time in milliseconds and the HTTP status code.
-///
-/// mihomo compat: matches adapter.go URLTest() which uses a 30s HTTP client timeout,
-/// dials through the proxy, sends HEAD, reads the status line. The status code
-/// is returned so callers can apply expected-status "satisfied" semantics.
-/// The caller (run_health_check) wraps this with the configurable per-check
-/// timeout (default 5000ms, healthcheck.go:202).
+/// Shared URLTest path for controller requests and background health checks.
 pub(crate) async fn measure_unified_delay(
     handler: &Arc<dyn OutboundHandler>,
     url: &str,
     dns: &DnsResolver,
-) -> anyhow::Result<(u64, u16)> {
-    // Parse URL to extract host and port
+) -> anyhow::Result<(u16, u16)> {
+    measure_delay(handler, url, dns, UNIFIED_DELAY.load(Ordering::Relaxed)).await
+}
+
+async fn measure_delay(
+    handler: &Arc<dyn OutboundHandler>,
+    url: &str,
+    dns: &DnsResolver,
+    unified: bool,
+) -> anyhow::Result<(u16, u16)> {
     let parsed: url::Url = url.parse()?;
-    let host = parsed.host_str().unwrap_or("www.gstatic.com").to_string();
-    let port = parsed.port_or_known_default().unwrap_or(80);
-    let path = if parsed.path().is_empty() {
-        "/"
-    } else {
-        parsed.path()
-    };
-
-    let is_https = parsed.scheme() == "https";
-    let target = Address::domain(&host, port);
-    let start = Instant::now();
-
-    // Connect through the proxy
-    let stream = handler.connect_stream(&target, dns).await?;
-
-    // mihomo compat: adapter.go URLTest uses a real net/http client that
-    // performs the TLS handshake for https:// test URLs. Sending a plaintext
-    // HEAD to a :443 endpoint makes the TLS server reply with an alert, which
-    // we would misread as "dead" and mark every node down. So for https we
-    // must wrap the proxied stream in TLS before the HEAD.
-    let req = format!(
-        "HEAD {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: clash\r\nConnection: close\r\n\r\n"
+    anyhow::ensure!(
+        matches!(parsed.scheme(), "http" | "https"),
+        "unsupported URL scheme"
     );
-    let status = if is_https {
-        let tls_connector = tokio_rustls::TlsConnector::from(PROBE_TLS_CONFIG.clone());
-        let server_name =
-            rustls::pki_types::ServerName::try_from(host.clone()).unwrap_or_else(|_| {
-                rustls::pki_types::ServerName::try_from("localhost".to_string()).unwrap()
-            });
-        let mut tls_stream = tls_connector.connect(server_name, stream).await?;
-        head_status(&mut tls_stream, &req).await?
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("missing URL host"))?;
+    let port = parsed.port_or_known_default().unwrap();
+    let target = Address::domain(host, port);
+    let start = Instant::now();
+    let stream = handler.connect_stream(&target, dns).await?;
+    let stream: Box<dyn crate::proxy::ProxyStream> = if parsed.scheme() == "https" {
+        let server_name = rustls::pki_types::ServerName::try_from(host.to_string())?;
+        Box::new(
+            tokio_rustls::TlsConnector::from(PROBE_TLS_CONFIG.clone())
+                .connect(server_name, stream)
+                .await?,
+        )
     } else {
-        let mut stream = stream;
-        head_status(&mut stream, &req).await?
+        stream
     };
 
-    let status = status.ok_or_else(|| anyhow::anyhow!("invalid HTTP response"))?;
-    Ok((start.elapsed().as_millis() as u64, status))
+    // A real HTTP connection consumes complete response headers and flushes
+    // framed transports before reading. HEAD responses have no response body.
+    let (mut sender, connection) = hyper::client::conn::http1::handshake::<_, axum::body::Body>(
+        hyper_util::rt::TokioIo::new(stream),
+    )
+    .await?;
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    let request = || {
+        http::Request::builder()
+            .method(http::Method::HEAD)
+            .uri(&parsed[url::Position::BeforePath..url::Position::AfterQuery])
+            .header(
+                http::header::HOST,
+                &parsed[url::Position::BeforeHost..url::Position::AfterPort],
+            )
+            .body(axum::body::Body::empty())
+    };
+    let response = sender.send_request(request()?).await?;
+    let mut status = response.status().as_u16();
+    drop(response);
+    let mut measured_from = start;
+    if unified {
+        // mihomo compat: adapter.go URLTest measures a second HEAD over the
+        // established tunnel. If it fails, retain the first result and timer.
+        let second = Instant::now();
+        let result = async {
+            sender.ready().await?;
+            sender
+                .send_request(request()?)
+                .await
+                .map_err(anyhow::Error::from)
+        }
+        .await;
+        if let Ok(response) = result {
+            status = response.status().as_u16();
+            measured_from = second;
+        }
+    }
+    let delay = measured_from.elapsed().as_millis() as u16;
+    Ok((delay.max(1), status))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn probes_reuse_the_tunnel_and_measure_the_configured_request() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream};
+
+        struct ProbeOutbound(std::sync::Mutex<Option<DuplexStream>>);
+
+        #[async_trait::async_trait]
+        impl OutboundHandler for ProbeOutbound {
+            fn name(&self) -> &str {
+                "probe"
+            }
+            fn proto(&self) -> &str {
+                "test"
+            }
+            fn supports_udp(&self) -> bool {
+                false
+            }
+            async fn connect_stream(
+                &self,
+                target: &Address,
+                _dns: &DnsResolver,
+            ) -> anyhow::Result<Box<dyn crate::proxy::ProxyStream>> {
+                assert_eq!(target, &Address::domain("probe.example", 8080));
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                Ok(Box::new(
+                    self.0.lock().unwrap().take().expect("probe redialed"),
+                ))
+            }
+        }
+
+        let dns = DnsResolver::new(&crate::config::DnsConfig::default())
+            .await
+            .unwrap();
+        for (unified, fail_second, expected_delay, expected_status) in [
+            (false, false, 420, 204),
+            (true, false, 60, 200),
+            (true, true, 470, 204),
+        ] {
+            let (client, server) = tokio::io::duplex(4096);
+            let handler: Arc<dyn OutboundHandler> =
+                Arc::new(ProbeOutbound(std::sync::Mutex::new(Some(client))));
+            let peer = tokio::spawn(async move {
+                let mut stream = BufReader::new(server);
+                for request in 0..if unified { 2 } else { 1 } {
+                    let mut line = String::new();
+                    stream.read_line(&mut line).await.unwrap();
+                    assert_eq!(line, "HEAD /generate_204?check=1 HTTP/1.1\r\n");
+                    let mut headers = String::new();
+                    loop {
+                        line.clear();
+                        stream.read_line(&mut line).await.unwrap();
+                        assert!(!line.is_empty(), "request headers truncated");
+                        if line == "\r\n" {
+                            break;
+                        }
+                        headers.push_str(&line.to_ascii_lowercase());
+                    }
+                    assert!(headers.contains("host: probe.example:8080\r\n"));
+                    assert!(!headers.contains("connection: close"));
+                    if request == 1 && fail_second {
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(if request == 0 { 100 } else { 40 }))
+                        .await;
+                    stream
+                        .write_all(if request == 0 {
+                            b"HTTP/1.1 204 No Content\r\n"
+                        } else {
+                            b"HTTP/1.1 200 OK\r\n"
+                        })
+                        .await
+                        .unwrap();
+                    // Receiving a status line alone must not complete the probe.
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    stream
+                        .write_all(b"Content-Length: 0\r\n\r\n")
+                        .await
+                        .unwrap();
+                }
+            });
+            let (delay, status) = measure_delay(
+                &handler,
+                "http://probe.example:8080/generate_204?check=1",
+                &dns,
+                unified,
+            )
+            .await
+            .unwrap();
+            assert_eq!(status, expected_status);
+            assert_eq!(
+                delay, expected_delay,
+                "unified={unified}, fail_second={fail_second}"
+            );
+            peer.await.unwrap();
+        }
+    }
 
     fn make_store() -> Arc<ProxyStateStore> {
         Arc::new(ProxyStateStore::new())

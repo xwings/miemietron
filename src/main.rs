@@ -380,6 +380,7 @@ impl AppState {
         // mihomo compat: executor.go:412 — re-apply the global outbound interface
         // on reload, clearing it when the new config drops the key.
         transport::tcp::set_default_outbound_interface(new_config.interface_name.clone());
+        proxy_group::set_unified_delay(new_config.unified_delay);
 
         *self.dns_resolver.write() = Arc::new(new_dns);
         *self.rule_engine.write() = new_rules;
@@ -658,6 +659,7 @@ impl Engine {
         // mihomo compat: inbound listeners keep-alive follows disable-keep-alive
         // (keepalive.SetDisableKeepAlive applies to inbound ListenConfig too).
         transport::tcp::set_inbound_keepalive_disabled(self.config.disable_keep_alive);
+        proxy_group::set_unified_delay(self.config.unified_delay);
 
         // mihomo compat: executor.go:412 `dialer.DefaultInterface.Store(general.Interface)`
         // — the top-level `interface-name` is the global fallback every outbound
@@ -916,7 +918,7 @@ impl Engine {
         // All health checks connect through each proxy via connect_stream()
         // to measure true end-to-end latency, matching mihomo's behavior.
         if config.unified_delay {
-            info!("unified-delay enabled: health checks will measure through-proxy latency");
+            info!("unified-delay enabled: delay tests will measure a second HEAD over the established connection");
         }
         let health_handles = proxy_group::health::spawn_health_checks(
             proxy_manager.list_live_groups(),

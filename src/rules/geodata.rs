@@ -8,7 +8,7 @@
 //! install doesn't silently route all `GEOIP,CN,DIRECT` traffic to the
 //! catch-all. Unlike mihomo, a download failure here is a loud error but not
 //! a boot abort — consistent with the provider-fetch policy (see
-//! ARCHITECTURE/rules.md).
+//! ARCHITECTURE/modules/rules.md).
 
 use std::collections::HashMap;
 use std::path::Path;

@@ -1436,7 +1436,7 @@ dependencies = [
 
 [[package]]
 name = "miemietron"
-version = "0.2.18-dev"
+version = "0.2.18"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -1462,6 +1462,7 @@ dependencies = [
  "hmac",
  "http",
  "hyper",
+ "hyper-util",
  "ipnet",
  "libc",
  "loona-hpack",

@@ -5,7 +5,6 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::time::Instant;
 
 use super::ApiState;
 
@@ -322,96 +321,7 @@ pub struct DelayQuery {
 
 // mihomo compat: expected-status parsing/matching lives with the groups
 // (utils.NewUnsignedRanges / IntRanges.Check ports).
-use crate::proxy_group::{parse_expected_status, status_matches};
-
-/// Perform a delay test through a proxy, matching mihomo's adapter.go URLTest().
-///
-/// mihomo uses Go's http.Client with DialContext overridden to route through the
-/// proxy connection. It sends HTTP HEAD and reads the full HTTP response
-/// (handling TLS for HTTPS URLs). Returns (delay_ms, status_code); the caller
-/// applies expected-status "satisfied" semantics — an unexpected status is NOT
-/// an error (adapter.go:166-200).
-async fn do_delay_test(
-    handler: &std::sync::Arc<dyn crate::proxy::OutboundHandler>,
-    dns: &std::sync::Arc<crate::dns::DnsResolver>,
-    url_str: &str,
-) -> Result<(u16, u16), anyhow::Error> {
-    let parsed: url::Url = url_str.parse()?;
-    let host = parsed.host_str().unwrap_or("www.gstatic.com").to_string();
-    let port = parsed
-        .port()
-        .unwrap_or(if parsed.scheme() == "https" { 443 } else { 80 });
-    let path = if let Some(query) = parsed.query() {
-        format!("{}?{}", parsed.path(), query)
-    } else {
-        parsed.path().to_string()
-    };
-    let is_https = parsed.scheme() == "https";
-
-    let target = crate::common::addr::Address::domain(&host, port);
-    let start = Instant::now();
-
-    // mihomo compat: connect through proxy, then use full HTTP client (handles TLS)
-    let stream = handler.connect_stream(&target, dns).await?;
-
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    // For HTTPS: wrap with TLS to the destination (the proxy tunnel is already established)
-    let status_code = if is_https {
-        let provider = rustls::crypto::ring::default_provider();
-        let tls_connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(
-            rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(provider))
-                .with_safe_default_protocol_versions()
-                .expect("tls config")
-                .dangerous()
-                .with_custom_certificate_verifier(std::sync::Arc::new(
-                    crate::transport::tls::NoVerifier::new(),
-                ))
-                .with_no_client_auth(),
-        ));
-        let server_name =
-            rustls::pki_types::ServerName::try_from(host.clone()).unwrap_or_else(|_| {
-                rustls::pki_types::ServerName::try_from("localhost".to_string()).unwrap()
-            });
-        let mut tls_stream = tls_connector.connect(server_name, stream).await?;
-
-        let req = format!("HEAD {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
-        tls_stream.write_all(req.as_bytes()).await?;
-        // Flush so message-framed transports (WebSocket) actually put the
-        // request on the wire — write_all alone leaves it buffered in the sink.
-        tls_stream.flush().await?;
-
-        let mut buf = [0u8; 512];
-        let n = tls_stream.read(&mut buf).await?;
-        parse_http_status(&buf[..n])
-    } else {
-        let mut stream = stream;
-        let req = format!("HEAD {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
-        stream.write_all(req.as_bytes()).await?;
-        stream.flush().await?;
-
-        let mut buf = [0u8; 512];
-        let n = stream.read(&mut buf).await?;
-        parse_http_status(&buf[..n])
-    };
-
-    let delay = start.elapsed().as_millis() as u16;
-
-    let status_code = status_code.ok_or_else(|| anyhow::anyhow!("invalid HTTP response"))?;
-
-    Ok((delay, status_code))
-}
-
-/// Parse HTTP status code from response bytes.
-fn parse_http_status(buf: &[u8]) -> Option<u16> {
-    let s = std::str::from_utf8(buf).ok()?;
-    // "HTTP/1.1 204 No Content"
-    if !s.starts_with("HTTP/") {
-        return None;
-    }
-    let status_part = s.get(9..12)?;
-    status_part.trim().parse().ok()
-}
+use crate::proxy_group::{measure_unified_delay, parse_expected_status, status_matches};
 
 pub async fn get_proxy_delay(
     State(state): State<ApiState>,
@@ -459,7 +369,8 @@ pub async fn get_proxy_delay(
     let dns = state.app.dns_resolver();
     let timeout = std::time::Duration::from_millis(timeout_ms);
 
-    let result = tokio::time::timeout(timeout, do_delay_test(&handler, &dns, url_str)).await;
+    let result =
+        tokio::time::timeout(timeout, measure_unified_delay(&handler, url_str, &dns)).await;
 
     let store = state.app.proxy_state_store();
     match result {
@@ -742,7 +653,8 @@ pub async fn get_group_delay(
         let pname = proxy_name.clone();
         let url = url_str.clone();
         handles.push(tokio::spawn(async move {
-            let result = tokio::time::timeout(timeout, do_delay_test(&handler, &dns, &url)).await;
+            let result =
+                tokio::time::timeout(timeout, measure_unified_delay(&handler, &url, &dns)).await;
 
             match result {
                 Ok(Ok((delay, status))) => (pname, Some((delay, status))),
