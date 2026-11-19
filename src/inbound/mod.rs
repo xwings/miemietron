@@ -27,6 +27,9 @@ pub async fn run_mixed_proxy(
     auth: Arc<Vec<String>>,
 ) -> Result<()> {
     let listener = TcpListener::bind(addr).await?;
+    // mihomo compat: listener.go ReCreateMixed — `socks.NewUDP` on the same
+    // address; failing to get it fails the listener.
+    let _udp = socks::UdpListener::start(addr, conn_manager.clone()).await?;
     tracing::info!("Mixed (HTTP+SOCKS5) proxy listening on {}", addr);
 
     loop {

@@ -1,18 +1,172 @@
 use anyhow::Result;
 use dashmap::DashMap;
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::Path;
 use std::sync::atomic::{AtomicU32, Ordering};
 use tracing::debug;
 
-/// Pre-compiled filter for fast domain bypass checks.
-/// Separates exact matches (O(1) HashSet lookup) from suffix patterns.
-struct CompiledFilter {
-    /// Exact domain matches (from bare patterns and `*.domain` patterns).
-    exact: HashSet<String>,
-    /// Suffix patterns to check with ends_with (from `*.` and `+` patterns).
-    suffixes: Vec<String>,
+/// One `fake-ip-filter` entry.
+///
+/// mihomo compat: config/config.go parseDomain — the `geosite:` / `rule-set:`
+/// prefix is tested case-insensitively and the names are what sits between
+/// the first and the second `:`, split at `,` (`geosite:cn,private`). Every
+/// other entry is a domain pattern.
+pub(super) enum FilterEntry<'a> {
+    Geosite(Vec<&'a str>),
+    RuleSet(Vec<&'a str>),
+    Domain(&'a str),
+}
+
+impl<'a> FilterEntry<'a> {
+    pub(super) fn parse(entry: &'a str) -> Self {
+        let has_prefix = |prefix: &str| {
+            entry
+                .get(..prefix.len())
+                .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+        };
+        let names = || {
+            entry
+                .split(':')
+                .nth(1)
+                .unwrap_or_default()
+                .split(',')
+                .collect()
+        };
+        if has_prefix("geosite:") {
+            Self::Geosite(names())
+        } else if has_prefix("rule-set:") {
+            Self::RuleSet(names())
+        } else {
+            Self::Domain(entry)
+        }
+    }
+}
+
+/// Label of the node standing for any non-empty run of further labels.
+const SUBDOMAINS: &str = "+";
+/// Label of the node standing for exactly one label.
+const ANY_LABEL: &str = "*";
+
+/// Domain patterns matched label by label, with the semantics of mihomo's
+/// `trie.DomainSet` (component/trie/domain.go, domain_set.go):
+/// - names compare case-insensitively;
+/// - `*` stands for exactly one label, wherever it sits (`time.*.com`);
+/// - a leading `+.` matches the rest of the pattern and every subdomain of it;
+/// - a leading `.` matches subdomains only.
+#[derive(Default)]
+struct DomainSet {
+    /// Child nodes by label, walked from the top-level label down.
+    children: HashMap<String, DomainSet>,
+    /// A pattern ends at this node.
+    terminal: bool,
+}
+
+impl DomainSet {
+    /// mihomo compat: domain_set.go DomainSetBuilder.Insert.
+    fn insert(&mut self, pattern: &str) -> Result<()> {
+        let mut labels = valid_and_split_domain(pattern)?;
+        if labels[0] == SUBDOMAINS {
+            self.insert_labels(&labels[1..]);
+        } else if labels[0].is_empty() {
+            labels[0] = SUBDOMAINS.to_string();
+        }
+        self.insert_labels(&labels);
+        Ok(())
+    }
+
+    fn insert_labels(&mut self, labels: &[String]) {
+        let mut node = self;
+        for label in labels.iter().rev() {
+            node = node.children.entry(label.clone()).or_default();
+        }
+        node.terminal = true;
+    }
+
+    /// mihomo compat: domain_set.go Has.
+    fn has(&self, domain: &str) -> bool {
+        let domain = domain.to_lowercase();
+        let labels: Vec<&str> = domain.split('.').collect();
+        self.matches(&labels)
+    }
+
+    fn matches(&self, labels: &[&str]) -> bool {
+        let Some((label, rest)) = labels.split_last() else {
+            return self.terminal;
+        };
+        // An empty leftmost label (the empty name, a leading dot) leaves
+        // nothing for a wildcard to stand for.
+        let wildcard_fits = !(rest.is_empty() && label.is_empty());
+        if wildcard_fits && self.children.contains_key(SUBDOMAINS) {
+            return true;
+        }
+        self.children
+            .get(*label)
+            .is_some_and(|node| node.matches(rest))
+            || (wildcard_fits
+                && self
+                    .children
+                    .get(ANY_LABEL)
+                    .is_some_and(|node| node.matches(rest)))
+    }
+}
+
+/// Lower-case a domain pattern and split it into labels, rejecting a
+/// malformed one.
+///
+/// mihomo compat: component/trie/domain.go ValidAndSplitDomain, error texts
+/// included.
+fn valid_and_split_domain(domain: &str) -> Result<Vec<String>> {
+    let invalid = |reason: String| anyhow::anyhow!("invalid domain {domain:?}: {reason}");
+    if domain.is_empty() {
+        return Err(invalid("domain is empty".into()));
+    }
+    if domain.ends_with('.') {
+        return Err(invalid("trailing dot is not allowed".into()));
+    }
+    if domain.starts_with(char::is_whitespace) {
+        return Err(invalid("leading whitespace is not allowed".into()));
+    }
+    if domain.ends_with(char::is_whitespace) {
+        return Err(invalid("trailing whitespace is not allowed".into()));
+    }
+
+    let labels: Vec<String> = domain
+        .to_lowercase()
+        .split('.')
+        .map(str::to_string)
+        .collect();
+    // An empty first label is the ".example.com" form; any other is a typo.
+    if let Some(i) = labels.iter().skip(1).position(String::is_empty) {
+        return Err(invalid(format!("label {} is empty", i + 2)));
+    }
+    for (i, label) in labels.iter().enumerate() {
+        if label.contains('+') {
+            if label != "+" {
+                return Err(invalid(format!(
+                    "\"+\" wildcard must occupy the entire label {}",
+                    i + 1
+                )));
+            }
+            if i != 0 {
+                return Err(invalid(
+                    "\"+\" wildcard is only allowed in the first label".into(),
+                ));
+            }
+            if labels.len() == 1 {
+                return Err(invalid(
+                    "\"+\" wildcard must be followed by another label".into(),
+                ));
+            }
+        }
+        if label.contains('*') && label != "*" {
+            return Err(invalid(format!(
+                "\"*\" wildcard must occupy the entire label {}",
+                i + 1
+            )));
+        }
+    }
+    Ok(labels)
 }
 
 /// FakeIP pool: assigns fake IPs from a CIDR range to domains.
@@ -30,8 +184,8 @@ pub struct FakeIpPool {
     ip_to_domain: DashMap<IpAddr, String>,
     domain_to_ip: DashMap<String, IpAddr>,
 
-    // Filter (pre-compiled for fast matching)
-    compiled_filter: CompiledFilter,
+    // Domain patterns of the filter
+    filter: DomainSet,
     filter_mode: FilterMode,
 }
 
@@ -70,22 +224,20 @@ impl FakeIpPool {
             FilterMode::Blacklist
         };
 
-        // Pre-compile filter patterns into exact matches and suffix lists
-        // for O(1) exact lookups instead of O(n) iteration per query.
-        let mut exact = HashSet::with_capacity(filter.len());
-        let mut suffixes = Vec::new();
-        for f in filter {
-            if let Some(stripped) = f.strip_prefix("*.") {
-                // *.example.com → suffix ".example.com" + exact "example.com"
-                suffixes.push(format!(".{stripped}"));
-                exact.insert(stripped.to_string());
-            } else if let Some(suffix) = f.strip_prefix('+') {
-                suffixes.push(suffix.to_string());
-            } else {
-                exact.insert(f.clone());
+        // mihomo compat: config.go parseDomain — the `geosite:` / `rule-set:`
+        // entries belong to the resolver's checkers; an invalid pattern fails
+        // the config load. With `fake-ip-filter-mode: rule` (unsupported) the
+        // entries are rule lines, not patterns (config.go parseFakeIPRules).
+        let mut domains = DomainSet::default();
+        if !filter_mode.eq_ignore_ascii_case("rule") {
+            for (idx, entry) in filter.iter().enumerate() {
+                if let FilterEntry::Domain(pattern) = FilterEntry::parse(entry) {
+                    domains
+                        .insert(pattern)
+                        .map_err(|e| anyhow::anyhow!("dns.fake-ip-filter[{idx}]: {e}"))?;
+                }
             }
         }
-        let compiled_filter = CompiledFilter { exact, suffixes };
 
         Ok(Self {
             base: first, // First allocatable IP (base+4)
@@ -95,7 +247,7 @@ impl FakeIpPool {
             offset: AtomicU32::new(0),
             ip_to_domain: DashMap::new(),
             domain_to_ip: DashMap::new(),
-            compiled_filter,
+            filter: domains,
             filter_mode: mode,
         })
     }
@@ -174,12 +326,7 @@ impl FakeIpPool {
     /// Raw filter-pattern match (no filter-mode applied). The resolver ORs
     /// this with the geosite/rule-set checkers before applying the mode.
     pub fn filter_matches(&self, domain: &str) -> bool {
-        self.compiled_filter.exact.contains(domain)
-            || self
-                .compiled_filter
-                .suffixes
-                .iter()
-                .any(|s| domain.ends_with(s.as_str()))
+        self.filter.has(domain)
     }
 
     /// Whether fake-ip-filter-mode is whitelist.
@@ -449,15 +596,18 @@ mod tests {
         let pool = FakeIpPool::new("198.18.0.0/24", &filter, "blacklist").unwrap();
         assert!(should_bypass(&pool, "foo.example.com"));
         assert!(should_bypass(&pool, "bar.example.com"));
-        assert!(should_bypass(&pool, "deep.sub.example.com"));
+        // mihomo compat: `*` is exactly one label (trie/domain_test.go
+        // TestTrie_Wildcard: `*.example.com` does not find foo.sub.example.com).
+        assert!(!should_bypass(&pool, "deep.sub.example.com"));
     }
 
     #[test]
-    fn wildcard_filter_matches_exact_domain() {
-        // *.example.com should also match "example.com" itself
+    fn wildcard_filter_does_not_match_apex() {
+        // mihomo compat: trie/domain_test.go TestTrie_Wildcard — with
+        // `*.example.com` inserted, Search("example.com") is nil.
         let filter = vec!["*.example.com".to_string()];
         let pool = FakeIpPool::new("198.18.0.0/24", &filter, "blacklist").unwrap();
-        assert!(should_bypass(&pool, "example.com"));
+        assert!(!should_bypass(&pool, "example.com"));
     }
 
     #[test]
@@ -475,7 +625,9 @@ mod tests {
         let pool = FakeIpPool::new("198.18.0.0/24", &filter, "blacklist").unwrap();
         assert!(should_bypass(&pool, "router.lan"));
         assert!(should_bypass(&pool, "nas.lan"));
-        assert!(should_bypass(&pool, "lan")); // exact match
+        // mihomo compat: trie/domain_test.go TestTrie_Boundary — `*.dev`
+        // does not find "dev".
+        assert!(!should_bypass(&pool, "lan"));
         assert!(!should_bypass(&pool, "lanmore.com"));
     }
 
@@ -484,7 +636,7 @@ mod tests {
         let filter = vec!["*.local".to_string()];
         let pool = FakeIpPool::new("198.18.0.0/24", &filter, "blacklist").unwrap();
         assert!(should_bypass(&pool, "myhost.local"));
-        assert!(should_bypass(&pool, "local"));
+        assert!(!should_bypass(&pool, "local")); // TestTrie_Boundary, as above
         assert!(!should_bypass(&pool, "localhost")); // not a suffix match for .local
     }
 
@@ -503,9 +655,288 @@ mod tests {
         let pool = FakeIpPool::new("198.18.0.0/24", &filter, "blacklist").unwrap();
         assert!(should_bypass(&pool, "www.google.com"));
         assert!(should_bypass(&pool, "mail.google.com"));
-        // "google.com" does NOT end with ".google.com" (the + prefix strips
-        // only the '+', so the suffix becomes ".google.com" which is longer)
-        assert!(!should_bypass(&pool, "google.com"));
+        // mihomo compat: `+.` covers the domain itself as well
+        // (trie/domain_set_test.go TestDomainSet: `+.cn` has "cn").
+        assert!(should_bypass(&pool, "google.com"));
+    }
+
+    /// The match tables of mihomo's own trie tests
+    /// (component/trie/domain_set_test.go, domain_test.go).
+    #[test]
+    fn domain_set_matches_like_mihomo() {
+        // (patterns, names that match, names that do not)
+        let long_labels = "label.".repeat(50);
+        let long_hit = format!("{long_labels}example.com");
+        let long_miss = format!("{long_labels}example.net");
+        let cases: &[(&[&str], &[&str], &[&str])] = &[
+            // TestDomainSet
+            (
+                &[
+                    "baidu.com",
+                    "google.com",
+                    "www.google.com",
+                    "test.a.net",
+                    "test.a.oc",
+                    "Mijia Cloud",
+                    ".qq.com",
+                    "+.cn",
+                ],
+                &[
+                    "test.cn",
+                    "cn",
+                    "Mijia Cloud",
+                    "test.a.net",
+                    "www.qq.com",
+                    "google.com",
+                ],
+                &["qq.com", "www.baidu.com"],
+            ),
+            // TestDomainSetForeach
+            (
+                &[".example.com", "+.example.org", "example.net"],
+                &[
+                    "www.example.com",
+                    "example.org",
+                    "www.example.org",
+                    "example.net",
+                ],
+                &["example.com", "www.example.net"],
+            ),
+            // TestDomainSetComplexWildcard
+            (
+                &[
+                    "+.baidu.com",
+                    "+.a.baidu.com",
+                    "www.baidu.com",
+                    "+.bb.baidu.com",
+                    "test.a.net",
+                    "test.a.oc",
+                    "www.qq.com",
+                ],
+                &["www.baidu.com", "test.test.baidu.com"],
+                &["google.com"],
+            ),
+            // TestDomainSetWildcard
+            (
+                &[
+                    "*.*.*.baidu.com",
+                    "www.baidu.*",
+                    "stun.*.*",
+                    "*.*.qq.com",
+                    "test.*.baidu.com",
+                    "*.apple.com",
+                ],
+                &[
+                    "www.baidu.com",
+                    "test.test.baidu.com",
+                    "test.test.qq.com",
+                    "stun.ab.cd",
+                ],
+                &[
+                    "test.baidu.com",
+                    "www.google.com",
+                    "a.www.google.com",
+                    "test.qq.com",
+                    "test.test.test.qq.com",
+                ],
+            ),
+            // TestDomainSetWildcardShadow
+            (
+                &["*.example.com", "dead.a.example.com"],
+                &["a.example.com"],
+                &["b.a.example.com"],
+            ),
+            (
+                &[
+                    "*.*.example.com",
+                    "dead.*.a.example.com",
+                    "dead.b.a.example.com",
+                ],
+                &["b.a.example.com"],
+                &["a.example.com"],
+            ),
+            (
+                &["*.*.*.example.com", "*.a.example.com"],
+                &["b.c.a.example.com"],
+                &["d.b.c.a.example.com"],
+            ),
+            // TestDomainSetCase
+            (
+                &["example.com", "EXAMPLE.COM", "+.mixed.example.org"],
+                &["EXAMPLE.COM", "ExAmPlE.cOm", "WWW.MIXED.EXAMPLE.ORG"],
+                &["EXAMPLE.NET"],
+            ),
+            // TestDomainSetUnicode
+            (
+                &["中文.example", "+.测试.cn"],
+                &["中文.example", "www.测试.cn"],
+                &["日本語.example"],
+            ),
+            // TestDomainSetOversizedKey
+            (
+                &["+.example.com"],
+                &[long_hit.as_str()],
+                &[long_miss.as_str()],
+            ),
+            // TestTrie_Wildcard
+            (
+                &[
+                    "*.example.com",
+                    "sub.*.example.com",
+                    "*.dev",
+                    ".org",
+                    ".example.net",
+                    ".apple.*",
+                    "+.foo.com",
+                    "+.stun.*.*",
+                    "+.stun.*.*.*",
+                    "+.stun.*.*.*.*",
+                    "stun.l.google.com",
+                ],
+                &[
+                    "sub.example.com",
+                    "sub.foo.example.com",
+                    "test.org",
+                    "test.example.net",
+                    "test.apple.com",
+                    "test.foo.com",
+                    "foo.com",
+                    "global.stun.website.com",
+                ],
+                &["foo.sub.example.com", "foo.example.dev", "example.com"],
+            ),
+            // TestTrie_Boundary
+            (&["*.dev"], &[], &["dev"]),
+            // TestTrie_WildcardBoundary
+            (&["+.*", "stun.*.*.*"], &["example.com"], &[]),
+            // TestTrie_InvalidWildcardPlacement, consistency: a lone `*` is
+            // any single-label name.
+            (&["*"], &["com"], &["example.com"]),
+            // Not in mihomo's tables, read off domain_set.go Has: a wildcard
+            // never stands for an empty leftmost label.
+            (
+                &["*", "+.example.com", "*.example.org"],
+                &[],
+                &["", ".example.com", ".example.org"],
+            ),
+        ];
+        for (patterns, hits, misses) in cases {
+            let mut set = DomainSet::default();
+            for pattern in *patterns {
+                set.insert(pattern).unwrap();
+            }
+            for name in *hits {
+                assert!(set.has(name), "{patterns:?} should match {name:?}");
+            }
+            for name in *misses {
+                assert!(!set.has(name), "{patterns:?} should not match {name:?}");
+            }
+        }
+    }
+
+    /// mihomo compat: component/trie/domain_test.go
+    /// TestTrie_InvalidWildcardPlacement, TestTrie_ValidAndSplitDomain and
+    /// TestTrie_Boundary — the rejected patterns and why.
+    #[test]
+    fn invalid_patterns_are_rejected_like_mihomo() {
+        for valid in [
+            "+.example.com",
+            "*.example.com",
+            "+.*",
+            "stun.*.*.*",
+            "*",
+            "a.*",
+            "*.a",
+        ] {
+            assert!(
+                valid_and_split_domain(valid).is_ok(),
+                "should accept {valid:?}"
+            );
+        }
+        assert_eq!(
+            valid_and_split_domain("GOOGLE.COM").unwrap(),
+            ["google", "com"]
+        );
+        assert_eq!(
+            valid_and_split_domain("Mijia Cloud").unwrap(),
+            ["mijia cloud"]
+        );
+
+        for (domain, reason) in [
+            (
+                "stun.+",
+                "\"+\" wildcard is only allowed in the first label",
+            ),
+            ("a.+.b", "\"+\" wildcard is only allowed in the first label"),
+            ("a.+", "\"+\" wildcard is only allowed in the first label"),
+            ("+", "\"+\" wildcard must be followed by another label"),
+            (
+                "+.+.com",
+                "\"+\" wildcard is only allowed in the first label",
+            ),
+            ("a+b.com", "\"+\" wildcard must occupy the entire label 1"),
+            ("a*b.com", "\"*\" wildcard must occupy the entire label 1"),
+            ("*a.com", "\"*\" wildcard must occupy the entire label 1"),
+            ("a*.com", "\"*\" wildcard must occupy the entire label 1"),
+            ("", "domain is empty"),
+            ("example.com.", "trailing dot is not allowed"),
+            (".", "trailing dot is not allowed"),
+            (" example.com", "leading whitespace is not allowed"),
+            ("example.com ", "trailing whitespace is not allowed"),
+            ("A..COM", "label 2 is empty"),
+            ("..dev", "label 2 is empty"),
+        ] {
+            let err = valid_and_split_domain(domain).unwrap_err().to_string();
+            assert_eq!(err, format!("invalid domain {domain:?}: {reason}"));
+        }
+    }
+
+    /// mihomo compat: config.go parseDomain — an invalid fake-ip-filter
+    /// pattern fails the config load, naming the entry.
+    #[test]
+    fn invalid_filter_pattern_fails_pool_construction() {
+        let filter = vec![
+            "*.lan".to_string(),
+            "geosite:cn".to_string(),
+            "time.*.com.".to_string(),
+        ];
+        let err = FakeIpPool::new("198.18.0.0/24", &filter, "blacklist")
+            .err()
+            .expect("a trailing dot is not a valid pattern")
+            .to_string();
+        assert_eq!(
+            err,
+            "dns.fake-ip-filter[2]: invalid domain \"time.*.com.\": trailing dot is not allowed"
+        );
+    }
+
+    /// mihomo compat: config.go parseDomain — `geosite:` / `rule-set:` are
+    /// recognised in any case and name comma-separated lists; such entries
+    /// are no domain patterns.
+    #[test]
+    fn filter_entry_prefixes_and_comma_lists() {
+        let names = |entry| match FilterEntry::parse(entry) {
+            FilterEntry::Geosite(names) => ("geosite", names),
+            FilterEntry::RuleSet(names) => ("rule-set", names),
+            FilterEntry::Domain(pattern) => ("domain", vec![pattern]),
+        };
+        assert_eq!(names("geosite:cn"), ("geosite", vec!["cn"]));
+        assert_eq!(
+            names("GEOSITE:cn,private"),
+            ("geosite", vec!["cn", "private"])
+        );
+        assert_eq!(names("Rule-Set:a,B"), ("rule-set", vec!["a", "B"]));
+        assert_eq!(
+            names("geosite.example.com"),
+            ("domain", vec!["geosite.example.com"])
+        );
+
+        // A `+` in a rule-set name is no pattern error: the entry never
+        // reaches the domain set.
+        let filter = vec!["rule-set:cn+private".to_string(), "+.lan".to_string()];
+        let pool = FakeIpPool::new("198.18.0.0/24", &filter, "blacklist").unwrap();
+        assert!(should_bypass(&pool, "router.lan"));
+        assert!(!should_bypass(&pool, "rule-set:cn+private"));
     }
 
     #[test]

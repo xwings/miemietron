@@ -16,11 +16,12 @@ DNS serving. Status: `in progress` toward full parity; implemented with known pa
 
 | Path / symbol | Role |
 | --- | --- |
-| `src/dns/mod.rs` / `DnsResolver::resolve_with_ttl` | Client-facing answers and mappings |
-| `src/dns/mod.rs` / `resolve_real_ip` | Real destination IPs for routing |
-| `src/dns/mod.rs` / `resolve_proxy_server` | Cached/singleflight proxy bootstrap |
+| `src/dns/mod.rs` / `DnsResolver::serve_ip`, `process_dns_query` | Client-facing answers, mappings, reply wire format |
+| `src/dns/mod.rs` / `resolve_real_ip`, `query` | Real destination IPs for routing; controller query |
+| `src/dns/mod.rs` / `resolve_proxy_server` | Cached/singleflight proxy-server host lookups |
+| `src/dns/mod.rs` / `recreate_server`, `ResolverProvider` | Listener across reloads; live resolver for long-lived tasks |
 | `src/dns/upstream.rs` | Policy, racing, fallback/anti-poison and transports |
-| `src/dns/fakeip.rs`, `src/dns/cache.rs` | Domain allocation, reverse map, persistence and TTL cache |
+| `src/dns/fakeip.rs`, `src/dns/cache.rs` | Allocation, filter patterns, reverse map, persistence, TTL cache |
 
 ## Local Conventions
 
@@ -28,24 +29,45 @@ Root conventions suffice; tests live beside their owning implementation.
 
 ## Contracts and Invariants
 
-Client answer order is hosts → FakeIP/filter → real cache → upstream.
+Client answer order is hosts → FakeIP/filter → real cache → upstream (`serve_ip`).
 FakeIP must precede the real cache because `resolve_real_ip` shares that cache.
 Allocations live in the pool, not DNS answer cache. FakeIP TTL is 1; real cached
-answers report remaining upstream TTL (`resolve_with_ttl`).
+answers report remaining upstream TTL.
 
-`resolve_real_ip` never trusts a cached FakeIP and does not populate ip→host:
-rule-only lookups of shared CDN addresses must not rewrite unrelated hosts.
-`resolve_proxy_server` uses bootstrap nameservers and rejects FakeIP to avoid
-recursive proxy dialing. Reverse lookup consults the FakeIP pool first.
+An upstream reply is an `Answer`: response code, every address of the asked
+type, cache TTL (smallest record TTL, OPT excluded). Only SERVFAIL/REFUSED fail
+a nameserver; NXDOMAIN and empty replies win the race, reach the client with
+their code and are cached for their SOA's TTL. Truncated UDP replies retry over TCP.
 
-Filter patterns combine with geosite/rule-set checkers wired after the rule
-engine exists. Whitelist inverts the whole matcher. Nameserver-policy supports
-comma lists, geosite/rule-set and domain patterns, evaluated in config order.
-Fallback decisions apply configured GeoIP/domain criteria.
+`resolve_real_ip` does not populate ip→host: rule-only lookups of shared CDN
+addresses must not rewrite unrelated hosts. ip→host is an LRU of 4096 entries
+without expiry, written for every real address served to a client (cache hits
+too), never for fake IPs. Reverse lookup consults the FakeIP pool first.
+`resolve_proxy_server` asks the main resolver (`nameserver-policy`, `nameserver`,
+`fallback`); with `proxy-server-nameserver` set, only it and its policy, without
+fall-through. Hosts come first, `default-nameserver` is never asked, and answers
+are used as they are.
+
+Filter patterns follow mihomo's DomainSet: case-insensitive, `*` is exactly one
+label anywhere, `+.x` is x and its subdomains, `.x` subdomains only; an invalid
+pattern fails resolver construction. `geosite:`/`rule-set:` entries (any case,
+comma lists) go to checkers wired after the rule engine exists. Whitelist
+inverts the whole matcher. Nameserver-policy supports comma lists,
+geosite/rule-set and domain patterns, evaluated in config order. Fallback
+filters are consulted only when `fallback` servers exist.
 
 Embedded DNS supports A/AAAA; IPv6 needs enablement, fake-ip without a v6 pool
-returns NODATA, HTTPS(65) is empty under fake-ip. Other types relay raw to the
-first plain-UDP main nameserver (`process_dns_query`, `forward_raw_query`).
+answers AAAA empty, SVCB(64)/HTTPS(65) are empty under fake-ip. Other types
+relay raw to the first plain-UDP main nameserver (`process_dns_query`,
+`forward_raw_query`). Replies echo an EDNS0 OPT (1232, DO) to clients that sent
+one; UDP replies truncate with TC to the client's size (512 without OPT; 2048
+at most for the TUN hijack).
+
+`recreate_server` runs at boot and on every reload: an unchanged `dns.listen`
+keeps the sockets and swaps the resolver, a changed one re-binds, disabled DNS
+stops listening; host-less `:port` binds every address. Tasks outliving a reload
+(listener, TUN dns-hijack) fetch the resolver per query: one kept from boot
+answers from a pool that connections no longer look up.
 
 ## Dependencies and Boundaries
 
@@ -61,6 +83,7 @@ changing DNS hijack behavior.
 | Resolve/cache/mapping | Three resolver entry points and TTL/mapping tests | `cargo test dns`; conn/rules integration |
 | Fallback/filter/policy | `upstream.rs`, filter checker wiring | `cargo test should_use_fallback`; `cargo test fakeip` |
 | DNS answer wire format | `process_dns_query` tests | TUN hijack tests if boundary changes |
+| Listener/reload | `recreate_listener`, `main.rs` boot and reload calls | `cargo test listener_answers` |
 
 ## Verification
 
@@ -74,7 +97,9 @@ using real destinations, with foreign traffic selecting its configured proxy.
 
 Policy overlap uses first config order rather than upstream's most-specific
 trie. Fallback domain matches query main first; failed fallback can return main
-rather than error. A/AAAA responses carry one record; no stale/negative cache.
-Hosts cover exact single-IP entries. DoH/DoT hostname bootstrap uses OS DNS.
-Rule filter mode and QUIC/h3/dhcp/rcode upstreams, DoH serving and full EDNS
-subnet are unsupported. Missing rule-set filters log and remain inert.
+rather than error. Client replies carry synthesized A/AAAA records only (no
+CNAME chain or authority SOA); no stale cache. Hosts cover exact single-IP
+entries. DoH/DoT hostname bootstrap uses OS DNS. Rule filter mode and
+QUIC/h3/dhcp/rcode upstreams, DoH serving and full EDNS subnet are unsupported.
+Missing rule-set filters log and remain inert. Group health-check tasks keep
+the resolver they were spawned with across reloads (`spawn_health_checks`).

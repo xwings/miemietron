@@ -17,7 +17,7 @@ Owns smoltcp packet termination and TPROXY UDP socket helpers. Status: `in progr
 | --- | --- |
 | `src/stack/smol.rs` / `SmolStack::start` | Dedicated interface polling thread and flow channels |
 | `src/stack/smol.rs` / `SmolTcpStream` | AsyncRead/AsyncWrite over real TCP segments |
-| `src/stack/smol.rs` / `SmolUdpFlow`, `UdpReplySender` | Per-flow datagrams and reply writeback |
+| `src/stack/smol.rs` / `SmolUdpPacket`, `UdpSender` | Received datagrams and any-source sending |
 | `src/stack/system.rs` | Standalone TPROXY UDP/IP_TRANSPARENT helpers |
 | `src/stack/mod.rs` | Stack module boundary |
 
@@ -37,9 +37,13 @@ specific destination, completes real TCP handshake and yields a stream. Stream
 writes must return real TCP data segments to the client; channel acceptance is
 not sufficient correctness. Deduplicate SYN retransmits and reap closed sockets.
 
-UDP demux is per source/destination and replies are injected through the stack.
-The poll thread bridges bounded channels/wakers; preserve backpressure and EOF
-across task cancellation. TUN loop avoidance is outbound interface binding,
+UDP is handed over datagram by datagram with source and destination; the stack
+keeps no per-client state. One smoltcp socket per remote endpoint receives
+what any client sends there and, through `UdpSender`, sends to a client from
+any source address, so a reply need not come from an address the client wrote
+to. Such a socket is closed after 10 s without a datagram. The poll thread
+bridges bounded channels/wakers; preserve backpressure and EOF across task
+cancellation. TUN loop avoidance is outbound interface binding,
 not firewall interception installed by the stack.
 
 ICMP echo is answered locally under any-IP. It does not measure remote path
@@ -56,7 +60,7 @@ binding changes. Stack code must not own rule evaluation or proxy construction.
 | Change trigger | Inspect / extend | Required docs / checks |
 | --- | --- | --- |
 | TCP/flow lifecycle | Poll loop, SmolTcpStream and packet fixtures | `cargo test stack::smol`; bidirectional wire assertions |
-| UDP demux/reply | Flow keys/channels and reply sender | UDP isolation/reply/backpressure tests |
+| UDP delivery/sending | Endpoint sockets, datagram channels, `UdpSender` | Delivery, any-source send and idle-reap tests |
 | Transparent socket | `system.rs` options/control messages | Privileged IPv4/IPv6 socket integration |
 
 ## Verification

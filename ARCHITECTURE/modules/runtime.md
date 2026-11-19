@@ -9,7 +9,7 @@ Read when: changing boot, reload, CLI, persistence, NTP, manifests, build target
 
 ## Responsibility and Status
 
-Owns `src/main.rs`, selection persistence, NTP monitoring and build tooling.
+Owns `src/main.rs`, selection persistence, the NTP service and build tooling.
 Status: `in progress` toward full parity; implemented, with reload and cross-platform limitations below. Verification
 must distinguish unit results from privileged router and cross-build evidence.
 
@@ -20,7 +20,7 @@ must distinguish unit results from privileged router and cross-build evidence.
 | `src/main.rs` / `main`, `Engine::run` | GID setup, CLI normalization, engine construction, tasks/signals |
 | `src/main.rs` / `AppState::reload_from_config` | Build replacements before exchanging shared components |
 | `src/store.rs` | JSON `cache.db` selections |
-| `src/ntp.rs` | NTP offset query and periodic logging |
+| `src/ntp.rs` / `now`, `recreate_service` | NTP-corrected clock and the service that keeps it |
 | `Cargo.toml`, `.cargo/`, `Cross.toml`, `Makefile`, `.github/workflows/` | Dependencies, static release targets and CI |
 
 ## Local Conventions
@@ -41,6 +41,16 @@ and controller config reload rebuild components. Signals drive shutdown. Read
 Startup and full config reload also apply `unified-delay` to the shared probe
 flag; controller and background checks must observe the same setting.
 
+`ntp::now()` is mihomo's `ntp.Now()`: the system clock plus the last measured
+offset, zero while the service is off. Everything that puts a timestamp on the
+wire or judges one reads it (Reality session ID, VMess, Shadowsocks 2022, TLS
+certificate validity); new protocol code must not call `SystemTime::now()` for
+that. `recreate_service` runs at boot after DNS and on every reload: it
+synchronises at once, then every `interval` minutes, three attempts each,
+through `dialer-proxy` when set, and steps the system clock when
+`write-to-system` is set. A stepped clock clears the offset; mihomo leaves it,
+counting the correction twice until the next synchronisation.
+
 CLI accepts Go single-dash long flags through `normalize_go_flags`, config via
 file/stdin/base64 and the OpenClash version shape `Mihomo Meta <version>`.
 Windows named-pipe controller is accepted as a no-op; Linux is the build target.
@@ -60,14 +70,17 @@ for state-consumer changes, [API](api.md) for reload entry points, and
 | Change trigger | Inspect / extend | Required docs / checks |
 | --- | --- | --- |
 | Boot/reload | `Engine`, `AppState` and affected consumers | Root aggregate checks and real-config smoke test |
+| NTP | `ntp.rs`, upstream `ntp/` and sing `common/ntp` | `cargo test ntp`; a run with `ntp.enable` logging the offset |
 | CLI/persistence | `normalize_go_flags`, base64-config and store tests | `cargo test config_base64`; `cargo test store` |
-| Toolchain/targets | Cargo patch/profile, CI, Makefile | Root all-features checks; target build/static checks |
+| Toolchain/targets | Cargo profile, CI, Makefile | Root all-features checks; target build/static checks |
 
 ## Verification
 
 Use [root checks](../../ARCHITECTURE.md#verification). `cargo test store` proves
 selection roundtrip/corrupt/missing behavior; `cargo test config_base64` covers
-base64 config loading/errors in `main.rs`. CI runs host all-features build/tests and `cross build --release
+base64 config loading/errors in `main.rs`; `cargo test ntp` covers defaults,
+the request packet, offset arithmetic and answer validation, not a live
+exchange or the privileged clock step. CI runs host all-features build/tests and `cross build --release
 --target <triple>` for x86_64/aarch64 musl, then `file`/`readelf` checks for static
 linking. Local `make x86_64` needs musl-gcc; `make aarch64` needs the GNU aarch64
 cross linker and installed Rust target. No claim of cross-build success follows
@@ -76,7 +89,7 @@ from host tests alone.
 ## Known Gaps
 
 Reload does not restart already-bound API/listener sockets. `cache.db` is JSON,
-not mihomo bbolt, so existing core caches are incompatible (`store.rs`). NTP only
-reports offset; `write-to-system` is parsed but not used (`ntp.rs`). Dedicated
-NTP and Go-flag-normalizer unit coverage is absent. Privileged
+not mihomo bbolt, so existing core caches are incompatible (`store.rs`). NTP
+answers are validated (mode, echoed nonce, sane timestamps) where sing accepts
+any 48 bytes. Go-flag-normalizer unit coverage is absent. Privileged
 OpenWrt/TUN behavior needs separate integration evidence.

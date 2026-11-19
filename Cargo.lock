@@ -53,6 +53,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "alloc-no-stdlib"
+version = "2.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cc7bb162ec39d46ab1ca8c77bf72e890535becd1751bb45f64c597edb4c8c6b3"
+
+[[package]]
+name = "alloc-stdlib"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0e76a019e91224d279006ff972f1e984179a6e9feb050adba6ce8274aef23195"
+dependencies = [
+ "alloc-no-stdlib",
+]
+
+[[package]]
 name = "android_system_properties"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -282,6 +297,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3078c7629b62d3f0439517fa394996acacc5cbc91c5a20d8c658e77abd503a71"
 dependencies = [
  "generic-array",
+]
+
+[[package]]
+name = "brotli-decompressor"
+version = "5.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3a32acac15fe1967bc3986b2a6347dffc965602354ea6f450ad07e8bfd253583"
+dependencies = [
+ "alloc-no-stdlib",
+ "alloc-stdlib",
 ]
 
 [[package]]
@@ -1436,7 +1461,7 @@ dependencies = [
 
 [[package]]
 name = "miemietron"
-version = "0.2.18"
+version = "0.2.21-dev"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -1446,6 +1471,7 @@ dependencies = [
  "axum",
  "base64",
  "blake3",
+ "brotli-decompressor",
  "bytes",
  "cfb-mode",
  "chacha20",
@@ -1455,6 +1481,7 @@ dependencies = [
  "clap",
  "dashmap",
  "digest 0.10.7",
+ "flate2",
  "futures-util",
  "h2",
  "hex",
@@ -2119,8 +2146,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.40"
-source = "git+https://github.com/Watfaq/rustls.git?rev=e6e8e7e1a0d65f2f273eb7b5b6179896536ac174#e6e8e7e1a0d65f2f273eb7b5b6179896536ac174"
+version = "0.23.46"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
 dependencies = [
  "log",
  "once_cell",
@@ -2128,7 +2156,6 @@ dependencies = [
  "rustls-pki-types",
  "rustls-webpki",
  "subtle",
- "x25519-dalek",
  "zeroize",
 ]
 
@@ -2153,9 +2180,9 @@ dependencies = [
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.10"
+version = "0.103.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "df33b2b81ac578cabaf06b89b0631153a3f416b0a886e8a7a1707fb51abbd1ef"
+checksum = "e3a0760a887c14823fca5a1c970b01d47c328c696c0c64829d1df50e8f853fd5"
 dependencies = [
  "ring",
  "rustls-pki-types",

@@ -7,6 +7,7 @@ pub mod provider;
 
 use anyhow::Result;
 use regex::Regex;
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
@@ -47,6 +48,92 @@ pub struct RuleMetadata {
     pub in_name: Option<String>,
     pub uid: Option<u32>,
     pub dscp: Option<u8>,
+}
+
+/// One connection as a rule walk sees it.
+struct Probe<'a> {
+    metadata: &'a RuleMetadata,
+    /// The host lowercased once for every domain rule.
+    domain_lower: Option<&'a str>,
+    lazy: LazyIp,
+}
+
+impl Probe<'_> {
+    /// The destination IP as the rule reading it now may see it. `resolves`
+    /// says whether that rule asks for the host to be resolved.
+    fn dst_ip(&self, resolves: bool) -> Option<IpAddr> {
+        if let Some(ip) = self.metadata.dst_ip {
+            return Some(ip);
+        }
+        let read = self.lazy.reads.get();
+        self.lazy.reads.set(read + 1);
+        match self.lazy.state {
+            LazyIpState::Fixed => None,
+            LazyIpState::Unresolved => {
+                if resolves && self.lazy.asked.get().is_none() {
+                    self.lazy.asked.set(Some(read));
+                }
+                None
+            }
+            LazyIpState::Resolved { from, ip } => ip.filter(|_| read >= from),
+        }
+    }
+}
+
+/// The destination IP of a connection that has a host and no IP yet.
+///
+/// mihomo resolves the host from inside the walk. Matching here is
+/// synchronous and resolving is not, so a walk that needs the IP stops, the
+/// caller resolves, and the walk is taken up again where it stopped. Counting
+/// the reads makes the second walk see exactly what an uninterrupted one
+/// would have: nothing before the read that asked, the answer from it on.
+struct LazyIp {
+    /// Reads of the missing destination IP so far.
+    reads: Cell<usize>,
+    /// The first read that asked for resolution.
+    asked: Cell<Option<usize>>,
+    state: LazyIpState,
+}
+
+impl LazyIp {
+    fn new(state: LazyIpState) -> Self {
+        Self {
+            reads: Cell::new(0),
+            asked: Cell::new(None),
+            state,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum LazyIpState {
+    /// There is nothing to resolve, or nobody to resolve it.
+    Fixed,
+    /// A rule may ask.
+    Unresolved,
+    /// Resolution ran, and `ip` (none if it failed) is visible from read
+    /// `from` on.
+    Resolved { from: usize, ip: Option<IpAddr> },
+}
+
+/// How a rule walk ended.
+enum WalkEnd {
+    Matched(Action, String, String),
+    NoMatch,
+    /// Rule `rule` asked for the destination IP at read `read`; `reads` is
+    /// the read count when that rule began.
+    NeedsIp {
+        rule: usize,
+        reads: usize,
+        read: usize,
+    },
+}
+
+/// mihomo compat: no rule matched → DIRECT with a nil rule (tunnel.go
+/// `match`). The empty rule type distinguishes this from an explicit MATCH
+/// rule in /connections and the info log ("doesn't match any rule using ...").
+fn no_rule_matched() -> (Action, String, String) {
+    (Action::Direct, String::new(), String::new())
 }
 
 /// Matcher discriminant, derived once from `rule_type` at parse time.
@@ -815,7 +902,8 @@ impl RuleEngine {
     /// Match a connection and return (action, rule_type, rule_payload).
     ///
     /// This is used by the connection manager to populate the `rule` and
-    /// `rulePayload` fields in the connections API.
+    /// `rulePayload` fields in the connections API. The metadata is taken as
+    /// it is: a host is never resolved (see [`Self::match_rules_resolving`]).
     pub fn match_rules_detailed(&self, metadata: &RuleMetadata) -> (Action, String, String) {
         self.match_rules_detailed_filtered(metadata, None)
     }
@@ -833,12 +921,109 @@ impl RuleEngine {
         metadata: &RuleMetadata,
         adapter_ok: Option<&dyn Fn(&Action) -> bool>,
     ) -> (Action, String, String) {
-        // Pre-lowercase domain once for all domain-based rules.
-        // Previously each domain rule arm called to_lowercase() individually,
-        // resulting in 5+ allocations per connection through the rule chain.
         let domain_lower = metadata.domain.as_ref().map(|d| d.to_lowercase());
+        let probe = Probe {
+            metadata,
+            domain_lower: domain_lower.as_deref(),
+            lazy: LazyIp::new(LazyIpState::Fixed),
+        };
+        match self.walk(&probe, 0, adapter_ok) {
+            WalkEnd::Matched(action, rule_type, payload) => (action, rule_type, payload),
+            // A fixed walk never asks.
+            WalkEnd::NoMatch | WalkEnd::NeedsIp { .. } => no_rule_matched(),
+        }
+    }
 
-        for (i, rule) in self.rules.iter().enumerate() {
+    /// Match a connection, resolving its host if and when a rule asks for the
+    /// destination IP.
+    ///
+    /// mihomo compat: tunnel.go `resolveMetadata` hands the walk a
+    /// `ResolveIP` helper, which GEOIP / IP-CIDR / IP-SUFFIX / IP-ASN rules
+    /// without `no-resolve` call before reading `DstIP`. So the host is
+    /// resolved at most once, by the first such rule the walk reaches; rules
+    /// before it — `no-resolve` ones included — were evaluated without an IP,
+    /// and every rule from it on sees the answer. A failed resolution is not
+    /// retried and leaves the IP empty. The answer becomes `metadata.dst_ip`,
+    /// as it becomes `metadata.DstIP` upstream.
+    ///
+    /// `resolve` is called with the host, only when a host is known and the
+    /// metadata has no IP.
+    pub async fn match_rules_resolving<R, Fut>(
+        &self,
+        metadata: &mut RuleMetadata,
+        adapter_ok: Option<&(dyn Fn(&Action) -> bool + Sync)>,
+        resolve: R,
+    ) -> (Action, String, String)
+    where
+        R: FnOnce(String) -> Fut,
+        Fut: std::future::Future<Output = Option<IpAddr>>,
+    {
+        let domain_lower = metadata.domain.as_ref().map(|d| d.to_lowercase());
+        // Not kept in a variable: without `Sync` it could not cross the await.
+        let filter = || adapter_ok.map(|check| check as &dyn Fn(&Action) -> bool);
+        let state = match (&metadata.domain, metadata.dst_ip) {
+            (Some(_), None) => LazyIpState::Unresolved,
+            _ => LazyIpState::Fixed,
+        };
+
+        // The probe counts reads in `Cell`s, so it must not live across the
+        // await below.
+        let first = self.walk(
+            &Probe {
+                metadata,
+                domain_lower: domain_lower.as_deref(),
+                lazy: LazyIp::new(state),
+            },
+            0,
+            filter(),
+        );
+        let (rule, reads, read) = match first {
+            WalkEnd::Matched(action, rule_type, payload) => return (action, rule_type, payload),
+            WalkEnd::NoMatch => return no_rule_matched(),
+            WalkEnd::NeedsIp { rule, reads, read } => (rule, reads, read),
+        };
+
+        let ip = match metadata.domain.clone() {
+            Some(host) => resolve(host).await,
+            None => None,
+        };
+
+        // Take the walk up again at the rule that asked: what it read before
+        // asking stays empty, the read that asked and all later ones see `ip`.
+        let end = self.walk(
+            &Probe {
+                metadata,
+                domain_lower: domain_lower.as_deref(),
+                lazy: LazyIp {
+                    reads: Cell::new(reads),
+                    asked: Cell::new(None),
+                    state: LazyIpState::Resolved { from: read, ip },
+                },
+            },
+            rule,
+            filter(),
+        );
+        metadata.dst_ip = ip;
+        match end {
+            WalkEnd::Matched(action, rule_type, payload) => (action, rule_type, payload),
+            WalkEnd::NoMatch | WalkEnd::NeedsIp { .. } => no_rule_matched(),
+        }
+    }
+
+    /// Match a connection against the rule engine and return the action.
+    pub fn match_rules(&self, metadata: &RuleMetadata) -> Action {
+        self.match_rules_detailed(metadata).0
+    }
+
+    /// Evaluate the rules from index `start` on until one matches or one asks
+    /// for an IP that has to be resolved first.
+    fn walk(
+        &self,
+        probe: &Probe<'_>,
+        start: usize,
+        adapter_ok: Option<&dyn Fn(&Action) -> bool>,
+    ) -> WalkEnd {
+        for (i, rule) in self.rules.iter().enumerate().skip(start) {
             // mihomo compat: skip disabled rules (toggled via PATCH /rules/disable)
             if self
                 .rule_stats
@@ -848,7 +1033,18 @@ impl RuleEngine {
                 continue;
             }
 
-            if let Some(action) = self.match_single_rule(rule, metadata, domain_lower.as_deref()) {
+            let reads = probe.lazy.reads.get();
+            let action = self.match_single_rule(rule, probe);
+            if let Some(read) = probe.lazy.asked.get() {
+                // Whatever the rule answered, it answered without the IP it
+                // asked for.
+                return WalkEnd::NeedsIp {
+                    rule: i,
+                    reads,
+                    read,
+                };
+            }
+            if let Some(action) = action {
                 if let Some(check) = adapter_ok {
                     if !check(&action) {
                         continue;
@@ -857,60 +1053,10 @@ impl RuleEngine {
                 if let Some(stats) = self.rule_stats.get(i) {
                     stats.hit_count.fetch_add(1, Ordering::Relaxed);
                 }
-                return (action, rule.rule_type.clone(), rule.payload.clone());
+                return WalkEnd::Matched(action, rule.rule_type.clone(), rule.payload.clone());
             }
         }
-
-        // mihomo compat: no rule matched → DIRECT with a nil rule
-        // (tunnel.go:685). The empty rule type distinguishes this from an
-        // explicit MATCH rule in /connections and the info log
-        // ("doesn't match any rule using ...").
-        (Action::Direct, String::new(), String::new())
-    }
-
-    /// Match a connection against the rule engine and return the action.
-    pub fn match_rules(&self, metadata: &RuleMetadata) -> Action {
-        self.match_rules_detailed(metadata).0
-    }
-
-    /// Whether rule evaluation needs the destination host resolved to a real IP.
-    ///
-    /// mihomo compat: tunnel.go `match()` resolves the host on demand (lazily)
-    /// the first time it reaches a destination-IP rule (GEOIP / IP-CIDR /
-    /// IP-CIDR6 / IP-SUFFIX / IP-ASN, without `no-resolve`) while `DstIP` is
-    /// empty. Earlier rules that match without the IP (DOMAIN*, PROCESS*, ...)
-    /// short-circuit, so no resolution happens for them.
-    ///
-    /// The caller invokes this only when `metadata.dst_ip` is None and a domain
-    /// is known (FakeIP was blanked from `dst_ip`); it then resolves via
-    /// `DnsResolver::resolve_real_ip`, populates `dst_ip`, and re-runs
-    /// `match_rules_detailed`. Without this, `GEOIP,CN,DIRECT` never matches
-    /// domain traffic under fake-ip and domestic connections leak through the
-    /// proxy catch-all.
-    pub fn needs_ip_resolution(&self, metadata: &RuleMetadata) -> bool {
-        let domain_lower = metadata.domain.as_ref().map(|d| d.to_lowercase());
-        for (i, rule) in self.rules.iter().enumerate() {
-            // mihomo compat: skip disabled rules (toggled via PATCH /rules/disable)
-            if self
-                .rule_stats
-                .get(i)
-                .is_some_and(|s| s.disabled.load(Ordering::Relaxed))
-            {
-                continue;
-            }
-            // First destination-IP rule reached before any match → resolve once.
-            if self.rule_wants_dst_resolution(rule, 0) {
-                return true;
-            }
-            // An earlier rule matches without needing the dst IP → no resolution.
-            if self
-                .match_single_rule(rule, metadata, domain_lower.as_deref())
-                .is_some()
-            {
-                return false;
-            }
-        }
-        false
+        WalkEnd::NoMatch
     }
 
     /// mihomo compat: `Rule.Match(metadata)` — evaluate one parsed rule.
@@ -919,13 +1065,10 @@ impl RuleEngine {
     /// rule instead of a 36-arm string match) and routes to a per-family
     /// matcher. Every family except logic answers a plain bool, so the
     /// `target -> Action` mapping happens once here.
-    fn match_single_rule(
-        &self,
-        rule: &ParsedRule,
-        metadata: &RuleMetadata,
-        domain_lower: Option<&str>,
-    ) -> Option<Action> {
+    fn match_single_rule(&self, rule: &ParsedRule, probe: &Probe<'_>) -> Option<Action> {
         use RuleKind::*;
+        let metadata = probe.metadata;
+        let domain_lower = probe.domain_lower;
         let matched = match rule.kind {
             Match => true,
 
@@ -935,7 +1078,7 @@ impl RuleEngine {
             | DomainWildcard | DomainRegex | GeoSite => self.match_domain_rule(rule, domain_lower),
 
             GeoIp | SrcGeoIp | IpCidr | SrcIpCidr | IpSuffix | SrcIpSuffix | IpAsn | SrcIpAsn => {
-                self.match_ip_rule(rule, metadata)
+                self.match_ip_rule(rule, probe)
             }
 
             SrcPort | DstPort | InPort => self.match_port_rule(rule, metadata),
@@ -947,7 +1090,7 @@ impl RuleEngine {
 
             // Logic rules pick their own target (SUB-RULE resolves to the
             // matched rule *inside* the named group), so they answer directly.
-            And | Or | Not | SubRule => return self.match_logic_rule(rule, metadata, domain_lower),
+            And | Or | Not | SubRule => return self.match_logic_rule(rule, probe),
 
             Unknown => false,
         };
@@ -1003,7 +1146,7 @@ impl RuleEngine {
     }
 
     /// GEOIP / IP-CIDR / IP-SUFFIX / IP-ASN and their SRC- variants.
-    fn match_ip_rule(&self, rule: &ParsedRule, metadata: &RuleMetadata) -> bool {
+    fn match_ip_rule(&self, rule: &ParsedRule, probe: &Probe<'_>) -> bool {
         // mihomo compat: the `src` param flips a destination-IP rule onto the
         // source IP (base.go ParseParams; parser.go NewGEOIP(isSrc)); the SRC-*
         // rule types always read the source IP.
@@ -1011,11 +1154,13 @@ impl RuleEngine {
             RuleKind::SrcGeoIp
             | RuleKind::SrcIpCidr
             | RuleKind::SrcIpSuffix
-            | RuleKind::SrcIpAsn => metadata.src_ip.as_ref(),
-            _ if rule.is_src => metadata.src_ip.as_ref(),
-            _ => metadata.dst_ip.as_ref(),
+            | RuleKind::SrcIpAsn => probe.metadata.src_ip,
+            _ if rule.is_src => probe.metadata.src_ip,
+            // mihomo compat: `if !noResolveIP && !isSourceIP { helper.ResolveIP() }`
+            // (rules/common/ipcidr.go, geoip.go, ipsuffix.go, ipasn.go).
+            _ => probe.dst_ip(!rule.no_resolve),
         };
-        let Some(ip) = ip else {
+        let Some(ip) = ip.as_ref() else {
             return false;
         };
         match rule.kind {
@@ -1141,27 +1286,22 @@ impl RuleEngine {
     /// rule parser at load, so every rule type (including nested logic)
     /// evaluates with the real matcher. AND over zero rules is vacuously true;
     /// OR over zero rules is false.
-    fn match_logic_rule(
-        &self,
-        rule: &ParsedRule,
-        metadata: &RuleMetadata,
-        domain_lower: Option<&str>,
-    ) -> Option<Action> {
+    fn match_logic_rule(&self, rule: &ParsedRule, probe: &Probe<'_>) -> Option<Action> {
         match rule.kind {
             RuleKind::And => rule
                 .sub_rules
                 .iter()
-                .all(|r| self.match_single_rule(r, metadata, domain_lower).is_some())
+                .all(|r| self.match_single_rule(r, probe).is_some())
                 .then(|| target_to_action(&rule.target)),
 
             RuleKind::Or => rule
                 .sub_rules
                 .iter()
-                .any(|r| self.match_single_rule(r, metadata, domain_lower).is_some())
+                .any(|r| self.match_single_rule(r, probe).is_some())
                 .then(|| target_to_action(&rule.target)),
 
             RuleKind::Not => self
-                .match_single_rule(rule.sub_rules.first()?, metadata, domain_lower)
+                .match_single_rule(rule.sub_rules.first()?, probe)
                 .is_none()
                 .then(|| target_to_action(&rule.target)),
 
@@ -1170,8 +1310,8 @@ impl RuleEngine {
             // matches is the named group evaluated.
             RuleKind::SubRule => {
                 let cond = rule.sub_rules.first()?;
-                self.match_single_rule(cond, metadata, domain_lower)?;
-                self.match_sub_rules_group(&rule.target, metadata, domain_lower, 0)
+                self.match_single_rule(cond, probe)?;
+                self.match_sub_rules_group(&rule.target, probe, 0)
             }
 
             _ => None,
@@ -1182,13 +1322,7 @@ impl RuleEngine {
     /// group; nested SUB-RULE entries recurse (depth-capped so a cyclic group
     /// definition can't overflow the stack under panic=abort); a matched
     /// "PASS-RULE" target skips to the next rule in the group.
-    fn match_sub_rules_group(
-        &self,
-        name: &str,
-        metadata: &RuleMetadata,
-        domain_lower: Option<&str>,
-        depth: usize,
-    ) -> Option<Action> {
+    fn match_sub_rules_group(&self, name: &str, probe: &Probe<'_>, depth: usize) -> Option<Action> {
         if depth > 16 {
             return None;
         }
@@ -1198,16 +1332,13 @@ impl RuleEngine {
                 let Some(cond) = sub.sub_rules.first() else {
                     continue;
                 };
-                if self
-                    .match_single_rule(cond, metadata, domain_lower)
-                    .is_some()
-                {
-                    self.match_sub_rules_group(&sub.target, metadata, domain_lower, depth + 1)
+                if self.match_single_rule(cond, probe).is_some() {
+                    self.match_sub_rules_group(&sub.target, probe, depth + 1)
                 } else {
                     None
                 }
             } else {
-                self.match_single_rule(sub, metadata, domain_lower)
+                self.match_single_rule(sub, probe)
             };
             if let Some(action) = action {
                 if matches!(&action, Action::Proxy(n) if n == "PASS-RULE") {
@@ -1244,36 +1375,6 @@ impl RuleEngine {
             _ => rule.payload.parse().ok(),
         };
         rule_asn == Some(asn)
-    }
-
-    /// mihomo compat: `C.Rule.ShouldResolveIP()` — destination-IP rules
-    /// resolve the host on demand unless tagged `no-resolve` (or `src`, which
-    /// implies it). Logic rules resolve if any nested rule would (mihomo
-    /// resolves lazily inside the nested Match via the helper); SUB-RULE
-    /// considers both its condition and the referenced group.
-    fn rule_wants_dst_resolution(&self, rule: &ParsedRule, depth: usize) -> bool {
-        if depth > 16 {
-            return false;
-        }
-        match rule.kind {
-            RuleKind::GeoIp | RuleKind::IpCidr | RuleKind::IpSuffix | RuleKind::IpAsn => {
-                !rule.is_src && !rule.no_resolve
-            }
-            RuleKind::And | RuleKind::Or | RuleKind::Not => rule
-                .sub_rules
-                .iter()
-                .any(|r| self.rule_wants_dst_resolution(r, depth + 1)),
-            RuleKind::SubRule => {
-                rule.sub_rules
-                    .iter()
-                    .any(|r| self.rule_wants_dst_resolution(r, depth + 1))
-                    || self.sub_rules.get(&rule.target).is_some_and(|rs| {
-                        rs.iter()
-                            .any(|r| self.rule_wants_dst_resolution(r, depth + 1))
-                    })
-            }
-            _ => false,
-        }
     }
 
     pub fn rule_count(&self) -> usize {
@@ -1990,107 +2091,201 @@ mod tests {
         );
     }
 
-    // mihomo compat: tunnel.go match() resolves the host on demand when an
-    // IP-based rule is reached with an empty DstIP. These cover the
-    // needs_ip_resolution() guard that drives that resolution in conn/mod.rs.
+    // mihomo compat: tunnel.go resolves the host from inside the rule walk,
+    // when the first rule that wants the destination IP is reached.
 
-    #[tokio::test]
-    async fn needs_ip_resolution_true_when_ip_rule_reached_without_dst_ip() {
-        let rules: Vec<RuleString> = vec![
-            "DOMAIN-SUFFIX,google.com,Proxy".to_string(),
-            "IP-CIDR,1.2.3.0/24,DIRECT".to_string(),
-            "MATCH,Proxy".to_string(),
-        ];
-        let engine = RuleEngine::new(&rules, &HashMap::new()).await.unwrap();
-
-        // Domain that no DOMAIN rule matches and no dst_ip (FakeIP cleared):
-        // evaluation reaches the IP-CIDR rule, so resolution is required.
-        let meta = RuleMetadata {
-            domain: Some("random.xyz".to_string()),
-            dst_ip: None,
-            ..Default::default()
-        };
-        assert!(engine.needs_ip_resolution(&meta));
-    }
-
-    #[tokio::test]
-    async fn needs_ip_resolution_false_when_domain_rule_matches_first() {
-        let rules: Vec<RuleString> = vec![
-            "DOMAIN-SUFFIX,google.com,Proxy".to_string(),
-            "IP-CIDR,1.2.3.0/24,DIRECT".to_string(),
-            "MATCH,Proxy".to_string(),
-        ];
-        let engine = RuleEngine::new(&rules, &HashMap::new()).await.unwrap();
-
-        // A domain rule matches before the IP-CIDR rule is ever reached.
-        let meta = RuleMetadata {
-            domain: Some("www.google.com".to_string()),
-            dst_ip: None,
-            ..Default::default()
-        };
-        assert!(!engine.needs_ip_resolution(&meta));
-    }
-
-    #[tokio::test]
-    async fn needs_ip_resolution_false_for_no_resolve_ip_rule() {
-        let rules: Vec<RuleString> = vec![
-            "IP-CIDR,1.2.3.0/24,DIRECT,no-resolve".to_string(),
-            "MATCH,Proxy".to_string(),
-        ];
-        let engine = RuleEngine::new(&rules, &HashMap::new()).await.unwrap();
-
-        // no-resolve IP rules never trigger on-demand resolution.
-        let meta = RuleMetadata {
-            domain: Some("random.xyz".to_string()),
-            dst_ip: None,
-            ..Default::default()
-        };
-        assert!(!engine.needs_ip_resolution(&meta));
-    }
-
-    #[tokio::test]
-    async fn needs_ip_resolution_false_without_any_ip_rule() {
-        let rules: Vec<RuleString> = vec![
-            "DOMAIN-SUFFIX,google.com,Proxy".to_string(),
-            "MATCH,Proxy".to_string(),
-        ];
-        let engine = RuleEngine::new(&rules, &HashMap::new()).await.unwrap();
-
-        let meta = RuleMetadata {
-            domain: Some("random.xyz".to_string()),
-            dst_ip: None,
-            ..Default::default()
-        };
-        assert!(!engine.needs_ip_resolution(&meta));
-    }
-
-    #[tokio::test]
-    async fn resolve_on_demand_flips_ip_rule_from_proxy_to_direct() {
-        // Regression for the domestic-routing leak: without a resolved dst_ip,
-        // an IP rule cannot match and the connection falls through to the proxy
-        // catch-all. Once the host is resolved to a real (domestic) IP, the IP
-        // rule matches and routes DIRECT.
-        let rules: Vec<RuleString> = vec![
-            "IP-CIDR,1.2.3.0/24,DIRECT".to_string(),
-            "MATCH,Proxy".to_string(),
-        ];
-        let engine = RuleEngine::new(&rules, &HashMap::new()).await.unwrap();
-
-        // Before resolution: dst_ip is None → leaks to the proxy catch-all.
+    /// Match `host` (no IP known), answering a resolution with `answer`.
+    /// Returns the action, how often the host was resolved, and the IP the
+    /// metadata ends up with.
+    async fn resolving(
+        engine: &RuleEngine,
+        host: &str,
+        answer: Option<&str>,
+    ) -> (Action, usize, Option<IpAddr>) {
         let mut meta = RuleMetadata {
-            domain: Some("domestic.example".to_string()),
-            dst_ip: None,
+            domain: Some(host.to_string()),
             ..Default::default()
         };
-        assert!(engine.needs_ip_resolution(&meta));
+        let calls = Cell::new(0);
+        let (action, _, _) = engine
+            .match_rules_resolving(&mut meta, None, |asked| {
+                assert_eq!(asked, host);
+                calls.set(calls.get() + 1);
+                async move { answer.map(|ip| ip.parse().unwrap()) }
+            })
+            .await;
+        (action, calls.get(), meta.dst_ip)
+    }
+
+    async fn engine_of(rules: &[&str]) -> RuleEngine {
+        let rules: Vec<RuleString> = rules.iter().map(|r| r.to_string()).collect();
+        RuleEngine::new(&rules, &HashMap::new()).await.unwrap()
+    }
+
+    fn proxy(name: &str) -> Action {
+        Action::Proxy(name.to_string())
+    }
+
+    #[tokio::test]
+    async fn the_host_is_resolved_when_an_ip_rule_is_reached() {
+        let engine = engine_of(&[
+            "DOMAIN-SUFFIX,google.com,Proxy",
+            "IP-CIDR,1.2.3.0/24,DIRECT",
+            "MATCH,Proxy",
+        ])
+        .await;
+
+        // No domain rule matches, so the walk reaches the IP-CIDR rule: the
+        // host is resolved and the rule sees the answer. Without this a
+        // domestic host under fake-ip leaks to the proxy catch-all.
         assert_eq!(
-            engine.match_rules(&meta),
-            Action::Proxy("Proxy".to_string())
+            resolving(&engine, "domestic.example", Some("1.2.3.4")).await,
+            (Action::Direct, 1, Some("1.2.3.4".parse().unwrap()))
+        );
+        assert_eq!(
+            resolving(&engine, "random.xyz", Some("9.9.9.9")).await,
+            (proxy("Proxy"), 1, Some("9.9.9.9".parse().unwrap()))
+        );
+    }
+
+    #[tokio::test]
+    async fn the_host_is_not_resolved_when_a_rule_matches_first() {
+        let engine = engine_of(&[
+            "DOMAIN-SUFFIX,google.com,Proxy",
+            "IP-CIDR,1.2.3.0/24,DIRECT",
+            "MATCH,Proxy",
+        ])
+        .await;
+        assert_eq!(
+            resolving(&engine, "www.google.com", Some("1.2.3.4")).await,
+            (proxy("Proxy"), 0, None)
+        );
+    }
+
+    #[tokio::test]
+    async fn no_resolve_rules_never_resolve_the_host() {
+        let engine = engine_of(&["IP-CIDR,1.2.3.0/24,DIRECT,no-resolve", "MATCH,Proxy"]).await;
+        assert_eq!(
+            resolving(&engine, "random.xyz", Some("1.2.3.4")).await,
+            (proxy("Proxy"), 0, None)
         );
 
-        // After resolution (conn/mod.rs sets dst_ip): the IP rule matches DIRECT.
-        meta.dst_ip = Some("1.2.3.4".parse().unwrap());
-        assert_eq!(engine.match_rules(&meta), Action::Direct);
+        let engine = engine_of(&["DOMAIN-SUFFIX,google.com,Proxy", "MATCH,Proxy"]).await;
+        assert_eq!(
+            resolving(&engine, "random.xyz", Some("1.2.3.4")).await,
+            (proxy("Proxy"), 0, None)
+        );
+    }
+
+    #[tokio::test]
+    async fn no_resolve_rules_before_the_resolving_one_see_no_ip() {
+        // rules/common/ipcidr.go Match: a `no-resolve` rule reads whatever
+        // DstIP is at that moment — empty before the first resolving rule,
+        // the answer after it.
+        let before = engine_of(&[
+            "IP-CIDR,91.108.4.0/22,Telegram,no-resolve",
+            "IP-CIDR,10.0.0.0/8,DIRECT",
+            "MATCH,Proxy",
+        ])
+        .await;
+        assert_eq!(
+            resolving(&before, "random.xyz", Some("91.108.4.10"))
+                .await
+                .0,
+            proxy("Proxy")
+        );
+
+        let after = engine_of(&[
+            "IP-CIDR,10.0.0.0/8,DIRECT",
+            "IP-CIDR,91.108.4.0/22,Telegram,no-resolve",
+            "MATCH,Proxy",
+        ])
+        .await;
+        assert_eq!(
+            resolving(&after, "random.xyz", Some("91.108.4.10")).await.0,
+            proxy("Telegram")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_logic_rule_resolves_where_its_evaluation_gets_to() {
+        // The first branch read an empty IP before the second one asked;
+        // taking the walk up again must not let it see the answer.
+        let engine = engine_of(&[
+            "OR,((IP-CIDR,91.108.4.0/22,no-resolve),(IP-CIDR,10.0.0.0/8)),Logic",
+            "MATCH,Proxy",
+        ])
+        .await;
+        assert_eq!(
+            resolving(&engine, "random.xyz", Some("91.108.4.10")).await,
+            (proxy("Proxy"), 1, Some("91.108.4.10".parse().unwrap()))
+        );
+        assert_eq!(
+            resolving(&engine, "random.xyz", Some("10.1.2.3")).await.0,
+            proxy("Logic")
+        );
+
+        // AND stops at the first branch that fails, before anything asks.
+        let engine = engine_of(&[
+            "AND,((DOMAIN,other.example),(IP-CIDR,10.0.0.0/8)),Logic",
+            "MATCH,Proxy",
+        ])
+        .await;
+        assert_eq!(
+            resolving(&engine, "random.xyz", Some("10.1.2.3")).await,
+            (proxy("Proxy"), 0, None)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_resolution_is_not_retried() {
+        let engine = engine_of(&[
+            "IP-CIDR,10.0.0.0/8,DIRECT",
+            "IP-CIDR,1.2.3.0/24,DIRECT",
+            "MATCH,Proxy",
+        ])
+        .await;
+        assert_eq!(
+            resolving(&engine, "random.xyz", None).await,
+            (proxy("Proxy"), 1, None)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_known_ip_is_never_resolved_again() {
+        let engine = engine_of(&["IP-CIDR,1.2.3.0/24,DIRECT", "MATCH,Proxy"]).await;
+        let mut meta = RuleMetadata {
+            domain: Some("random.xyz".to_string()),
+            dst_ip: Some("1.2.3.4".parse().unwrap()),
+            ..Default::default()
+        };
+        let (action, _, _) = engine
+            .match_rules_resolving(&mut meta, None, |_| async { panic!("resolved a known IP") })
+            .await;
+        assert_eq!(action, Action::Direct);
+    }
+
+    #[tokio::test]
+    async fn a_rule_skipped_by_the_adapter_filter_does_not_end_the_walk() {
+        // tunnel.go match(): "UDP is not supported" continues with the next
+        // rule, which may be the one that resolves.
+        let engine = engine_of(&[
+            "DOMAIN-SUFFIX,xyz,NoUdp",
+            "IP-CIDR,1.2.3.0/24,DIRECT",
+            "MATCH,Proxy",
+        ])
+        .await;
+        let mut meta = RuleMetadata {
+            domain: Some("random.xyz".to_string()),
+            ..Default::default()
+        };
+        let skip = |action: &Action| *action != proxy("NoUdp");
+        let (action, _, _) = engine
+            .match_rules_resolving(&mut meta, Some(&skip), |_| async {
+                Some("1.2.3.4".parse().unwrap())
+            })
+            .await;
+        assert_eq!(action, Action::Direct);
     }
 
     #[tokio::test]

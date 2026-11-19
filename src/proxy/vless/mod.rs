@@ -11,8 +11,7 @@ use tracing::debug;
 use crate::common::addr::Address;
 use crate::config::proxy::{GrpcOpts, H2Opts, ProxyConfig, RealityOpts, WsOpts};
 use crate::dns::DnsResolver;
-use crate::proxy::{OutboundHandler, OutboundPacketConn, ProxyStream};
-use crate::transport::fingerprint::TlsFingerprint;
+use crate::proxy::{Handshake, OutboundHandler, OutboundPacketConn, ProxyStream};
 use crate::transport::reality::RealityConfig;
 use crate::transport::stack::{self, SecuritySpec, TransportSpec};
 use crate::transport::tcp::{self, ConnectOpts};
@@ -134,6 +133,12 @@ impl OutboundHandler for VlessOutbound {
         self.udp
     }
 
+    fn handshake(&self) -> Handshake {
+        // mihomo compat: transport/vless/conn.go `NeedHandshake` — the
+        // request goes out with the first write, which the tunnel forces.
+        Handshake::WithEarlyData
+    }
+
     async fn connect_stream(
         &self,
         target: &Address,
@@ -191,23 +196,16 @@ impl VlessOutbound {
             .as_deref()
             .context("VLESS Reality: missing 'public-key'")?;
         let short_id = opts.short_id.as_deref().unwrap_or("");
-        let fp = TlsFingerprint::from_str_opt(self.fingerprint.as_deref());
-        let alpn = match self.network.as_str() {
-            "ws" => vec!["http/1.1".to_string()],
-            "grpc" | "h2" | "xhttp" => vec!["h2".to_string()],
-            _ if self.alpn.is_empty() => crate::transport::fingerprint::default_alpn_for(fp),
-            _ => self.alpn.clone(),
-        };
 
+        // mihomo compat: `GetRealityConn` takes no ALPN — the hello carries
+        // the uTLS preset's own list whatever the transport or `alpn` say.
         let config = RealityConfig::from_opts(
             public_key,
             short_id,
             self.sni.clone(),
-            fp,
-            alpn,
+            self.fingerprint.as_deref(),
             opts.support_x25519mlkem768,
-        )
-        .context("VLESS Reality: invalid configuration")?;
+        )?;
 
         Ok(Some(config))
     }

@@ -1,4 +1,4 @@
-//! Shadowsocks plugin implementations: simple-obfs, v2ray-plugin, shadow-tls.
+//! Shadowsocks plugin implementations: simple-obfs, v2ray-plugin.
 //!
 //! Each plugin wraps the raw TCP stream *before* the AEAD encryption layer,
 //! providing obfuscation or transport encapsulation.
@@ -8,18 +8,19 @@ use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use pin_project_lite::pin_project;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tracing::debug;
 
-/// Parsed plugin options extracted from the config `plugin-opts` map.
+/// Parsed plugin options extracted from the config `plugin-opts` map. An
+/// option that is not set is `None` (or `false`): each plugin has defaults
+/// of its own.
 #[derive(Debug, Clone, Default)]
 pub struct PluginOpts {
     pub mode: Option<String>,
     pub host: Option<String>,
     pub path: Option<String>,
     pub tls: bool,
-    pub password: Option<String>,
+    pub mux: Option<bool>,
+    pub v2ray_http_upgrade: bool,
 }
 
 impl PluginOpts {
@@ -31,21 +32,20 @@ impl PluginOpts {
                 _ => serde_yaml::to_string(v).ok().map(|s| s.trim().to_string()),
             })
         };
-        let get_bool = |key: &str| -> bool {
-            map.get(key)
-                .map(|v| match v {
-                    serde_yaml::Value::Bool(b) => *b,
-                    serde_yaml::Value::String(s) => s == "true" || s == "1",
-                    _ => false,
-                })
-                .unwrap_or(false)
+        let get_bool = |key: &str| -> Option<bool> {
+            map.get(key).map(|v| match v {
+                serde_yaml::Value::Bool(b) => *b,
+                serde_yaml::Value::String(s) => s == "true" || s == "1",
+                _ => false,
+            })
         };
         Self {
             mode: get_str("mode"),
             host: get_str("host"),
             path: get_str("path"),
-            tls: get_bool("tls"),
-            password: get_str("password"),
+            tls: get_bool("tls").unwrap_or(false),
+            mux: get_bool("mux"),
+            v2ray_http_upgrade: get_bool("v2ray-http-upgrade").unwrap_or(false),
         }
     }
 }
@@ -505,22 +505,20 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncWrite for ObfsStream<T> {
 /// Returns a stream suitable for wrapping in `SsStream`.
 pub async fn connect_v2ray_plugin<S>(
     stream: S,
-    opts: &PluginOpts,
-    server_host: &str,
+    host: &str,
+    path: &str,
+    tls: bool,
 ) -> anyhow::Result<Box<dyn crate::proxy::ProxyStream>>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let host = opts.host.as_deref().unwrap_or(server_host);
-    let path = opts.path.as_deref().unwrap_or("/");
-
     let ws_opts = crate::transport::ws::WsOptions {
         host: host.to_string(),
         path: path.to_string(),
         headers: Vec::new(),
     };
 
-    if opts.tls {
+    if tls {
         let tls_opts = crate::transport::tls::TlsOptions {
             sni: host.to_string(),
             skip_cert_verify: false,
@@ -533,158 +531,6 @@ where
     } else {
         let ws_stream = crate::transport::ws::wrap_ws(stream, &ws_opts).await?;
         Ok(Box::new(ws_stream))
-    }
-}
-
-/// Connect through shadow-tls v2.
-///
-/// shadow-tls works by:
-/// 1. Connecting to the shadow-tls server.
-/// 2. Performing a real TLS handshake (proxied to a camouflage server).
-/// 3. After the handshake, sending HMAC-authenticated SS data.
-pub async fn connect_shadow_tls<S>(
-    stream: S,
-    opts: &PluginOpts,
-    server_host: &str,
-) -> anyhow::Result<ShadowTlsStream<S>>
-where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
-    let sni = opts.host.as_deref().unwrap_or(server_host);
-    let password = opts.password.as_deref().unwrap_or("");
-
-    debug!("shadow-tls v2: TLS handshake to SNI={}", sni);
-
-    let tls_opts = crate::transport::tls::TlsOptions {
-        sni: sni.to_string(),
-        skip_cert_verify: true,
-        alpn: vec!["h2".to_string(), "http/1.1".to_string()],
-        fingerprint: None,
-    };
-    let tls_stream = crate::transport::tls::wrap_tls(stream, &tls_opts).await?;
-
-    Ok(ShadowTlsStream {
-        inner: tls_stream,
-        hmac_key: derive_shadow_tls_key(password.as_bytes()),
-        write_state: ShadowTlsWriteState::NeedHmac,
-    })
-}
-
-/// Derive the HMAC key for shadow-tls v2 from the password.
-fn derive_shadow_tls_key(password: &[u8]) -> [u8; 32] {
-    use sha2::Digest;
-    let hash = sha2::Sha256::digest(password);
-    let mut key = [0u8; 32];
-    key.copy_from_slice(&hash);
-    key
-}
-
-pin_project! {
-    /// Stream wrapper for shadow-tls v2.
-    ///
-    /// After the TLS handshake, the first write is prefixed with an HMAC of
-    /// the data (using the password-derived key).  Subsequent data passes
-    /// through the TLS stream directly.
-    pub struct ShadowTlsStream<T> {
-        #[pin]
-        inner: tokio_rustls::client::TlsStream<T>,
-        hmac_key: [u8; 32],
-        write_state: ShadowTlsWriteState,
-    }
-}
-
-enum ShadowTlsWriteState {
-    /// First write: need to prepend the 8-byte HMAC tag.
-    NeedHmac,
-    /// Draining the composed [tag(8)][data] buffer across polls.
-    /// `data_len` is reported to the caller once fully written.
-    Flushing {
-        buf: Vec<u8>,
-        pos: usize,
-        data_len: usize,
-    },
-    /// Tag sent; writes pass through.
-    Streaming,
-}
-
-impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncRead for ShadowTlsStream<T> {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        self.project().inner.poll_read(cx, buf)
-    }
-}
-
-impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncWrite for ShadowTlsStream<T> {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        data: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        let mut this = self.project();
-
-        loop {
-            match this.write_state {
-                ShadowTlsWriteState::NeedHmac => {
-                    if data.is_empty() {
-                        return Poll::Ready(Ok(0));
-                    }
-
-                    use hmac::Mac;
-                    type HmacSha256 = hmac::Hmac<sha2::Sha256>;
-
-                    let mut mac = HmacSha256::new_from_slice(this.hmac_key)
-                        .map_err(|e| io::Error::other(format!("shadow-tls hmac init: {e}")))?;
-                    mac.update(data);
-                    let tag = mac.finalize().into_bytes();
-
-                    let mut buf = Vec::with_capacity(8 + data.len());
-                    buf.extend_from_slice(&tag[..8]);
-                    buf.extend_from_slice(data);
-
-                    *this.write_state = ShadowTlsWriteState::Flushing {
-                        buf,
-                        pos: 0,
-                        data_len: data.len(),
-                    };
-                }
-                ShadowTlsWriteState::Flushing {
-                    ref buf,
-                    ref mut pos,
-                    data_len,
-                } => {
-                    while *pos < buf.len() {
-                        match this.inner.as_mut().poll_write(cx, &buf[*pos..]) {
-                            Poll::Ready(Ok(n)) => {
-                                if n == 0 {
-                                    return Poll::Ready(Err(io::Error::new(
-                                        io::ErrorKind::WriteZero,
-                                        "shadow-tls: write zero",
-                                    )));
-                                }
-                                *pos += n;
-                            }
-                            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                            Poll::Pending => return Poll::Pending,
-                        }
-                    }
-                    let data_len = *data_len;
-                    *this.write_state = ShadowTlsWriteState::Streaming;
-                    return Poll::Ready(Ok(data_len));
-                }
-                ShadowTlsWriteState::Streaming => return this.inner.poll_write(cx, data),
-            }
-        }
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.project().inner.poll_flush(cx)
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.project().inner.poll_shutdown(cx)
     }
 }
 
@@ -704,16 +550,19 @@ mod tests {
             serde_yaml::Value::String("example.com".to_string()),
         );
         map.insert("tls".to_string(), serde_yaml::Value::Bool(true));
-        map.insert(
-            "password".to_string(),
-            serde_yaml::Value::String("secret".to_string()),
-        );
+        map.insert("mux".to_string(), serde_yaml::Value::Bool(false));
 
         let opts = PluginOpts::from_map(&map);
         assert_eq!(opts.mode.as_deref(), Some("http"));
         assert_eq!(opts.host.as_deref(), Some("example.com"));
         assert!(opts.tls);
-        assert_eq!(opts.password.as_deref(), Some("secret"));
+        assert_eq!(opts.mux, Some(false));
+        assert!(!opts.v2ray_http_upgrade);
+
+        // Unset options stay unset: the defaults differ per plugin.
+        let unset = PluginOpts::from_map(&HashMap::new());
+        assert_eq!(unset.host, None);
+        assert_eq!(unset.mux, None);
     }
 
     #[test]
@@ -747,14 +596,6 @@ mod tests {
         let len = ((record[3] as usize) << 8) | (record[4] as usize);
         assert_eq!(len, payload.len());
         assert_eq!(&record[5..], payload);
-    }
-
-    #[test]
-    fn shadow_tls_key_derivation() {
-        let key1 = derive_shadow_tls_key(b"password1");
-        let key2 = derive_shadow_tls_key(b"password2");
-        assert_ne!(key1, key2);
-        assert_eq!(key1.len(), 32);
     }
 
     #[test]

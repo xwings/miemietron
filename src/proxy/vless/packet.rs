@@ -42,7 +42,13 @@ impl<S: AsyncRead + AsyncWrite> VlessPacketConn<S> {
 
 #[async_trait]
 impl<S: AsyncRead + AsyncWrite + Unpin + Send + Sync> OutboundPacketConn for VlessPacketConn<S> {
-    async fn send_to(&self, data: &[u8], _target: &Address) -> Result<usize> {
+    async fn send_to(&self, data: &[u8], target: &Address) -> Result<usize> {
+        // mihomo compat: adapter/outbound/vmess.go `vmessPacketConn.WriteTo`
+        // — a stream that carries datagrams for one destination drops those
+        // meant for another (`ErrUDPRemoteAddrMismatch`).
+        if *target != self.remote {
+            bail!("udp packet dropped due to mismatched remote address");
+        }
         let length = u16::try_from(data.len()).map_err(|_| {
             io::Error::new(io::ErrorKind::InvalidInput, "VLESS UDP packet too large")
         })?;

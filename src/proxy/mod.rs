@@ -5,6 +5,7 @@ pub mod shadowsocks;
 pub mod snell;
 pub mod socks5;
 pub mod ssr;
+pub mod uot;
 
 #[cfg(feature = "trojan")]
 pub mod trojan;
@@ -46,12 +47,39 @@ pub trait OutboundPacketConn: Send + Sync {
     async fn close(&self) -> Result<()>;
 }
 
+/// When the server has to hear from a stream an outbound dialed.
+///
+/// mihomo writes some request headers while dialing and leaves others to the
+/// first write, which the tunnel then forces (`N.NeedHandshake`,
+/// tunnel.go handleTCPConn). Either way the server is told where to connect
+/// without waiting for the client to speak — a server that speaks first
+/// (SMTP, FTP, MySQL, ...) would otherwise never be reached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Handshake {
+    /// Nothing is owed: the stream is ready as dialed (DIRECT, HTTP, SOCKS5).
+    Done,
+    /// The request header is owed at once, on its own: mihomo sends it while
+    /// dialing.
+    AtDial,
+    /// mihomo `NeedHandshake`: the header travels with the client's first
+    /// bytes when they arrive within the tunnel's 200 ms peek, alone
+    /// otherwise.
+    WithEarlyData,
+}
+
 /// Outbound handler trait - all proxy protocols implement this.
 #[async_trait]
 pub trait OutboundHandler: Send + Sync {
     fn name(&self) -> &str;
     fn proto(&self) -> &str;
     fn supports_udp(&self) -> bool;
+
+    /// See [`Handshake`]. A handler that does not return `Done` hands out
+    /// streams whose pending request header is sent by a `poll_write` with an
+    /// empty buffer (and by nothing else an empty write does).
+    fn handshake(&self) -> Handshake {
+        Handshake::Done
+    }
 
     async fn connect_stream(
         &self,
@@ -72,6 +100,68 @@ pub trait OutboundHandler: Send + Sync {
             self.name(),
             self.proto()
         ))
+    }
+
+    /// [`connect_datagram`](Self::connect_datagram) on behalf of a known
+    /// client socket.
+    ///
+    /// mihomo's `ListenPacketContext` is handed the whole metadata; an
+    /// outbound that derives something from the client address (XUDP's
+    /// GlobalID is a hash of `metadata.SourceAddress()`) overrides this.
+    /// `source` is `None` for the core's own datagrams (NTP, DNS).
+    async fn connect_datagram_from(
+        &self,
+        _source: Option<std::net::SocketAddr>,
+        target: &Address,
+        dns: Arc<DnsResolver>,
+    ) -> Result<Box<dyn OutboundPacketConn>> {
+        self.connect_datagram(target, dns).await
+    }
+}
+
+/// A rule target resolved down to the outbound that dials.
+pub struct ResolvedPath {
+    pub handler: Arc<dyn OutboundHandler>,
+    /// The groups the target was resolved through, outermost first.
+    pub groups: Vec<Arc<dyn ProxyGroup>>,
+}
+
+impl ResolvedPath {
+    /// mihomo's `Chain`: the outbound, then each group outward — every group
+    /// a connection is dialed through appends itself (`AppendToChains`).
+    pub fn chains(&self) -> Vec<String> {
+        std::iter::once(self.handler.name().to_string())
+            .chain(self.groups.iter().rev().map(|group| group.name().to_string()))
+            .collect()
+    }
+
+    /// mihomo compat: each group dials through its member with
+    /// `GetProxies(touch = true)`, which is what keeps a lazy health check
+    /// running for a group that is only reached through other groups.
+    pub fn touch(&self) {
+        for group in &self.groups {
+            group.touch();
+        }
+    }
+
+    /// mihomo compat: each group on the path sees the result of the dial it
+    /// forwarded (urltest.go / fallback.go / loadbalance.go `DialContext`).
+    pub fn on_dial_success(&self) {
+        for group in &self.groups {
+            group.on_dial_success();
+        }
+    }
+
+    /// See [`Self::on_dial_success`]. Each group is told the type of the
+    /// member it dialed through: the next group inward, or the outbound.
+    pub fn on_dial_failed(&self, error: &str) {
+        for (at, group) in self.groups.iter().enumerate() {
+            let member_type = match self.groups.get(at + 1) {
+                Some(member) => member.group_type(),
+                None => self.handler.proto(),
+            };
+            group.on_dial_failed(member_type, error);
+        }
     }
 }
 
@@ -716,6 +806,20 @@ impl ProxyManager {
         }
     }
 
+    /// [`Self::resolve_action`], keeping the groups the action's target was
+    /// resolved through.
+    pub fn resolve_action_path(&self, action: &crate::rules::Action) -> Result<ResolvedPath> {
+        if let crate::rules::Action::Proxy(name) = action {
+            if let Some(path) = self.resolve_path(name) {
+                return Ok(path);
+            }
+        }
+        Ok(ResolvedPath {
+            handler: self.resolve_action(action)?,
+            groups: Vec::new(),
+        })
+    }
+
     /// Open a UDP packet conn through the named proxy.
     ///
     /// Architecture rule: when a rule selects a proxy and the proxy is
@@ -745,10 +849,23 @@ impl ProxyManager {
     /// Resolves proxy groups to their selected/active proxy, following chains
     /// like Others → Proxy → Auto-UrlTest → actual proxy (up to 10 levels).
     pub fn resolve(&self, target: &str) -> Option<Arc<dyn OutboundHandler>> {
-        self.resolve_depth(target, 10)
+        self.resolve_path(target).map(|path| path.handler)
     }
 
-    fn resolve_depth(&self, target: &str, depth: usize) -> Option<Arc<dyn OutboundHandler>> {
+    /// Resolve `target` to the outbound that dials, keeping every group the
+    /// resolution passed through.
+    pub fn resolve_path(&self, target: &str) -> Option<ResolvedPath> {
+        let mut groups = Vec::new();
+        let handler = self.resolve_depth(target, 10, &mut groups)?;
+        Some(ResolvedPath { handler, groups })
+    }
+
+    fn resolve_depth(
+        &self,
+        target: &str,
+        depth: usize,
+        groups: &mut Vec<Arc<dyn ProxyGroup>>,
+    ) -> Option<Arc<dyn OutboundHandler>> {
         if depth == 0 {
             return None;
         }
@@ -760,11 +877,14 @@ impl ProxyManager {
 
         // Proxy group — resolve its selected proxy recursively
         if let Some(group) = self.live_groups.get(target) {
+            groups.push(group.clone());
             let selected = group.now();
-            if let Some(result) = self.resolve_depth(&selected, depth - 1) {
+            let passed = groups.len();
+            if let Some(result) = self.resolve_depth(&selected, depth - 1, groups) {
                 return Some(result);
             }
             // Fall back to group's own resolution logic
+            groups.truncate(passed);
             return group.get_proxy(&self.proxies);
         }
 
@@ -802,28 +922,31 @@ impl ProxyManager {
         &self.live_groups
     }
 
-    /// Apply saved proxy group selections (from persistent store).
-    /// Silently skips groups or proxies that no longer exist.
-    pub fn apply_saved_selections(&self, selections: &std::collections::HashMap<String, String>) {
-        for (group_name, proxy_name) in selections {
-            if let Some(group) = self.live_groups.get(group_name) {
-                if group.select(proxy_name) {
-                    tracing::debug!(
-                        "Restored saved selection: group '{}' -> '{}'",
-                        group_name,
-                        proxy_name
-                    );
-                }
+    /// Tell every recorded group what was chosen for it.
+    ///
+    /// mihomo compat: executor.go `patchSelectGroup` — `ForceSet(selected)`
+    /// for the groups cache.db has an entry for; an empty entry unpins.
+    /// Groups and members that no longer exist are skipped.
+    pub fn apply_saved_selections(&self, selections: &crate::store::Selections) {
+        for (group_name, proxy_name) in &selections.selected {
+            let Some(group) = self.live_groups.get(group_name) else {
+                continue;
+            };
+            // See `Selections::legacy`: such a file names a member for every
+            // group, chosen or not.
+            if selections.legacy && group.group_type() != "Selector" {
+                continue;
+            }
+            if proxy_name.is_empty() {
+                group.clear_selection();
+            } else if group.select(proxy_name) {
+                tracing::debug!(
+                    "Restored saved selection: group '{}' -> '{}'",
+                    group_name,
+                    proxy_name
+                );
             }
         }
-    }
-
-    /// Get all current proxy group selections as a map (for persistence).
-    pub fn get_all_selections(&self) -> std::collections::HashMap<String, String> {
-        self.live_groups
-            .iter()
-            .map(|(name, group)| (name.clone(), group.now()))
-            .collect()
     }
 
     /// Get a proxy provider config by name.
@@ -921,6 +1044,90 @@ mod tests {
             Ok(_) => panic!("expected error, got handler"),
             Err(e) => format!("{e}"),
         }
+    }
+
+    /// A group that records what the tunnel tells it.
+    struct RecordingGroup {
+        name: &'static str,
+        kind: &'static str,
+        events: parking_lot::Mutex<Vec<String>>,
+    }
+
+    impl RecordingGroup {
+        fn new(name: &'static str, kind: &'static str) -> Arc<Self> {
+            Arc::new(Self {
+                name,
+                kind,
+                events: parking_lot::Mutex::new(Vec::new()),
+            })
+        }
+    }
+
+    impl ProxyGroup for RecordingGroup {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn group_type(&self) -> &str {
+            self.kind
+        }
+        fn now(&self) -> String {
+            String::new()
+        }
+        fn all(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn select(&self, _name: &str) -> bool {
+            false
+        }
+        fn get_proxy(
+            &self,
+            _proxies: &HashMap<String, Arc<dyn OutboundHandler>>,
+        ) -> Option<Arc<dyn OutboundHandler>> {
+            None
+        }
+        fn on_dial_failed(&self, proxy_type: &str, err: &str) {
+            self.events.lock().push(format!("failed:{proxy_type}:{err}"));
+        }
+        fn on_dial_success(&self) {
+            self.events.lock().push("success".to_string());
+        }
+        fn touch(&self) {
+            self.events.lock().push("touch".to_string());
+        }
+        fn as_any_arc(self: Arc<Self>) -> Arc<dyn std::any::Any + Send + Sync> {
+            self
+        }
+    }
+
+    /// mihomo compat: selector.go / urltest.go `DialContext` — each group
+    /// dials through its member, touching it and seeing how the dial went.
+    #[test]
+    fn a_resolved_path_reports_to_every_group_on_it() {
+        let node = ProxyManager::load_proxy_config(&parse_cfg(
+            "{name: node, type: vless, server: 127.0.0.1, port: 443, uuid: 11111111-2222-3333-4444-555555555555}",
+        ))
+        .unwrap();
+        let outer = RecordingGroup::new("Outer", "Selector");
+        let inner = RecordingGroup::new("Auto", "URLTest");
+        let path = ResolvedPath {
+            handler: node,
+            groups: vec![outer.clone(), inner.clone()],
+        };
+        assert_eq!(path.chains(), ["node", "Auto", "Outer"]);
+
+        path.touch();
+        path.on_dial_failed("boom");
+        path.on_dial_success();
+        // Each group hears about the member it dialed through: the next
+        // group inward, or the outbound itself.
+        assert_eq!(
+            *outer.events.lock(),
+            ["touch", "failed:URLTest:boom", "success"]
+        );
+        assert_eq!(
+            *inner.events.lock(),
+            ["touch", "failed:Vless:boom", "success"]
+        );
     }
 
     #[test]

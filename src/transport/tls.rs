@@ -181,8 +181,24 @@ fn build_client_config(key: &TlsConfigKey) -> Result<ClientConfig> {
     if !key.alpn.is_empty() {
         config.alpn_protocols = key.alpn.iter().map(|s| s.clone().into_bytes()).collect();
     }
+    // mihomo compat: `tlsConfig.Time = ntp.Now` (component/ca/config.go) —
+    // certificate validity is judged by the NTP-corrected clock.
+    config.time_provider = Arc::new(NtpTime);
 
     Ok(config)
+}
+
+/// The NTP-corrected clock, for certificate validity checks.
+#[derive(Debug)]
+struct NtpTime;
+
+impl rustls::time_provider::TimeProvider for NtpTime {
+    fn current_time(&self) -> Option<UnixTime> {
+        crate::ntp::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .map(UnixTime::since_unix_epoch)
+    }
 }
 
 /// A `ServerCertVerifier` that blindly accepts any certificate chain.

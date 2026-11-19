@@ -8,16 +8,15 @@ use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::os::unix::io::AsRawFd;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tokio::time::Duration;
 use tracing::{debug, error, info, warn};
 
 use crate::config::TunConfig;
 use crate::conn::{
-    udp::{self, UdpInbound},
+    udp::{self, UdpInbound, UdpPacket},
     ConnectionManager,
 };
-use crate::dns::DnsResolver;
-use crate::stack::smol::SmolStack;
+use crate::dns::{DnsResolver, ResolverProvider};
+use crate::stack::smol::{SmolStack, SmolUdpPacket, UdpSender};
 use crate::stack::system;
 use device::TunDevice;
 
@@ -34,7 +33,7 @@ use device::TunDevice;
 pub async fn run_tun(
     config: TunConfig,
     conn_manager: Arc<ConnectionManager>,
-    dns: Arc<DnsResolver>,
+    dns: ResolverProvider,
     dns_listen: Option<String>,
 ) -> Result<()> {
     let tun_dev = TunDevice::open(&config)?;
@@ -124,7 +123,7 @@ async fn run_gvisor_stack(
     tun_dev: TunDevice,
     config: &TunConfig,
     conn_manager: Arc<ConnectionManager>,
-    dns: Arc<DnsResolver>,
+    dns: ResolverProvider,
     stack_type: &str,
     dns_listen: &Option<String>,
 ) -> Result<()> {
@@ -135,7 +134,10 @@ async fn run_gvisor_stack(
     // userspace stack, which is behaviorally equivalent for the proxy tunnel).
     let _ = stack_type;
     let stack = SmolStack::start(tun_dev, config.mtu as usize);
-    let (mut tcp_rx, mut udp_rx) = stack.into_channels();
+    let (mut tcp_rx, mut udp_rx, udp_out) = stack.into_channels();
+    // mihomo compat: the tunnel's NAT table — one UDP session per client
+    // socket, whatever it sends to.
+    let udp_nat: Arc<DashMap<SocketAddr, mpsc::Sender<UdpPacket>>> = Arc::new(DashMap::new());
 
     // dns-hijack: destinations matching an entry are answered by the internal
     // resolver in-stack, both TCP and UDP (mihomo sing_tun/dns.go ShouldHijackDns).
@@ -144,8 +146,6 @@ async fn run_gvisor_stack(
         info!("TUN dns-hijack active for: {:?}", hijack);
     }
     let _ = dns_listen; // hijacked queries are served locally, not forwarded
-
-    let udp_timeout = Duration::from_secs(config.udp_timeout);
 
     info!("TUN {} ready — smoltcp userspace stack", config.device);
 
@@ -174,21 +174,45 @@ async fn run_gvisor_stack(
                 });
             }
             udp = udp_rx.recv() => {
-                let Some(flow) = udp else {
+                let Some(packet) = udp else {
                     error!("smoltcp UDP channel closed");
                     break;
                 };
+                if dns_hijack_matches(&hijack, packet.dst) {
+                    let dns = dns.clone();
+                    let out = udp_out.clone();
+                    tokio::spawn(async move {
+                        handle_hijacked_dns_udp(packet, &dns, &out).await;
+                    });
+                    continue;
+                }
+                let src = packet.src;
+                let queued = udp::enqueue(&udp_nat, src, UdpPacket::new(packet.dst, packet.data));
+                let Some((tx, rx)) = queued else {
+                    continue;
+                };
                 let cm = conn_manager.clone();
-                let dns = dns.clone();
-                let hijack = hijack.clone();
+                let nat = udp_nat.clone();
+                let out = udp_out.clone();
                 tokio::spawn(async move {
-                    if dns_hijack_matches(&hijack, flow.dst) {
-                        handle_hijacked_dns_udp(flow, &dns).await;
-                        return;
+                    let session = cm.handle_udp(
+                        UdpInbound { src, conn_type: "tun" },
+                        rx,
+                        |data, from| {
+                            let out = out.clone();
+                            async move {
+                                if out.send(from, src, data).await {
+                                    Ok(())
+                                } else {
+                                    Err(anyhow::anyhow!("TUN stack closed"))
+                                }
+                            }
+                        },
+                    );
+                    if let Err(e) = session.await {
+                        debug!("TUN UDP session {} error: {}", src, e);
                     }
-                    if let Err(e) = handle_tun_udp_flow(flow, &cm, &dns, udp_timeout).await {
-                        debug!("TUN UDP flow error: {}", e);
-                    }
+                    nat.remove_if(&src, |_, existing| existing.same_channel(&tx));
                 });
             }
         }
@@ -197,20 +221,16 @@ async fn run_gvisor_stack(
     Ok(())
 }
 
-/// Answer a hijacked DNS-over-UDP flow entirely from the internal resolver,
-/// relaying each query's response back through the stack to the client.
-async fn handle_hijacked_dns_udp(
-    mut flow: crate::stack::smol::SmolUdpFlow,
-    dns: &Arc<DnsResolver>,
-) {
-    debug!("[DNS] hijack udp:{} from {}", flow.dst, flow.src);
-    // The first datagram is already queued in flow.rx.
-    while let Some(query) = flow.rx.recv().await {
-        if let Some(resp) = crate::dns::process_dns_query(&query, dns).await {
-            if !flow.reply.send(resp).await {
-                break;
-            }
-        }
+/// Answer a hijacked DNS-over-UDP query from the internal resolver, back
+/// through the stack from the address it was sent to.
+///
+/// mihomo compat: `resolver.RelayDnsPacket` serves from the resolver of the
+/// running config — the one a reload swapped in, asked for per query.
+async fn handle_hijacked_dns_udp(packet: SmolUdpPacket, dns: &ResolverProvider, out: &UdpSender) {
+    debug!("[DNS] hijack udp:{} from {}", packet.dst, packet.src);
+    let reply_limit = Some(crate::dns::SAFE_DNS_PACKET_SIZE);
+    if let Some(resp) = crate::dns::process_dns_query(&packet.data, &dns(), reply_limit).await {
+        out.send(packet.dst, packet.src, resp).await;
     }
 }
 
@@ -218,7 +238,7 @@ async fn handle_hijacked_dns_udp(
 /// from the internal resolver.
 async fn handle_hijacked_dns_tcp(
     mut stream: crate::stack::smol::SmolTcpStream,
-    dns: &Arc<DnsResolver>,
+    dns: &ResolverProvider,
 ) -> Result<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     debug!("[DNS] hijack tcp:{}", stream.dst);
@@ -235,49 +255,11 @@ async fn handle_hijacked_dns_tcp(
         }
         let mut msg = vec![0u8; msg_len];
         stream.read_exact(&mut msg).await?;
-        if let Some(resp) = crate::dns::process_dns_query(&msg, dns).await {
+        if let Some(resp) = crate::dns::process_dns_query(&msg, &dns(), None).await {
             stream.write_all(&(resp.len() as u16).to_be_bytes()).await?;
             stream.write_all(&resp).await?;
         }
     }
-}
-
-/// Relay one smoltcp UDP flow through the proxy tunnel: rule-match once, dial
-/// the outbound (DIRECT or proxy) via the handler's `connect_datagram`, forward
-/// every client datagram, and pump replies back through `flow.reply`. This is
-/// the userspace-stack equivalent of the TPROXY UDP relay — proxied UDP is
-/// actually proxied (not leaked DIRECT) and replies reach the client.
-async fn handle_tun_udp_flow(
-    flow: crate::stack::smol::SmolUdpFlow,
-    conn_manager: &ConnectionManager,
-    _dns: &Arc<DnsResolver>,
-    udp_timeout: Duration,
-) -> Result<()> {
-    let src = flow.src;
-    let dst = flow.dst;
-
-    conn_manager
-        .handle_udp(
-            UdpInbound {
-                src,
-                dst,
-                conn_type: "tun",
-                domain: None,
-            },
-            flow.rx,
-            udp_timeout,
-            |packet| {
-                let reply = flow.reply.clone();
-                async move {
-                    if reply.send(packet).await {
-                        Ok(())
-                    } else {
-                        Err(anyhow::anyhow!("TUN UDP client flow closed"))
-                    }
-                }
-            },
-        )
-        .await
 }
 
 /// Receive a UDP datagram via `recvmsg`, extracting both the source address
@@ -354,17 +336,15 @@ fn recvmsg_orig_dst(
     Ok((n, src_addr, dst_addr))
 }
 
-/// Full UDP relay for TPROXY'd datagrams.
+/// UDP relay for TPROXY'd datagrams.
 ///
-/// Uses `recvmsg` with `IP_RECVORIGDSTADDR` to recover the original destination.
-/// For each unique (src, dst) pair, maintains a NAT mapping with idle timeout.
-/// Datagrams are forwarded to the destination (DIRECT) or through the proxy.
-/// Replies are sent back through the TPROXY socket to the original client.
+/// Uses `recvmsg` with `IP_RECVORIGDSTADDR` to recover the original
+/// destination. Every client socket gets one session (mihomo's NAT table);
+/// replies go back through sockets bound to the address they come from.
 async fn run_udp_relay(
     port: u16,
     conn_manager: Arc<ConnectionManager>,
     _dns: Arc<DnsResolver>,
-    timeout_secs: u64,
 ) -> Result<()> {
     let socket = match system::create_udp_tproxy_socket(port).await {
         Ok(s) => s,
@@ -378,14 +358,9 @@ async fn run_udp_relay(
     };
 
     let listener = Arc::new(socket);
-    let nat_table: Arc<DashMap<(SocketAddr, SocketAddr), mpsc::Sender<Vec<u8>>>> =
-        Arc::new(DashMap::new());
-    let timeout_dur = Duration::from_secs(timeout_secs);
+    let nat_table: Arc<DashMap<SocketAddr, mpsc::Sender<UdpPacket>>> = Arc::new(DashMap::new());
 
-    info!(
-        "UDP relay listening on port {} (timeout {}s)",
-        port, timeout_secs
-    );
+    info!("UDP relay listening on port {}", port);
 
     let raw_fd = listener.as_raw_fd();
     let mut buf = vec![0u8; 65535];
@@ -406,69 +381,172 @@ async fn run_udp_relay(
             }
         };
 
-        let data = buf[..n].to_vec();
-        let key = (src_addr, orig_dst);
-
-        let Some((tx, rx)) = udp::enqueue(&nat_table, key, data) else {
+        let packet = UdpPacket::new(orig_dst, buf[..n].to_vec());
+        let Some((tx, rx)) = udp::enqueue(&nat_table, src_addr, packet) else {
             continue;
         };
         let nat = nat_table.clone();
         let cm = conn_manager.clone();
         tokio::spawn(async move {
-            let result = cm.handle_udp(
-                UdpInbound { src: src_addr, dst: orig_dst, conn_type: "tproxy", domain: None },
+            let local = LocalConns::new(src_addr, tx.clone());
+            let session = cm.handle_udp(
+                UdpInbound {
+                    src: src_addr,
+                    conn_type: "tproxy",
+                },
                 rx,
-                timeout_dur,
-                |data| async move { send_udp_from(orig_dst, src_addr, &data).map_err(Into::into) },
-            ).await;
-            if let Err(error) = result {
-                debug!("UDP session {} -> {} error: {}", src_addr, orig_dst, error);
+                |data, from| {
+                    let local = &local;
+                    async move { local.write_back(from, &data).await }
+                },
+            );
+            if let Err(error) = session.await {
+                debug!("UDP session {} error: {}", src_addr, error);
             }
-            nat.remove_if(&key, |_, existing| existing.same_channel(&tx));
+            nat.remove_if(&src_addr, |_, existing| existing.same_channel(&tx));
         });
     }
 }
 
-/// Send a UDP datagram that appears to originate from `from_addr` to `to_addr`.
+/// The sockets one TPROXY client is answered through, one per address it is
+/// answered from.
 ///
-/// Uses `IP_TRANSPARENT` + `bind` on the spoofed source, which is what TPROXY
-/// requires for the reverse path.
-fn send_udp_from(from_addr: SocketAddr, to_addr: SocketAddr, data: &[u8]) -> std::io::Result<()> {
-    let sock = socket2::Socket::new(
-        socket2::Domain::IPV4,
-        socket2::Type::DGRAM,
-        Some(socket2::Protocol::UDP),
-    )?;
+/// mihomo compat: listener/tproxy/packet.go `createOrGetLocalConn` — a
+/// socket is bound (transparently) to the remote address and connected to
+/// the client, kept for the life of the NAT entry, and read as well: once it
+/// exists the kernel hands it the client's datagrams for that remote instead
+/// of the TPROXY listener.
+struct LocalConns {
+    client: SocketAddr,
+    session: mpsc::Sender<UdpPacket>,
+    conns: tokio::sync::Mutex<std::collections::HashMap<SocketAddr, LocalConn>>,
+}
 
-    // IP_TRANSPARENT allows binding to a non-local address
+struct LocalConn {
+    socket: Arc<tokio::net::UdpSocket>,
+    reader: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for LocalConn {
+    fn drop(&mut self) {
+        debug!(
+            "Closing TProxy local conn... rAddr={:?}",
+            self.socket.local_addr().ok()
+        );
+        self.reader.abort();
+    }
+}
+
+impl LocalConns {
+    fn new(client: SocketAddr, session: mpsc::Sender<UdpPacket>) -> Self {
+        Self {
+            client,
+            session,
+            conns: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// Send `data` to the client as coming from `from`.
+    async fn write_back(&self, from: SocketAddr, data: &[u8]) -> Result<()> {
+        let socket = {
+            let mut conns = self.conns.lock().await;
+            match conns.get(&from) {
+                Some(conn) => conn.socket.clone(),
+                None => {
+                    let socket = match dial_transparent_udp(from, self.client) {
+                        Ok(socket) => Arc::new(socket),
+                        Err(e) => {
+                            error!(
+                                "listenLocalConn failed with error: {}, packet loss (rAddr={} lAddr={})",
+                                e, from, self.client
+                            );
+                            return Err(e.into());
+                        }
+                    };
+                    debug!(
+                        "TProxy listenLocalConn rAddr={} lAddr={}",
+                        from, self.client
+                    );
+                    let reader =
+                        tokio::spawn(read_local_conn(socket.clone(), from, self.session.clone()));
+                    conns.insert(
+                        from,
+                        LocalConn {
+                            socket: socket.clone(),
+                            reader,
+                        },
+                    );
+                    socket
+                }
+            }
+        };
+        socket.send(data).await?;
+        Ok(())
+    }
+}
+
+/// Feed what the client sends to `remote` through a local conn into its
+/// session.
+async fn read_local_conn(
+    socket: Arc<tokio::net::UdpSocket>,
+    remote: SocketAddr,
+    session: mpsc::Sender<UdpPacket>,
+) {
+    let mut buf = vec![0u8; 65535];
+    loop {
+        match socket.recv(&mut buf).await {
+            // A full queue drops the datagram, as on the listener.
+            Ok(n) => {
+                let _ = session.try_send(UdpPacket::new(remote, buf[..n].to_vec()));
+            }
+            // An ICMP error surfacing on the connected socket is not the end
+            // of it; anything else is.
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {}
+            Err(e) => {
+                debug!("TProxy local conn listener exit.. rAddr={}: {}", remote, e);
+                break;
+            }
+        }
+    }
+}
+
+/// A UDP socket bound to the non-local `from` and connected to `to`.
+///
+/// mihomo compat: listener/tproxy/udp_linux.go `dialUDP` — SO_REUSEADDR and
+/// IP_TRANSPARENT, and no SO_MARK: OpenClash routes its own mark to `lo`,
+/// which a marked reply would follow instead of reaching the client.
+fn dial_transparent_udp(
+    from: SocketAddr,
+    to: SocketAddr,
+) -> std::io::Result<tokio::net::UdpSocket> {
+    let (domain, level, option) = if from.is_ipv4() && to.is_ipv4() {
+        (socket2::Domain::IPV4, libc::SOL_IP, libc::IP_TRANSPARENT)
+    } else {
+        (
+            socket2::Domain::IPV6,
+            libc::SOL_IPV6,
+            libc::IPV6_TRANSPARENT,
+        )
+    };
+    let sock = socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))?;
+    sock.set_reuse_address(true)?;
     let on: libc::c_int = 1;
-    unsafe {
+    let rc = unsafe {
         libc::setsockopt(
             sock.as_raw_fd(),
-            libc::SOL_IP,
-            libc::IP_TRANSPARENT,
+            level,
+            option,
             &on as *const libc::c_int as *const libc::c_void,
             std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-        );
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
     }
-
-    // SO_MARK to bypass TUN
-    let mark: u32 = 0x162;
-    unsafe {
-        libc::setsockopt(
-            sock.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_MARK,
-            &mark as *const u32 as *const libc::c_void,
-            std::mem::size_of::<u32>() as libc::socklen_t,
-        );
-    }
-
-    sock.set_reuse_address(true)?;
-    sock.bind(&socket2::SockAddr::from(from_addr))?;
-    sock.send_to(data, &socket2::SockAddr::from(to_addr))?;
-
-    Ok(())
+    sock.bind(&socket2::SockAddr::from(from))?;
+    sock.connect(&socket2::SockAddr::from(to))?;
+    sock.set_nonblocking(true)?;
+    tokio::net::UdpSocket::from_std(sock.into())
 }
 
 /// Run a standalone UDP TPROXY listener on the given port.
@@ -480,8 +558,7 @@ pub async fn run_tproxy_udp_listener(
     conn_manager: Arc<ConnectionManager>,
     dns: Arc<DnsResolver>,
 ) -> Result<()> {
-    // Default UDP session timeout of 300 seconds
-    run_udp_relay(port, conn_manager, dns, 300).await
+    run_udp_relay(port, conn_manager, dns).await
 }
 
 /// Cleanup guard that removes the TUN routes when the module shuts down.

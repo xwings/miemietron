@@ -72,56 +72,52 @@ pub async fn get_configs(State(state): State<ApiState>) -> Json<Value> {
 
 #[derive(Deserialize, Default)]
 pub struct PutConfigsQuery {
-    force: Option<bool>,
+    force: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct PutConfigsBody {
+    path: String,
+    payload: String,
 }
 
 /// PUT /configs — full config reload.
 ///
-/// Accepts JSON body with either:
-///   - `{"path": "/path/to/config.yaml"}` — read and reload from that file
-///   - `{"payload": "yaml string"}` — parse and reload from the inline YAML
-///
-/// Supports `?force=true` query param to force reload even if config hasn't changed.
+/// mihomo compat: hub/route/configs.go `updateConfigs`. A non-empty `payload`
+/// is the config itself; otherwise `path` names it, and an empty `path` means
+/// the file the core was started with — which is what both dashboards send
+/// for "reload config" (`{"path": "", "payload": ""}`). The body is decoded
+/// whatever its Content-Type says.
 pub async fn put_configs(
     State(state): State<ApiState>,
     Query(query): Query<PutConfigsQuery>,
-    Json(body): Json<Value>,
+    body: axum::body::Bytes,
 ) -> Response {
-    let force = query.force.unwrap_or(false);
+    let Ok(body) = serde_json::from_slice::<PutConfigsBody>(&body) else {
+        return config_error(StatusCode::BAD_REQUEST, "Body invalid");
+    };
+    let force = query.force.as_deref() == Some("true");
 
-    let result = if let Some(path_str) = body.get("path").and_then(|v| v.as_str()) {
-        // Reload from file path
-        let path = std::path::PathBuf::from(path_str);
-        if !path.exists() {
-            error!("PUT /configs: path does not exist: {}", path.display());
-            // mihomo returns a JSON error body; OpenClash treats any non-empty
-            // response as failure, so an empty body would mask this.
-            return config_error(
-                StatusCode::BAD_REQUEST,
-                &format!("config path not found: {}", path.display()),
-            );
-        }
-        info!(
-            "PUT /configs: reloading from path: {} (force={})",
-            path.display(),
-            force
-        );
-        // Update the stored config path so future SIGHUP reloads use it too
-        *state.app.config_path.write() = path.clone();
-        state.app.reload_from_path(&path).await
-    } else if let Some(payload) = body.get("payload").and_then(|v| v.as_str()) {
-        // Reload from inline YAML payload
+    let result = if !body.payload.is_empty() {
         info!(
             "PUT /configs: reloading from payload ({} bytes, force={})",
-            payload.len(),
+            body.payload.len(),
             force
         );
-        state.app.reload_from_str(payload).await
+        state.app.reload_from_str(&body.payload).await
     } else {
-        // No path or payload — try reloading from the current config path
-        let path = state.app.config_path.read().clone();
+        let path = if body.path.is_empty() {
+            state.app.config_path.read().clone()
+        } else {
+            let path = std::path::PathBuf::from(&body.path);
+            if !path.is_absolute() {
+                return config_error(StatusCode::BAD_REQUEST, "path is not a absolute path");
+            }
+            path
+        };
         info!(
-            "PUT /configs: reloading from current path: {} (force={})",
+            "PUT /configs: reloading from path: {} (force={})",
             path.display(),
             force
         );
@@ -250,5 +246,84 @@ pub async fn post_configs_geo(State(state): State<ApiState>) -> Response {
             StatusCode::NO_CONTENT.into_response()
         }
         Err(e) => config_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::conn::ConnectionManager;
+    use std::sync::Arc;
+
+    async fn state() -> ApiState {
+        let app = crate::conn::test_support::app_state("mode: rule\n").await;
+        ApiState {
+            conn_manager: Arc::new(ConnectionManager::new(app.clone())),
+            app,
+        }
+    }
+
+    async fn put(state: &ApiState, body: &str) -> (StatusCode, String) {
+        let response = put_configs(
+            State(state.clone()),
+            Query(PutConfigsQuery::default()),
+            axum::body::Bytes::copy_from_slice(body.as_bytes()),
+        )
+        .await;
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        (status, String::from_utf8(body.to_vec()).unwrap())
+    }
+
+    /// mihomo compat: hub/route/configs.go updateConfigs.
+    #[tokio::test]
+    async fn put_configs_reloads_like_mihomo() {
+        let state = state().await;
+        let dir = tempfile::tempdir().unwrap();
+        let on_disk = dir.path().join("config.yaml");
+        std::fs::write(&on_disk, "mode: direct\n").unwrap();
+        *state.app.config_path.write() = on_disk.clone();
+        let mode = || state.app.runtime_config.read().mode.clone();
+
+        // What both dashboards send for "reload config": the file the core
+        // was started with.
+        assert_eq!(
+            put(&state, r#"{"path": "", "payload": ""}"#).await,
+            (StatusCode::NO_CONTENT, String::new())
+        );
+        assert_eq!(mode(), "direct");
+
+        // A payload wins over a path.
+        let body = format!(
+            r#"{{"path": {:?}, "payload": "mode: global\n"}}"#,
+            on_disk.display().to_string()
+        );
+        assert_eq!(put(&state, &body).await.0, StatusCode::NO_CONTENT);
+        assert_eq!(mode(), "global");
+
+        // An explicit path is read, and does not become the default one.
+        let other = dir.path().join("other.yaml");
+        std::fs::write(&other, "mode: rule\n").unwrap();
+        let body = format!(r#"{{"path": {:?}}}"#, other.display().to_string());
+        assert_eq!(put(&state, &body).await.0, StatusCode::NO_CONTENT);
+        assert_eq!(mode(), "rule");
+        assert_eq!(*state.app.config_path.read(), on_disk);
+
+        assert_eq!(
+            put(&state, r#"{"path": "relative.yaml"}"#).await,
+            (
+                StatusCode::BAD_REQUEST,
+                r#"{"message":"path is not a absolute path"}"#.to_string()
+            )
+        );
+        assert_eq!(
+            put(&state, "not json").await,
+            (
+                StatusCode::BAD_REQUEST,
+                r#"{"message":"Body invalid"}"#.to_string()
+            )
+        );
     }
 }

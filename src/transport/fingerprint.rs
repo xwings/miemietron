@@ -57,20 +57,6 @@ impl TlsFingerprint {
             None => Self::None,
         }
     }
-
-    /// Whether mihomo's uTLS preset for this fingerprint carries an
-    /// X25519MLKEM768 hybrid key share.
-    ///
-    /// mihomo compat: `chrome`, `firefox` and `safari` are HelloChrome_133,
-    /// HelloFirefox_148 and HelloSafari_26_3, which do; `ios` (HelloIOS_14)
-    /// and `android` (HelloAndroid_11_OkHttp) predate it. `random` picks among
-    /// chrome/safari/ios/firefox weighted 6/3/2/1, so it nearly always does.
-    pub fn has_x25519mlkem768(self) -> bool {
-        matches!(
-            self,
-            Self::Chrome | Self::Firefox | Self::Safari | Self::Random
-        )
-    }
 }
 
 impl fmt::Display for TlsFingerprint {
@@ -285,25 +271,6 @@ mod tests {
             TlsFingerprint::None
         );
         assert_eq!(TlsFingerprint::from_str_opt(None), TlsFingerprint::None);
-    }
-
-    #[test]
-    fn x25519mlkem768_follows_mihomos_utls_presets() {
-        for fingerprint in [
-            TlsFingerprint::Chrome,
-            TlsFingerprint::Firefox,
-            TlsFingerprint::Safari,
-            TlsFingerprint::Random,
-        ] {
-            assert!(fingerprint.has_x25519mlkem768(), "{fingerprint}");
-        }
-        for fingerprint in [
-            TlsFingerprint::Ios,
-            TlsFingerprint::Android,
-            TlsFingerprint::None,
-        ] {
-            assert!(!fingerprint.has_x25519mlkem768(), "{fingerprint}");
-        }
     }
 
     #[test]

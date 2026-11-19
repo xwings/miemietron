@@ -26,7 +26,7 @@ use tokio_rustls::client::TlsStream;
 
 use super::grpc::{self, GrpcStream};
 use super::h2_transport::{self, H2Stream};
-use super::reality::{self, RealityConfig};
+use super::reality::{self, RealityConfig, RealityStream};
 use super::tls::{self, TlsOptions};
 use super::ws::{self, WsOptions, WsStream};
 use super::xhttp::{self, XHttpConfig};
@@ -115,14 +115,13 @@ macro_rules! delegate_io {
 #[allow(clippy::large_enum_variant)]
 pub enum Secured<S> {
     Plain(S),
-    /// TLS — and Reality, which produces the same `TlsStream`: Reality's
-    /// authentication rides in the ClientHello session ID, so once the
-    /// handshake completes there is nothing protocol-specific left in the
-    /// stream (`transport/reality.rs`).
     Tls(TlsStream<S>),
+    /// REALITY runs on its own TLS 1.3 client, which can send the uTLS
+    /// ClientHello mihomo sends (`transport/reality.rs`).
+    Reality(RealityStream<S>),
 }
 
-delegate_io!(Secured, Plain, Tls);
+delegate_io!(Secured, Plain, Tls, Reality);
 
 /// The stream after the optional application-layer transport.
 pub enum Layered<S> {
@@ -200,7 +199,7 @@ where
                 .await
                 .with_context(|| format!("{label}: TLS handshake failed"))?,
         ),
-        SecuritySpec::Reality(ref config) => Secured::Tls(
+        SecuritySpec::Reality(ref config) => Secured::Reality(
             reality::wrap_reality(stream, config)
                 .await
                 .with_context(|| format!("{label}: Reality handshake failed"))?,

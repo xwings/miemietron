@@ -50,8 +50,8 @@ Rust uses snake_case files/functions and PascalCase types, typed serde config,
 [rustfmt.toml](rustfmt.toml) sets 100 columns. Tests normally live beside code
 in `#[cfg(test)]` modules. No configured clippy gate exists. Keep protocol edits
 surgical; do not edit generated target artifacts or loosen tests for green.
-The rustls dependency is pinned in Cargo; dependency updates must preserve
-Reality wire/authentication tests and license attribution.
+Reality runs on the project's own TLS 1.3 client, not rustls; changes there
+must preserve the Reality wire/authentication tests.
 
 ## Verification
 

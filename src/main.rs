@@ -281,9 +281,9 @@ async fn build_components(
         .unwrap_or(true);
     if store_selected {
         let saved = store::load_selected(home_dir);
-        if !saved.is_empty() {
+        if !saved.selected.is_empty() {
             proxy_manager.apply_saved_selections(&saved);
-            info!("Restored {} saved proxy selections", saved.len());
+            info!("Restored {} saved proxy selections", saved.selected.len());
         }
     }
 
@@ -385,6 +385,13 @@ impl AppState {
         *self.dns_resolver.write() = Arc::new(new_dns);
         *self.rule_engine.write() = new_rules;
         *self.proxy_manager.write() = Arc::new(new_proxies);
+        // mihomo compat: executor.go updateDNS → dns.ReCreateServer — the
+        // listener answers from the resolver just swapped in, re-binds when
+        // `dns.listen` changed and stops when DNS got disabled.
+        dns::recreate_server(&new_config.dns, self.dns_resolver()).await;
+        // mihomo compat: executor.go updateNTP runs on every reload, after
+        // DNS, against the components just swapped in.
+        ntp::recreate_service(&new_config.ntp, self.dns_resolver(), self.proxy_manager());
         *self.config.write() = Arc::new(new_config);
 
         info!(
@@ -788,7 +795,10 @@ impl Engine {
                 }
             }
             let cm = conn_manager.clone();
-            let dns = dns_resolver.clone();
+            // The dns-hijack outlives config reloads: it asks for the resolver
+            // of the moment instead of keeping the boot-time one.
+            let state = app_state.clone();
+            let dns: dns::ResolverProvider = Arc::new(move || state.dns_resolver());
             let dns_listen = if config.dns.enable {
                 Some(config.dns.listen.clone())
             } else {
@@ -804,18 +814,8 @@ impl Engine {
             None
         };
 
-        // Start DNS listener
-        let dns_handle = if config.dns.enable {
-            let listen = config.dns.listen.clone();
-            let resolver = dns_resolver.clone();
-            Some(tokio::spawn(async move {
-                if let Err(e) = dns::run_dns_server(&listen, resolver).await {
-                    error!("DNS server error: {}", e);
-                }
-            }))
-        } else {
-            None
-        };
+        // Start DNS listener (every reload re-creates it: reload_from_config)
+        dns::recreate_server(&config.dns, app_state.dns_resolver()).await;
 
         // Start inbound proxy listeners (HTTP, SOCKS5, mixed-port, redir-port, tproxy-port)
         let mut inbound_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
@@ -929,14 +929,12 @@ impl Engine {
             info!("Spawned {} health check tasks", health_handles.len());
         }
 
-        // Spawn NTP sync task if enabled
-        if config.ntp.enable {
-            let ntp_config = config.ntp.clone();
-            tokio::spawn(async move {
-                ntp::run_ntp(&ntp_config).await;
-            });
-            info!("NTP sync task started");
-        }
+        // mihomo compat: executor.go updateNTP, after DNS is up (ac017cd).
+        ntp::recreate_service(
+            &config.ntp,
+            app_state.dns_resolver(),
+            app_state.proxy_manager(),
+        );
 
         // Spawn periodic FakeIP persistence task (every 60s).
         // Read the resolver from AppState each tick — a config reload swaps
@@ -1019,9 +1017,6 @@ impl Engine {
             h.abort();
         }
         if let Some(h) = api_unix_handle {
-            h.abort();
-        }
-        if let Some(h) = dns_handle {
             h.abort();
         }
 

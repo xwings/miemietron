@@ -1,48 +1,93 @@
 //! Persistent proxy selection store.
 //!
-//! When `profile.store-selected: true` in config, user proxy group selections
-//! are persisted to `{home_dir}/cache.db` as a simple JSON map so they survive
-//! restarts.
+//! mihomo compat: the `selected` bucket of `component/profile/cachefile`. A
+//! group's entry is written when the controller sets it (`PUT /proxies/{g}`)
+//! and emptied when it is unpinned; nothing else writes one. On start and on
+//! reload every recorded group is told its entry again (`patchSelectGroup`).
+//!
+//! The file is `{home_dir}/cache.db`, JSON rather than mihomo's bbolt.
 
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
 use tracing::{debug, warn};
 
 const CACHE_FILE: &str = "cache.db";
 
-/// Save the current proxy group selections to disk.
-pub fn save_selected(home_dir: &Path, selections: &HashMap<String, String>) -> anyhow::Result<()> {
+#[derive(Default, Serialize, Deserialize)]
+struct CacheFile {
+    /// Group name → the member chosen for it; empty when unpinned.
+    selected: HashMap<String, String>,
+}
+
+/// What `cache.db` records about group selections.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Selections {
+    pub selected: HashMap<String, String>,
+    /// The file predates the `selected` bucket: it is a bare map of every
+    /// group to the member it happened to be using when anything was
+    /// selected. For a url-test or fallback group that is not a choice
+    /// anyone made, so only select groups may be restored from it.
+    pub legacy: bool,
+}
+
+/// Load the recorded selections. A missing or unreadable file records none.
+pub fn load_selected(home_dir: &Path) -> Selections {
     let path = home_dir.join(CACHE_FILE);
-    let json = serde_json::to_string_pretty(selections)?;
-    std::fs::write(&path, json)?;
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        debug!("No saved proxy selections at {}", path.display());
+        return Selections::default();
+    };
+    if let Ok(file) = serde_json::from_str::<CacheFile>(&content) {
+        debug!("Loaded proxy selections from {}", path.display());
+        return Selections {
+            selected: file.selected,
+            legacy: false,
+        };
+    }
+    match serde_json::from_str::<HashMap<String, String>>(&content) {
+        Ok(selected) => Selections {
+            selected,
+            legacy: true,
+        },
+        Err(e) => {
+            warn!("Failed to parse {}: {}", path.display(), e);
+            Selections::default()
+        }
+    }
+}
+
+/// Record `selected` as the choice for `group`; empty unpins it.
+///
+/// mihomo compat: cachefile `SetSelected`. Entries of a legacy file are
+/// carried over only for groups `keep_legacy` accepts (see
+/// [`Selections::legacy`]).
+pub fn set_selected(
+    home_dir: &Path,
+    group: &str,
+    selected: &str,
+    keep_legacy: impl Fn(&str) -> bool,
+) -> anyhow::Result<()> {
+    let mut selections = load_selected(home_dir);
+    if selections.legacy {
+        selections.selected.retain(|name, _| keep_legacy(name));
+    }
+    selections
+        .selected
+        .insert(group.to_string(), selected.to_string());
+
+    let path = home_dir.join(CACHE_FILE);
+    let file = CacheFile {
+        selected: selections.selected,
+    };
+    std::fs::write(&path, serde_json::to_string_pretty(&file)?)?;
     debug!(
-        "Saved {} proxy selections to {}",
-        selections.len(),
+        "Saved selection {} = {:?} to {}",
+        group,
+        selected,
         path.display()
     );
     Ok(())
-}
-
-/// Load saved proxy group selections from disk.
-/// Returns an empty map if the file doesn't exist or can't be parsed.
-pub fn load_selected(home_dir: &Path) -> HashMap<String, String> {
-    let path = home_dir.join(CACHE_FILE);
-    match std::fs::read_to_string(&path) {
-        Ok(content) => match serde_json::from_str(&content) {
-            Ok(map) => {
-                debug!("Loaded proxy selections from {}", path.display());
-                map
-            }
-            Err(e) => {
-                warn!("Failed to parse {}: {}", path.display(), e);
-                HashMap::new()
-            }
-        },
-        Err(_) => {
-            debug!("No saved proxy selections at {}", path.display());
-            HashMap::new()
-        }
-    }
 }
 
 #[cfg(test)]
@@ -51,25 +96,59 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
-    fn save_and_load_roundtrip() {
+    fn records_one_group_at_a_time() {
         let dir = tempfile::tempdir().unwrap();
-        let mut selections = HashMap::new();
-        selections.insert("group1".to_string(), "proxy-a".to_string());
-        selections.insert("group2".to_string(), "proxy-b".to_string());
+        set_selected(dir.path(), "group1", "proxy-a", |_| true).unwrap();
+        set_selected(dir.path(), "group2", "proxy-b", |_| true).unwrap();
+        set_selected(dir.path(), "group1", "proxy-c", |_| true).unwrap();
 
-        save_selected(dir.path(), &selections).unwrap();
         let loaded = load_selected(dir.path());
+        assert!(!loaded.legacy);
+        assert_eq!(loaded.selected.len(), 2);
+        assert_eq!(loaded.selected["group1"], "proxy-c");
+        assert_eq!(loaded.selected["group2"], "proxy-b");
+    }
 
-        assert_eq!(loaded.len(), 2);
-        assert_eq!(loaded.get("group1").unwrap(), "proxy-a");
-        assert_eq!(loaded.get("group2").unwrap(), "proxy-b");
+    #[test]
+    fn an_unpinned_group_is_recorded_as_empty() {
+        // cachefile.SetSelected(name, ""): the entry stays, so the next
+        // restore clears a pin instead of leaving whatever was there.
+        let dir = tempfile::tempdir().unwrap();
+        set_selected(dir.path(), "auto", "node", |_| true).unwrap();
+        set_selected(dir.path(), "auto", "", |_| true).unwrap();
+        assert_eq!(load_selected(dir.path()).selected["auto"], "");
+    }
+
+    #[test]
+    fn a_bare_map_is_a_legacy_file_and_is_filtered_when_rewritten() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(CACHE_FILE),
+            r#"{"PROXY": "Auto-Select", "Auto-Select": "node-1", "Fallback": "node-2"}"#,
+        )
+        .unwrap();
+
+        let loaded = load_selected(dir.path());
+        assert!(loaded.legacy);
+        assert_eq!(loaded.selected.len(), 3);
+
+        // The first write converts the file, keeping what the caller vouches for.
+        set_selected(dir.path(), "Other", "node-3", |name| name == "PROXY").unwrap();
+        let loaded = load_selected(dir.path());
+        assert!(!loaded.legacy);
+        assert_eq!(
+            loaded.selected,
+            HashMap::from([
+                ("PROXY".to_string(), "Auto-Select".to_string()),
+                ("Other".to_string(), "node-3".to_string()),
+            ])
+        );
     }
 
     #[test]
     fn load_selected_missing_file_returns_empty() {
         let dir = PathBuf::from("/tmp/miemietron_test_nonexistent_dir_12345");
-        let loaded = load_selected(&dir);
-        assert!(loaded.is_empty());
+        assert_eq!(load_selected(&dir), Selections::default());
     }
 
     #[test]
@@ -77,19 +156,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(CACHE_FILE);
         std::fs::write(&path, "this is not valid JSON {{{").unwrap();
-
-        let loaded = load_selected(dir.path());
-        assert!(loaded.is_empty());
-    }
-
-    #[test]
-    fn save_empty_and_load() {
-        let dir = tempfile::tempdir().unwrap();
-        let selections = HashMap::new();
-
-        save_selected(dir.path(), &selections).unwrap();
-        let loaded = load_selected(dir.path());
-
-        assert!(loaded.is_empty());
+        assert_eq!(load_selected(dir.path()), Selections::default());
     }
 }

@@ -2,33 +2,39 @@ use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use aes::cipher::BlockEncrypt;
+use aes::cipher::{BlockDecrypt, BlockEncrypt};
 use aes_gcm::aead::generic_array::GenericArray;
 use aes_gcm::aead::{AeadInPlace, KeyInit};
 use aes_gcm::{Aes128Gcm, Aes256Gcm};
-use chacha20poly1305::ChaCha20Poly1305;
+use chacha20poly1305::{ChaCha20Poly1305, XChaCha20Poly1305};
 use digest::Digest;
 use pin_project_lite::pin_project;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-/// Maximum payload size per chunk.
-/// Legacy AEAD: 0x3FFF (16383 bytes)
-/// SS2022: 0xFFFF (65535 bytes)
+type Aes192Gcm = aes_gcm::AesGcm<aes::Aes192, aes_gcm::aead::consts::U12>;
+
+/// Largest payload chunk the writer emits. Only the writer is capped: sing's
+/// reader takes any 16-bit length (`internal/shadowio/reader.go` readBuffer).
+/// Legacy AEAD: `shadowaead.MaxPacketSize`.
 const MAX_PAYLOAD_SIZE: usize = 0x3FFF;
-const MAX_PAYLOAD_SIZE_2022: usize = 0x7FDE; // buf.BufferSize - 2 - 32 = 32734 (mihomo compat)
+/// SS2022: `buf.BufferSize - PacketLengthBufferSize - Overhead*2` = 32734
+/// (`shadowaead_2022/method.go` writeRequest).
+const MAX_PAYLOAD_SIZE_2022: usize = 0x7FDE;
 
 /// AEAD tag size for all supported ciphers (16 bytes).
-const TAG_LEN: usize = 16;
+pub(super) const TAG_LEN: usize = 16;
 
-/// Nonce size for all supported AEAD ciphers (12 bytes).
-const NONCE_LEN: usize = 12;
+/// Nonce size of the session nonce counter (12 bytes).
+pub(super) const NONCE_LEN: usize = 12;
 
 /// Supported AEAD cipher types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AeadCipher {
     Aes128Gcm,
+    Aes192Gcm,
     Aes256Gcm,
     ChaCha20Poly1305,
+    XChaCha20Poly1305,
     // SS2022 ciphers (use BLAKE3 KDF, base64 key)
     Blake3Aes128Gcm,
     Blake3Aes256Gcm,
@@ -40,8 +46,10 @@ impl AeadCipher {
     pub fn from_name(name: &str) -> Option<Self> {
         match name.to_lowercase().as_str() {
             "aes-128-gcm" => Some(AeadCipher::Aes128Gcm),
+            "aes-192-gcm" => Some(AeadCipher::Aes192Gcm),
             "aes-256-gcm" => Some(AeadCipher::Aes256Gcm),
             "chacha20-ietf-poly1305" | "chacha20-poly1305" => Some(AeadCipher::ChaCha20Poly1305),
+            "xchacha20-ietf-poly1305" => Some(AeadCipher::XChaCha20Poly1305),
             "2022-blake3-aes-128-gcm" => Some(AeadCipher::Blake3Aes128Gcm),
             "2022-blake3-aes-256-gcm" => Some(AeadCipher::Blake3Aes256Gcm),
             "2022-blake3-chacha20-poly1305" | "2022-blake3-chacha20-ietf-poly1305" => {
@@ -55,8 +63,10 @@ impl AeadCipher {
     pub fn key_len(&self) -> usize {
         match self {
             AeadCipher::Aes128Gcm | AeadCipher::Blake3Aes128Gcm => 16,
+            AeadCipher::Aes192Gcm => 24,
             AeadCipher::Aes256Gcm
             | AeadCipher::ChaCha20Poly1305
+            | AeadCipher::XChaCha20Poly1305
             | AeadCipher::Blake3Aes256Gcm
             | AeadCipher::Blake3ChaCha20Poly1305 => 32,
         }
@@ -162,21 +172,35 @@ pub use crate::common::addr::{
 #[allow(clippy::large_enum_variant)]
 enum CachedCipher {
     Aes128Gcm(Aes128Gcm),
+    Aes192Gcm(Aes192Gcm),
     Aes256Gcm(Aes256Gcm),
     ChaCha20(ChaCha20Poly1305),
+    XChaCha20(XChaCha20Poly1305),
 }
 
 /// Encrypt/decrypt dispatcher that works with any of the supported AEAD ciphers.
 /// Cipher object is created once (key expansion) and reused for all operations.
-struct CipherCore {
+pub(super) struct CipherCore {
     cached: CachedCipher,
 }
 
+/// XChaCha20-Poly1305 takes a 24-byte nonce. sing counts in a little-endian
+/// nonce of the cipher's own size (`internal/shadowio/common.go`
+/// increaseNonce), so the 12 counter bytes are its low half.
+fn xnonce(nonce: &[u8; NONCE_LEN]) -> chacha20poly1305::XNonce {
+    let mut xnonce = chacha20poly1305::XNonce::default();
+    xnonce[..NONCE_LEN].copy_from_slice(nonce);
+    xnonce
+}
+
 impl CipherCore {
-    fn new(cipher: AeadCipher, key: Vec<u8>) -> Self {
+    pub(super) fn new(cipher: AeadCipher, key: Vec<u8>) -> Self {
         let cached = match cipher {
             AeadCipher::Aes128Gcm | AeadCipher::Blake3Aes128Gcm => {
                 CachedCipher::Aes128Gcm(Aes128Gcm::new(GenericArray::from_slice(&key)))
+            }
+            AeadCipher::Aes192Gcm => {
+                CachedCipher::Aes192Gcm(Aes192Gcm::new(GenericArray::from_slice(&key)))
             }
             AeadCipher::Aes256Gcm | AeadCipher::Blake3Aes256Gcm => {
                 CachedCipher::Aes256Gcm(Aes256Gcm::new(GenericArray::from_slice(&key)))
@@ -184,12 +208,15 @@ impl CipherCore {
             AeadCipher::ChaCha20Poly1305 | AeadCipher::Blake3ChaCha20Poly1305 => {
                 CachedCipher::ChaCha20(ChaCha20Poly1305::new(GenericArray::from_slice(&key)))
             }
+            AeadCipher::XChaCha20Poly1305 => {
+                CachedCipher::XChaCha20(XChaCha20Poly1305::new(GenericArray::from_slice(&key)))
+            }
         };
         Self { cached }
     }
 
     /// Encrypt `data` in-place using the given nonce, appending the AEAD tag.
-    fn encrypt_in_place(
+    pub(super) fn encrypt_in_place(
         &self,
         nonce: &[u8; NONCE_LEN],
         data: &mut Vec<u8>,
@@ -199,17 +226,23 @@ impl CipherCore {
             CachedCipher::Aes128Gcm(c) => c
                 .encrypt_in_place(nonce_ga, b"", data)
                 .map_err(|e| io::Error::other(format!("aes-128-gcm encrypt: {e}"))),
+            CachedCipher::Aes192Gcm(c) => c
+                .encrypt_in_place(nonce_ga, b"", data)
+                .map_err(|e| io::Error::other(format!("aes-192-gcm encrypt: {e}"))),
             CachedCipher::Aes256Gcm(c) => c
                 .encrypt_in_place(nonce_ga, b"", data)
                 .map_err(|e| io::Error::other(format!("aes-256-gcm encrypt: {e}"))),
             CachedCipher::ChaCha20(c) => c
                 .encrypt_in_place(nonce_ga, b"", data)
                 .map_err(|e| io::Error::other(format!("chacha20-poly1305 encrypt: {e}"))),
+            CachedCipher::XChaCha20(c) => c
+                .encrypt_in_place(&xnonce(nonce), b"", data)
+                .map_err(|e| io::Error::other(format!("xchacha20-poly1305 encrypt: {e}"))),
         }
     }
 
     /// Decrypt `data` in-place (data includes the appended AEAD tag).
-    fn decrypt_in_place(
+    pub(super) fn decrypt_in_place(
         &self,
         nonce: &[u8; NONCE_LEN],
         data: &mut Vec<u8>,
@@ -220,6 +253,12 @@ impl CipherCore {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!("aes-128-gcm decrypt: {e}"),
+                )
+            }),
+            CachedCipher::Aes192Gcm(c) => c.decrypt_in_place(nonce_ga, b"", data).map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("aes-192-gcm decrypt: {e}"),
                 )
             }),
             CachedCipher::Aes256Gcm(c) => c.decrypt_in_place(nonce_ga, b"", data).map_err(|e| {
@@ -234,6 +273,14 @@ impl CipherCore {
                     format!("chacha20-poly1305 decrypt: {e}"),
                 )
             }),
+            CachedCipher::XChaCha20(c) => {
+                c.decrypt_in_place(&xnonce(nonce), b"", data).map_err(|e| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("xchacha20-poly1305 decrypt: {e}"),
+                    )
+                })
+            }
         }
     }
 }
@@ -316,9 +363,8 @@ pin_project! {
         // The salt we sent in the request (needed to verify response header)
         request_salt: Vec<u8>,
 
-        // SS2022 multi-user: the key used for response decryption session derivation.
-        // For single-user this is the same as master_key.
-        // For multi-user this is the user_key (second part after ':').
+        // The key session subkeys derive from, in both directions: the legacy
+        // master key, or for SS2022 the last PSK of the `:`-separated list.
         session_key: Vec<u8>,
 
         // Encrypt state (write path)
@@ -341,42 +387,38 @@ pin_project! {
 impl<T> SsStream<T> {
     /// Create a new SsStream wrapping the given inner stream.
     ///
-    /// `master_key` is derived from the password via evp_bytes_to_key (legacy) or base64-decoded (SS2022).
+    /// `key` is derived from the password via evp_bytes_to_key (legacy) or is the
+    /// base64-decoded PSK (SS2022; the last one when several are configured).
     /// `cipher` specifies which AEAD cipher to use.
     /// `initial_payload` is the first data to send (typically the address header for legacy,
     /// or the SOCKS address header for SS2022).
-    /// `identity_keys` is for SS2022 multi-user mode: `Some((server_key, user_key))`.
-    ///   When present, the identity header is derived from server_key and the session
-    ///   encryption uses user_key. When `None`, master_key is used for everything.
+    /// `identity_psks` are the SS2022 PSKs configured before `key`, outermost
+    /// first; each adds an identity header to the request. Empty otherwise.
+    ///
+    /// The request is built here and stays pending until the first
+    /// `poll_write`, which sends it even when called with an empty buffer —
+    /// that is how the tunnel has the header leave at dial, like mihomo's
+    /// `DialConn` (see `crate::proxy::Handshake`).
     pub fn new(
         inner: T,
         cipher: AeadCipher,
-        master_key: Vec<u8>,
+        key: Vec<u8>,
         initial_payload: Vec<u8>,
-        identity_keys: Option<(Vec<u8>, Vec<u8>)>,
+        identity_psks: &[Vec<u8>],
     ) -> Self {
         let is_ss2022 = cipher.is_ss2022();
 
         // Generate random salt for the encryption direction
         let salt = generate_salt(cipher.salt_len());
 
-        // For SS2022 multi-user, the session key is derived from the USER key,
-        // and the identity header uses the SERVER key.
-        // For single-user or legacy, session key = master_key.
-        let (session_key, identity) = if let Some((ref server_key, ref user_key)) = identity_keys {
-            (user_key.clone(), Some(server_key.clone()))
-        } else {
-            (master_key.clone(), None)
-        };
-
         // Derive the encryption subkey from session key + salt
-        let enc_subkey = cipher.derive_subkey(&session_key, &salt);
+        let enc_subkey = cipher.derive_subkey(&key, &salt);
         let enc_cipher = CipherCore::new(cipher, enc_subkey);
 
         // Keep a copy of the salt for SS2022 response header verification
         let request_salt = if is_ss2022 { salt.clone() } else { Vec::new() };
 
-        // For SS2022: send the initial request immediately (non-early mode),
+        // For SS2022: the request carries no payload (non-early mode),
         // matching mihomo's DialConn behavior. The address header + random padding
         // are sent as the initial AEAD chunks; user data follows via standard chunks.
         // For legacy: build the initial buffer immediately.
@@ -387,9 +429,8 @@ impl<T> SsStream<T> {
                 &enc_cipher,
                 &mut nonce,
                 &initial_payload,
-                cipher,
-                identity.as_deref(),
-                identity_keys.as_ref().map(|(_, uk)| uk.as_slice()),
+                identity_psks,
+                &key,
                 &[], // No early payload — send addr+padding only (like mihomo DialConn)
             );
             (WriteState::Flushing { buf, pos: 0 }, nonce)
@@ -405,7 +446,7 @@ impl<T> SsStream<T> {
             cipher_type: cipher,
             is_ss2022,
             request_salt,
-            session_key,
+            session_key: key,
             enc_cipher: Some(enc_cipher),
             enc_nonce,
             write_state,
@@ -416,30 +457,6 @@ impl<T> SsStream<T> {
             read_state: ReadState::WaitingSalt { buf: Vec::new() },
             read_reuse_buf: Vec::new(),
         }
-    }
-
-    /// Flush the initial handshake buffer to the wire immediately.
-    ///
-    /// mihomo compat: mihomo's DialConn writes the SS2022 request to the TCP
-    /// connection before returning. We must do the same so the server starts
-    /// processing before the relay begins. Without this, tokio::io::split's
-    /// BiLock can cause a deadlock where the read side blocks waiting for the
-    /// server response while the write side hasn't sent the handshake yet.
-    pub async fn flush_handshake(&mut self) -> std::io::Result<()>
-    where
-        T: AsyncWrite + Unpin,
-    {
-        use tokio::io::AsyncWriteExt;
-
-        if let WriteState::Flushing { buf, pos } =
-            std::mem::replace(&mut self.write_state, WriteState::Ready)
-        {
-            if pos < buf.len() {
-                self.inner.write_all(&buf[pos..]).await?;
-                self.inner.flush().await?;
-            }
-        }
-        Ok(())
     }
 }
 
@@ -482,7 +499,7 @@ fn build_initial_buffer(
 }
 
 /// Build the initial send buffer for SS2022:
-/// [salt][identity_header (16 bytes, if multi-user)][encrypted_request_header + tag(16)]
+/// [salt][identity_headers (16 bytes per identity PSK)][encrypted_request_header + tag(16)]
 ///
 /// The request header plaintext is:
 ///   [0x00 (client type)][timestamp_be(8)][variable_length_be(2)][socks_addr][padding_len_be(2)][padding][initial_data]
@@ -490,19 +507,16 @@ fn build_initial_buffer(
 /// The entire header is encrypted as ONE AEAD chunk (nonce=0).
 /// After the header, subsequent data uses standard length-prefixed chunks (nonce continues).
 ///
-/// For multi-user mode:
-///   `server_key` = Some(server PSK) -- used to derive the identity subkey
-///   `user_key` = Some(user PSK) -- its hash is encrypted as the identity header
-///   The session cipher (passed in `cipher`) must already be derived from the user_key.
-#[allow(clippy::too_many_arguments)]
+/// `identity_psks` and `psk` are the configured key list (see
+/// [`build_identity_headers`]); the session cipher (passed in `cipher`) must
+/// already be derived from `psk`.
 fn build_ss2022_request_buffer(
     salt: &[u8],
     cipher: &CipherCore,
     nonce: &mut NonceCounter,
     addr_header: &[u8],
-    cipher_type: AeadCipher,
-    server_key: Option<&[u8]>,
-    user_key: Option<&[u8]>,
+    identity_psks: &[Vec<u8>],
+    psk: &[u8],
     first_data: &[u8],
 ) -> Vec<u8> {
     // SS2022 TCP request format (per shadowsocks-rust / SIP022):
@@ -520,10 +534,7 @@ fn build_ss2022_request_buffer(
     // chunk embeds the data length. After this, subsequent writes use the
     // standard [enc_len(18)][enc_payload] format with nonces 2, 3, 4, ...
 
-    let timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+    let timestamp = unix_now();
 
     // Data chunk plaintext: [socks_addr][padding_len(2)][padding][first_user_data]
     // When first_data is non-empty, padding=0. When empty, random 1-900 padding.
@@ -553,22 +564,22 @@ fn build_ss2022_request_buffer(
         timestamp,
         data_payload.len(),
         salt.len(),
-        server_key.is_some(),
+        !identity_psks.is_empty(),
     );
 
+    let identity_headers = build_identity_headers(identity_psks, psk, salt);
     let mut buf = Vec::with_capacity(
-        salt.len() + 16 + (header.len() + TAG_LEN) + (data_payload.len() + TAG_LEN),
+        salt.len()
+            + identity_headers.len()
+            + (header.len() + TAG_LEN)
+            + (data_payload.len() + TAG_LEN),
     );
 
     // [1] Salt (plaintext)
     buf.extend_from_slice(salt);
 
-    // [2] EIH (identity header, AES-ECB encrypted, multi-user only)
-    if let (Some(server_key), Some(user_key)) = (server_key, user_key) {
-        let identity_header =
-            build_identity_header(server_key, user_key, salt, cipher_type.key_len());
-        buf.extend_from_slice(&identity_header);
-    }
+    // [2] EIH (identity headers, AES-ECB encrypted, multi-user only)
+    buf.extend_from_slice(&identity_headers);
 
     // [3] AEAD header chunk (nonce=0): 11 bytes plaintext → 27 bytes on wire
     cipher
@@ -588,7 +599,7 @@ fn build_ss2022_request_buffer(
         "SS2022 wire: total={} (salt={} eih={} header={} data={})",
         buf.len(),
         salt.len(),
-        if server_key.is_some() { 16 } else { 0 },
+        identity_headers.len(),
         header.len(),
         data_payload.len(),
     );
@@ -596,51 +607,84 @@ fn build_ss2022_request_buffer(
     buf
 }
 
-/// Build the 16-byte identity header for SS2022 multi-user mode.
-///
-/// 1. Derive identity_subkey = blake3::derive_key("shadowsocks 2022 identity subkey", server_psk || salt)
-/// 2. Compute psk_hash = blake3::hash(user_psk)[0..16]
-/// 3. AES-ECB encrypt psk_hash with identity_subkey[0..16]
-fn build_identity_header(
-    server_key: &[u8],
-    user_key: &[u8],
-    salt: &[u8],
-    key_len: usize,
-) -> [u8; 16] {
-    // Derive identity subkey
-    let mut identity_subkey = vec![0u8; key_len];
-    let mut hasher = blake3::Hasher::new_derive_key("shadowsocks 2022 identity subkey");
-    hasher.update(server_key);
-    hasher.update(salt);
-    hasher.finalize_xof().fill(&mut identity_subkey);
+/// AES single-block (ECB) cipher keyed by an SS2022 PSK or identity subkey.
+/// The key is 16 or 32 bytes — the `keySaltLength` of the two AES methods,
+/// the only ones with identity headers and an encrypted UDP packet header.
+#[allow(clippy::large_enum_variant)]
+pub(super) enum AesBlock {
+    Aes128(aes::Aes128),
+    Aes256(aes::Aes256),
+}
 
-    // Compute psk_hash = blake3::hash(user_psk)[0..16]
-    let user_hash = blake3::hash(user_key);
-    let mut psk_hash = [0u8; 16];
-    psk_hash.copy_from_slice(&user_hash.as_bytes()[..16]);
-
-    // AES-ECB encrypt psk_hash with identity_subkey.
-    // Key size matches the cipher: AES-128 for 16-byte keys, AES-256 for 32-byte keys.
-    let mut block = aes::Block::from(psk_hash);
-    match key_len {
-        16 => {
-            let aes_key = GenericArray::from_slice(&identity_subkey[..16]);
-            aes::Aes128::new(aes_key).encrypt_block(&mut block);
-        }
-        32 => {
-            use aes::cipher::KeyInit as _;
-            let aes_key =
-                aes::cipher::generic_array::GenericArray::from_slice(&identity_subkey[..32]);
-            aes::Aes256::new(aes_key).encrypt_block(&mut block);
-        }
-        _ => {
-            // Fallback to AES-128 with first 16 bytes
-            let aes_key = GenericArray::from_slice(&identity_subkey[..16]);
-            aes::Aes128::new(aes_key).encrypt_block(&mut block);
+impl AesBlock {
+    pub(super) fn new(key: &[u8]) -> Self {
+        if key.len() == 16 {
+            Self::Aes128(aes::Aes128::new(GenericArray::from_slice(key)))
+        } else {
+            Self::Aes256(aes::Aes256::new(GenericArray::from_slice(key)))
         }
     }
 
-    block.into()
+    pub(super) fn encrypt(&self, block: &mut [u8; 16]) {
+        let block = GenericArray::from_mut_slice(block);
+        match self {
+            Self::Aes128(aes) => aes.encrypt_block(block),
+            Self::Aes256(aes) => aes.encrypt_block(block),
+        }
+    }
+
+    pub(super) fn decrypt(&self, block: &mut [u8; 16]) {
+        let block = GenericArray::from_mut_slice(block);
+        match self {
+            Self::Aes128(aes) => aes.decrypt_block(block),
+            Self::Aes256(aes) => aes.decrypt_block(block),
+        }
+    }
+}
+
+/// What an identity header says about the next PSK: the first 16 bytes of its
+/// BLAKE3 hash (`shadowaead_2022/method.go` NewMethod `pskHash`).
+pub(super) fn psk_hash(psk: &[u8]) -> [u8; 16] {
+    let mut hash = [0u8; 16];
+    hash.copy_from_slice(&blake3::hash(psk).as_bytes()[..16]);
+    hash
+}
+
+/// Build the SS2022 identity headers of a TCP request: one 16-byte block per
+/// identity PSK, each naming the PSK that follows it in the configured list
+/// (`identity_psks`, then `psk`).
+///
+/// mihomo compat: `shadowaead_2022/method.go` writeExtendedIdentityHeaders.
+/// For each identity PSK:
+/// 1. identity_subkey = blake3::derive_key("shadowsocks 2022 identity subkey", identity_psk || salt)
+/// 2. AES-ECB encrypt the next PSK's hash with identity_subkey
+fn build_identity_headers(identity_psks: &[Vec<u8>], psk: &[u8], salt: &[u8]) -> Vec<u8> {
+    let mut headers = Vec::with_capacity(identity_psks.len() * 16);
+    for (i, identity_psk) in identity_psks.iter().enumerate() {
+        let mut identity_subkey = vec![0u8; identity_psk.len()];
+        let mut hasher = blake3::Hasher::new_derive_key("shadowsocks 2022 identity subkey");
+        hasher.update(identity_psk);
+        hasher.update(salt);
+        hasher.finalize_xof().fill(&mut identity_subkey);
+
+        let next_psk = identity_psks.get(i + 1).map_or(psk, Vec::as_slice);
+        let mut block = psk_hash(next_psk);
+        AesBlock::new(&identity_subkey).encrypt(&mut block);
+        headers.extend_from_slice(&block);
+    }
+    headers
+}
+
+/// Seconds since the Unix epoch, as SS2022 timestamps count them.
+///
+/// mihomo compat: `MethodOptions{TimeFunc: ntp.Now}` (shadowsocks.go).
+pub(super) fn unix_now() -> u64 {
+    // A badly-set clock (before epoch) yields 0, which simply fails the
+    // timestamp checks instead of panicking.
+    crate::ntp::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 /// Generate a random salt of the given length.
@@ -658,25 +702,7 @@ pub(super) fn encrypt_in_place_standalone(
     nonce: &[u8; NONCE_LEN],
     data: &mut Vec<u8>,
 ) -> anyhow::Result<()> {
-    use aes_gcm::aead::{AeadInPlace, KeyInit};
-    let nonce_ga = GenericArray::from_slice(nonce);
-    match cipher {
-        AeadCipher::Aes128Gcm | AeadCipher::Blake3Aes128Gcm => {
-            let c = Aes128Gcm::new(GenericArray::from_slice(key));
-            c.encrypt_in_place(nonce_ga, b"", data)
-                .map_err(|e| anyhow::anyhow!("aes-128-gcm encrypt: {e}"))
-        }
-        AeadCipher::Aes256Gcm | AeadCipher::Blake3Aes256Gcm => {
-            let c = Aes256Gcm::new(GenericArray::from_slice(key));
-            c.encrypt_in_place(nonce_ga, b"", data)
-                .map_err(|e| anyhow::anyhow!("aes-256-gcm encrypt: {e}"))
-        }
-        AeadCipher::ChaCha20Poly1305 | AeadCipher::Blake3ChaCha20Poly1305 => {
-            let c = ChaCha20Poly1305::new(GenericArray::from_slice(key));
-            c.encrypt_in_place(nonce_ga, b"", data)
-                .map_err(|e| anyhow::anyhow!("chacha20-poly1305 encrypt: {e}"))
-        }
-    }
+    Ok(CipherCore::new(*cipher, key.to_vec()).encrypt_in_place(nonce, data)?)
 }
 
 /// Standalone AEAD decrypt for UDP packets (each packet uses a fresh key/nonce).
@@ -686,25 +712,7 @@ pub(super) fn decrypt_in_place_standalone(
     nonce: &[u8; NONCE_LEN],
     data: &mut Vec<u8>,
 ) -> anyhow::Result<()> {
-    use aes_gcm::aead::{AeadInPlace, KeyInit};
-    let nonce_ga = GenericArray::from_slice(nonce);
-    match cipher {
-        AeadCipher::Aes128Gcm | AeadCipher::Blake3Aes128Gcm => {
-            let c = Aes128Gcm::new(GenericArray::from_slice(key));
-            c.decrypt_in_place(nonce_ga, b"", data)
-                .map_err(|e| anyhow::anyhow!("aes-128-gcm decrypt: {e}"))
-        }
-        AeadCipher::Aes256Gcm | AeadCipher::Blake3Aes256Gcm => {
-            let c = Aes256Gcm::new(GenericArray::from_slice(key));
-            c.decrypt_in_place(nonce_ga, b"", data)
-                .map_err(|e| anyhow::anyhow!("aes-256-gcm decrypt: {e}"))
-        }
-        AeadCipher::ChaCha20Poly1305 | AeadCipher::Blake3ChaCha20Poly1305 => {
-            let c = ChaCha20Poly1305::new(GenericArray::from_slice(key));
-            c.decrypt_in_place(nonce_ga, b"", data)
-                .map_err(|e| anyhow::anyhow!("chacha20-poly1305 decrypt: {e}"))
-        }
-    }
+    Ok(CipherCore::new(*cipher, key.to_vec()).decrypt_in_place(nonce, data)?)
 }
 
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncRead for SsStream<T> {
@@ -815,12 +823,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncRead for SsStream<T> {
                     let resp_ts = u64::from_be_bytes(
                         hdr_buf[1..9].try_into().expect("8 bytes for timestamp"),
                     );
-                    // A badly-set clock (before epoch) yields now_ts=0, which
-                    // simply fails the diff check below instead of panicking.
-                    let now_ts = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs();
+                    let now_ts = unix_now();
                     let ts_diff = now_ts.abs_diff(resp_ts);
                     if ts_diff > 30 {
                         return Poll::Ready(Err(io::Error::new(
@@ -847,15 +850,13 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncRead for SsStream<T> {
                     // Now read the AEAD data chunk (nonce=1): data_length + TAG_LEN bytes.
                     // This chunk contains the server's initial response payload.
                     // After this, standard length-prefixed chunks start at nonce=2.
-                    if data_length > 0 {
-                        *me.read_state = ReadState::WaitingPayload {
-                            buf: Vec::new(),
-                            payload_len: data_length,
-                        };
-                    } else {
-                        // data_length == 0: no data chunk sent, standard chunks at nonce=1
-                        *me.read_state = ReadState::WaitingLength { buf: Vec::new() };
-                    }
+                    // mihomo compat: readResponse reads this chunk whatever its
+                    // length (`reader.ReadFixedBuffer(int(length))`) — an empty
+                    // one is still 16 bytes of tag under nonce 1.
+                    *me.read_state = ReadState::WaitingPayload {
+                        buf: Vec::new(),
+                        payload_len: data_length,
+                    };
                 }
 
                 ReadState::WaitingLength {
@@ -895,19 +896,10 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncRead for SsStream<T> {
                     dec.decrypt_in_place(me.dec_nonce.current(), len_buf)?;
                     me.dec_nonce.increment();
 
-                    // Parse the 2-byte big-endian length
+                    // Parse the 2-byte big-endian length. mihomo compat: any
+                    // length is accepted (`internal/shadowio/reader.go`
+                    // readBuffer) — the chunk size caps bind the writer only.
                     let payload_len = ((len_buf[0] as usize) << 8) | (len_buf[1] as usize);
-                    let max_payload = if *me.is_ss2022 {
-                        MAX_PAYLOAD_SIZE_2022
-                    } else {
-                        MAX_PAYLOAD_SIZE
-                    };
-                    if payload_len > max_payload {
-                        return Poll::Ready(Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!("payload length {payload_len} exceeds maximum {max_payload}"),
-                        )));
-                    }
 
                     // Reuse the read buffer instead of allocating a new Vec
                     me.read_reuse_buf.clear();
@@ -1160,9 +1152,11 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncWrite for SsStream<T> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::test_support::{legacy_subkey, read_request_2022, response_2022, StreamKey};
     use super::*;
     use crate::common::addr::Address;
     use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 
     #[test]
     fn evp_bytes_to_key_16() {
@@ -1271,14 +1265,24 @@ mod tests {
             AeadCipher::from_name("chacha20-poly1305"),
             Some(AeadCipher::ChaCha20Poly1305)
         );
+        assert_eq!(
+            AeadCipher::from_name("aes-192-gcm"),
+            Some(AeadCipher::Aes192Gcm)
+        );
+        assert_eq!(
+            AeadCipher::from_name("xchacha20-ietf-poly1305"),
+            Some(AeadCipher::XChaCha20Poly1305)
+        );
         assert_eq!(AeadCipher::from_name("unknown"), None);
     }
 
     #[test]
     fn cipher_key_lengths() {
         assert_eq!(AeadCipher::Aes128Gcm.key_len(), 16);
+        assert_eq!(AeadCipher::Aes192Gcm.key_len(), 24);
         assert_eq!(AeadCipher::Aes256Gcm.key_len(), 32);
         assert_eq!(AeadCipher::ChaCha20Poly1305.key_len(), 32);
+        assert_eq!(AeadCipher::XChaCha20Poly1305.key_len(), 32);
     }
 
     #[test]
@@ -1327,9 +1331,8 @@ mod tests {
             &enc_cipher,
             &mut nonce,
             &addr_header,
-            AeadCipher::Blake3Aes256Gcm,
-            None,
-            None,
+            &[],
+            &key,
             b"",
         );
 
@@ -1393,9 +1396,8 @@ mod tests {
             &enc_cipher,
             &mut nonce,
             &addr_header,
-            AeadCipher::Blake3Aes128Gcm,
-            None,
-            None,
+            &[],
+            &key,
             b"",
         );
 
@@ -1466,7 +1468,7 @@ mod tests {
         let (client_io, server_io) = tokio::io::duplex(16384);
 
         // Create the client SsStream (writes SS2022 request)
-        let mut client = SsStream::new(client_io, cipher, key.clone(), addr_header.clone(), None);
+        let mut client = SsStream::new(client_io, cipher, key.clone(), addr_header.clone(), &[]);
 
         // Write some data through the client
         let test_data = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
@@ -1569,9 +1571,8 @@ mod tests {
             &enc_cipher,
             &mut nonce,
             &addr_header,
-            AeadCipher::Blake3Aes256Gcm,
-            None,
-            None,
+            &[],
+            &key,
             b"",
         );
 
@@ -1598,5 +1599,398 @@ mod tests {
         let mut expected = [0u8; NONCE_LEN];
         expected[0] = 2;
         assert_eq!(nonce.current(), &expected);
+    }
+
+    // Vectors below come from implementations independent of this crate:
+    // OpenSSL's HKDF/AES-GCM/ChaCha20-Poly1305 and, for XChaCha20, HChaCha20
+    // written out from draft-irtf-cfrg-xchacha.
+    const LEGACY_VECTORS: [(AeadCipher, &str, &str, &str); 2] = [
+        (
+            AeadCipher::Aes192Gcm,
+            "b3adc47839e047eb228870526dc8fc30b347287ffca3045d",
+            "5d4ab537751e16d7258d643c6ade803a81fda83fb2962662",
+            "808182838485868788898a8b8c8d8e8f9091929394959697a1c6a5ab405f14dc6ec40e4ac364b887cb\
+             116a8aeacf08c7b1146304baca9c292e168200e9ed17a78377554adfb54d8fdf8a695d5f9a524306ce\
+             206db56d2990fadc5836e241e9cd34eb1a54fc44c4493cde4cb9260dc5bf7f746c20f059d5bf2a3eb6\
+             f7f5b2a950d0497658124294185d827301192bc35b510c",
+        ),
+        (
+            AeadCipher::XChaCha20Poly1305,
+            "b3adc47839e047eb228870526dc8fc30b347287ffca3045dcea06b3fdf090acb",
+            "71a584b0a1af55a7fc631fc356a47c81ce195fdda55891868f463baa2ce68d13",
+            "808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9ffecd4b72f18bf564bf\
+             f2a071fb253aecadc736e98e08c989dcb6c3d61ff6a2b6754cf5fe35c1f33ae568b637b0322c10edb4\
+             451ec8f588dcda0b637ad96abe612e1bc79d1c8f4920b3062bab7390ab25290b0cb508f167e873d23b\
+             ee057e2ff4cca3720bce36775d523a545c3dc157aa5b46b9156bc253903f6d27005f94bed4236999a8\
+             975e",
+        ),
+    ];
+
+    const LEGACY_METHODS: [(AeadCipher, &str); 5] = [
+        (AeadCipher::Aes128Gcm, "aes-128-gcm"),
+        (AeadCipher::Aes192Gcm, "aes-192-gcm"),
+        (AeadCipher::Aes256Gcm, "aes-256-gcm"),
+        (AeadCipher::ChaCha20Poly1305, "chacha20-ietf-poly1305"),
+        (AeadCipher::XChaCha20Poly1305, "xchacha20-ietf-poly1305"),
+    ];
+
+    const SS2022_METHODS: [(AeadCipher, &str); 3] = [
+        (AeadCipher::Blake3Aes128Gcm, "2022-blake3-aes-128-gcm"),
+        (AeadCipher::Blake3Aes256Gcm, "2022-blake3-aes-256-gcm"),
+        (
+            AeadCipher::Blake3ChaCha20Poly1305,
+            "2022-blake3-chacha20-poly1305",
+        ),
+    ];
+
+    fn target() -> Vec<u8> {
+        encode_address(&Address::Domain("example.com".to_string(), 443))
+    }
+
+    fn unix_seconds() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
+    /// What the client has put on the wire and the server has not read yet.
+    async fn sent(server: &mut DuplexStream) -> Vec<u8> {
+        let mut wire = vec![0u8; 1 << 17];
+        let n = server.read(&mut wire).await.unwrap();
+        wire.truncate(n);
+        wire
+    }
+
+    #[test]
+    fn legacy_key_and_subkey_known_answers() {
+        for (cipher, key, subkey, stream) in LEGACY_VECTORS {
+            let derived = evp_bytes_to_key(b"barfoo!", cipher.key_len());
+            assert_eq!(hex::encode(&derived), key);
+            // The stream vector starts with the salt it was sealed under.
+            let salt = &hex::decode(stream).unwrap()[..cipher.salt_len()];
+            assert_eq!(hex::encode(cipher.derive_subkey(&derived, salt)), subkey);
+        }
+    }
+
+    /// A server stream sealed by an independent implementation: a chunk, an
+    /// empty chunk, another chunk.
+    #[tokio::test]
+    async fn legacy_server_stream_known_answer() {
+        for (cipher, key, _, stream) in LEGACY_VECTORS {
+            let (client_io, mut server) = tokio::io::duplex(1 << 16);
+            let mut client =
+                SsStream::new(client_io, cipher, hex::decode(key).unwrap(), target(), &[]);
+            server
+                .write_all(&hex::decode(stream).unwrap())
+                .await
+                .unwrap();
+            drop(server);
+
+            let mut plain = String::new();
+            client.read_to_string(&mut plain).await.unwrap();
+            let name = if cipher == AeadCipher::Aes192Gcm {
+                "aes-192-gcm"
+            } else {
+                "xchacha20-ietf-poly1305"
+            };
+            assert_eq!(plain, format!("hello {name}bye"));
+        }
+    }
+
+    /// mihomo's tunnel sends the request header at dial with an empty write
+    /// (`crate::proxy::Handshake::AtDial`): it must put exactly the request
+    /// on the wire, and no later empty write may add to it.
+    #[tokio::test]
+    async fn legacy_empty_first_write_sends_exactly_the_request() {
+        for (cipher, method) in LEGACY_METHODS {
+            let key = evp_bytes_to_key(b"password", cipher.key_len());
+            let (client_io, mut server) = tokio::io::duplex(1 << 16);
+            let mut client = SsStream::new(client_io, cipher, key.clone(), target(), &[]);
+
+            assert_eq!(client.write(&[]).await.unwrap(), 0, "{method}");
+            client.flush().await.unwrap();
+            let wire = sent(&mut server).await;
+            let (salt, chunks) = wire.split_at(cipher.salt_len());
+            let mut server_key = StreamKey::new(method, &legacy_subkey(&key, salt));
+            // One chunk, holding the address: salt, length and payload.
+            assert_eq!(
+                chunks.len(),
+                2 + TAG_LEN + target().len() + TAG_LEN,
+                "{method}"
+            );
+            assert_eq!(server_key.open_chunks(chunks), target(), "{method}");
+
+            // The request is out: an empty write is now nothing at all.
+            assert_eq!(client.write(&[]).await.unwrap(), 0);
+            client.write_all(b"payload").await.unwrap();
+            client.flush().await.unwrap();
+            let wire = sent(&mut server).await;
+            assert_eq!(wire.len(), 2 + TAG_LEN + 7 + TAG_LEN, "{method}");
+            assert_eq!(server_key.open_chunks(&wire), b"payload", "{method}");
+        }
+    }
+
+    #[tokio::test]
+    async fn ss2022_empty_first_write_sends_exactly_the_request() {
+        for (cipher, method) in SS2022_METHODS {
+            let key = vec![0x42u8; cipher.key_len()];
+            let (client_io, mut server) = tokio::io::duplex(1 << 16);
+            let mut client = SsStream::new(client_io, cipher, key.clone(), target(), &[]);
+
+            assert_eq!(client.write(&[]).await.unwrap(), 0, "{method}");
+            client.flush().await.unwrap();
+            let wire = sent(&mut server).await;
+            let mut request = read_request_2022(method, &[&key], &wire);
+            assert_eq!(request.target, target(), "{method}");
+            assert!(request.timestamp.abs_diff(unix_seconds()) < 5, "{method}");
+            // mihomo compat: writeRequest pads a request without payload by
+            // `rand.Intn(MaxPaddingLength) + 1` bytes.
+            assert!((1..=900).contains(&request.padding_len), "{method}");
+            assert!(request.rest.is_empty(), "{method}");
+
+            // The request is out: an empty write is now nothing at all.
+            assert_eq!(client.write(&[]).await.unwrap(), 0);
+            client.write_all(b"payload").await.unwrap();
+            client.flush().await.unwrap();
+            let wire = sent(&mut server).await;
+            assert_eq!(wire.len(), 2 + TAG_LEN + 7 + TAG_LEN, "{method}");
+            assert_eq!(request.key.open_chunks(&wire), b"payload", "{method}");
+        }
+    }
+
+    /// A server that speaks first (SMTP, FTP, ...) is reached and heard
+    /// before the client has sent any payload.
+    #[tokio::test]
+    async fn server_speaks_first_after_the_empty_write() {
+        for (cipher, method) in LEGACY_METHODS {
+            let key = evp_bytes_to_key(b"password", cipher.key_len());
+            let (client_io, mut server) = tokio::io::duplex(1 << 16);
+            let mut client = SsStream::new(client_io, cipher, key.clone(), target(), &[]);
+            assert_eq!(client.write(&[]).await.unwrap(), 0);
+            client.flush().await.unwrap();
+            assert!(!sent(&mut server).await.is_empty(), "{method}");
+
+            let salt = vec![0x99u8; cipher.salt_len()];
+            let mut server_key = StreamKey::new(method, &legacy_subkey(&key, &salt));
+            server.write_all(&salt).await.unwrap();
+            let banner = server_key.seal_chunk(b"220 ready\r\n");
+            server.write_all(&banner).await.unwrap();
+
+            let mut banner = [0u8; 11];
+            client.read_exact(&mut banner).await.unwrap();
+            assert_eq!(&banner, b"220 ready\r\n", "{method}");
+        }
+
+        for (cipher, method) in SS2022_METHODS {
+            let key = vec![0x42u8; cipher.key_len()];
+            let (client_io, mut server) = tokio::io::duplex(1 << 16);
+            let mut client = SsStream::new(client_io, cipher, key.clone(), target(), &[]);
+            assert_eq!(client.write(&[]).await.unwrap(), 0);
+            client.flush().await.unwrap();
+            let request = read_request_2022(method, &[&key], &sent(&mut server).await);
+
+            let salt = vec![0x99u8; cipher.salt_len()];
+            let (response, _) = response_2022(
+                method,
+                &key,
+                &salt,
+                &request.salt,
+                unix_seconds(),
+                b"220 ready\r\n",
+            );
+            server.write_all(&response).await.unwrap();
+
+            let mut banner = [0u8; 11];
+            client.read_exact(&mut banner).await.unwrap();
+            assert_eq!(&banner, b"220 ready\r\n", "{method}");
+        }
+    }
+
+    /// mihomo compat: `internal/shadowio/reader.go` readBuffer takes whatever
+    /// length the 16-bit field holds; only writers are held to 0x3FFF
+    /// (legacy) and 0x7FDE (SS2022).
+    #[tokio::test]
+    async fn reads_a_chunk_of_any_16_bit_length() {
+        let payload: Vec<u8> = (0..0xFFFFu32).map(|i| (i % 251) as u8).collect();
+
+        let cipher = AeadCipher::Blake3Aes128Gcm;
+        let key = vec![0x42u8; 16];
+        let (client_io, mut server) = tokio::io::duplex(1 << 20);
+        let mut client = SsStream::new(client_io, cipher, key.clone(), target(), &[]);
+        assert_eq!(client.write(&[]).await.unwrap(), 0);
+        client.flush().await.unwrap();
+        let request =
+            read_request_2022("2022-blake3-aes-128-gcm", &[&key], &sent(&mut server).await);
+        let (response, mut server_key) = response_2022(
+            "2022-blake3-aes-128-gcm",
+            &key,
+            &[0x99u8; 16],
+            &request.salt,
+            unix_seconds(),
+            b"first",
+        );
+        server.write_all(&response).await.unwrap();
+        server
+            .write_all(&server_key.seal_chunk(&payload))
+            .await
+            .unwrap();
+        let mut received = vec![0u8; 5 + payload.len()];
+        client.read_exact(&mut received).await.unwrap();
+        assert_eq!(&received[..5], b"first");
+        assert!(received[5..] == payload[..]);
+
+        let cipher = AeadCipher::Aes256Gcm;
+        let key = evp_bytes_to_key(b"password", 32);
+        let (client_io, mut server) = tokio::io::duplex(1 << 20);
+        let mut client = SsStream::new(client_io, cipher, key.clone(), target(), &[]);
+        let salt = [0x99u8; 32];
+        let mut server_key = StreamKey::new("aes-256-gcm", &legacy_subkey(&key, &salt));
+        server.write_all(&salt).await.unwrap();
+        server
+            .write_all(&server_key.seal_chunk(&payload))
+            .await
+            .unwrap();
+        let mut received = vec![0u8; payload.len()];
+        client.read_exact(&mut received).await.unwrap();
+        assert!(received == payload);
+    }
+
+    /// mihomo compat: readResponse reads the first payload chunk whatever
+    /// its length — an empty one is still a 16-byte tag under nonce 1, and
+    /// the length-prefixed chunks start at nonce 2.
+    #[tokio::test]
+    async fn ss2022_response_with_an_empty_first_chunk() {
+        let cipher = AeadCipher::Blake3Aes128Gcm;
+        let key = vec![0x42u8; 16];
+        let (client_io, mut server) = tokio::io::duplex(1 << 16);
+        let mut client = SsStream::new(client_io, cipher, key.clone(), target(), &[]);
+        assert_eq!(client.write(&[]).await.unwrap(), 0);
+        client.flush().await.unwrap();
+        let request =
+            read_request_2022("2022-blake3-aes-128-gcm", &[&key], &sent(&mut server).await);
+        let (response, mut server_key) = response_2022(
+            "2022-blake3-aes-128-gcm",
+            &key,
+            &[0x99u8; 16],
+            &request.salt,
+            unix_seconds(),
+            b"",
+        );
+        server.write_all(&response).await.unwrap();
+        server
+            .write_all(&server_key.seal_chunk(b"later"))
+            .await
+            .unwrap();
+
+        let mut received = [0u8; 5];
+        client.read_exact(&mut received).await.unwrap();
+        assert_eq!(&received, b"later");
+    }
+
+    /// How TCP requests of a mihomo client (Meta alpha-gbeb1f27) started, for
+    /// several PSK lists (PSK `n` is the bytes n, n+1, ...): the salt, the
+    /// identity headers and the fixed header chunk.
+    #[test]
+    fn ss2022_request_start_matches_mihomo() {
+        let captures: [(AeadCipher, &[u8], &str); 5] = [
+            (
+                AeadCipher::Blake3Aes128Gcm,
+                &[0],
+                "31fa4203a0e0225e5a8c0f281be6c0f7d444009ffa5cef5bd1ef5408c15eec9eadaa614c9eab51461a\
+                 3a0d",
+            ),
+            (
+                AeadCipher::Blake3Aes128Gcm,
+                &[0, 16],
+                "3527578ad74a9eb13eadfc1b250bed4ece0236516b01a349e567f2f2363f543fade607d513965b9efc\
+                 782adeb11de9c969862d4e0e7c60d3c12708",
+            ),
+            (
+                AeadCipher::Blake3Aes128Gcm,
+                &[0, 16, 32],
+                "eb4f7ac00f96c824a1d4798d984c9d96b9d43324288b39803f4e7626a4189f46470a2fc7385c244797\
+                 308598069cc06a786468842e50767196c8054cb07e816dd07dd8e7f3386bbac97310",
+            ),
+            (
+                AeadCipher::Blake3Aes256Gcm,
+                &[0],
+                "c5966f2b2cf7254ae57b8f99c7a524d7f37188264154a02931073723acf8aa6553953e67b63680ac70\
+                 985ec41531bbb82ecd06d9e6f9c188fc0bcd",
+            ),
+            (
+                AeadCipher::Blake3Aes256Gcm,
+                &[0, 100],
+                "f4372403b6e5cd600bc27f18dd946e313ae164ce68112259fbf8c7f62427b1aaba9d985e5a34920a0e\
+                 a2e392686ab95bbc73d64c2d1fec7c17372369bb0908b4e0ba1dd0af1b09b0870f4d",
+            ),
+        ];
+        for (cipher, first_bytes, request) in captures {
+            let psks: Vec<Vec<u8>> = first_bytes
+                .iter()
+                .map(|&first| (first..first + cipher.key_len() as u8).collect())
+                .collect();
+            let (psk, identity_psks) = psks.split_last().unwrap();
+            let request = hex::decode(request).unwrap();
+            let (salt, rest) = request.split_at(cipher.salt_len());
+            let (identity_headers, fixed) = rest.split_at(16 * identity_psks.len());
+
+            assert_eq!(
+                hex::encode(build_identity_headers(identity_psks, psk, salt)),
+                hex::encode(identity_headers),
+                "{cipher:?} with {} PSKs",
+                psks.len()
+            );
+
+            // The chunk after them opens under the last PSK's session key: a
+            // client header announcing the address, the padding length and
+            // 1 to 900 bytes of padding.
+            let mut fixed = fixed.to_vec();
+            CipherCore::new(cipher, cipher.derive_subkey(psk, salt))
+                .decrypt_in_place(&[0u8; NONCE_LEN], &mut fixed)
+                .unwrap();
+            assert_eq!(fixed.len(), 11);
+            assert_eq!(fixed[0], 0x00);
+            let length = u16::from_be_bytes([fixed[9], fixed[10]]) as usize;
+            assert!((7 + 2 + 1..=7 + 2 + 900).contains(&length));
+        }
+    }
+
+    /// mihomo compat: writeExtendedIdentityHeaders — with N PSKs the request
+    /// carries N-1 identity headers, each naming the next PSK under a subkey
+    /// of the one before, and the session runs under the last.
+    #[tokio::test]
+    async fn ss2022_request_chains_identity_headers_over_every_psk() {
+        for (cipher, method) in &SS2022_METHODS[..2] {
+            for psk_count in [2usize, 3, 4] {
+                let psks: Vec<Vec<u8>> = (0..psk_count)
+                    .map(|i| vec![0x10 + i as u8; cipher.key_len()])
+                    .collect();
+                let (psk, identity_psks) = psks.split_last().unwrap();
+                let (client_io, mut server) = tokio::io::duplex(1 << 16);
+                let mut client =
+                    SsStream::new(client_io, *cipher, psk.clone(), target(), identity_psks);
+                assert_eq!(client.write(&[]).await.unwrap(), 0);
+                client.flush().await.unwrap();
+
+                let chain: Vec<&[u8]> = psks.iter().map(Vec::as_slice).collect();
+                let request = read_request_2022(method, &chain, &sent(&mut server).await);
+                assert_eq!(request.target, target(), "{method} with {psk_count} PSKs");
+
+                // The response comes back under the last PSK alone.
+                let (response, _) = response_2022(
+                    method,
+                    psk,
+                    &vec![0x99u8; cipher.salt_len()],
+                    &request.salt,
+                    unix_seconds(),
+                    b"ok",
+                );
+                server.write_all(&response).await.unwrap();
+                let mut received = [0u8; 2];
+                client.read_exact(&mut received).await.unwrap();
+                assert_eq!(&received, b"ok", "{method} with {psk_count} PSKs");
+            }
+        }
     }
 }

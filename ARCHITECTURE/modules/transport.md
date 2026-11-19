@@ -9,8 +9,8 @@ Read when: changing src/transport/, socket options, TLS verification, Reality, b
 
 ## Responsibility and Status
 
-Owns protocol-independent TCP/security/wrapper composition. Status: `in progress` toward full parity; implemented for TCP, TLS, WS, gRPC, H2, H2-XHTTP and Reality; exact uTLS and
-protocol interoperation need the targeted checks below.
+Owns protocol-independent TCP/security/wrapper composition. Status: `in progress` toward full parity; implemented for TCP, TLS, WS, gRPC, H2, H2-XHTTP and Reality. Reality sends
+mihomo's uTLS ClientHellos; plain TLS does not. Protocol interoperation needs the targeted checks below.
 
 ## Code Map
 
@@ -18,8 +18,8 @@ protocol interoperation need the targeted checks below.
 | --- | --- |
 | `src/transport/tcp.rs` / `connect`, `ConnectOpts` | Socket marks, interfaces, keepalive and TCP dial |
 | `src/transport/stack.rs` / `wrap_transport` | Shared security then transport layering |
-| `src/transport/tls.rs` | rustls config cache, connectors and verification |
-| `src/transport/reality.rs`, `x25519mlkem768.rs`, `fingerprint.rs` | Reality hello/auth and key exchange/browser selection |
+| `src/transport/tls.rs`, `fingerprint.rs` | rustls config cache, connectors, verification, cipher/group ordering |
+| `src/transport/reality.rs`, `reality/{hello,tls13,cert,fallback}.rs`, `x25519mlkem768.rs` | Reality: uTLS-preset hello, session-ID auth, its own TLS 1.3 client, fallback fetch |
 | `src/transport/{ws,grpc,h2_transport,xhttp}.rs` | Async wrappers and framing |
 
 ## Local Conventions
@@ -41,14 +41,15 @@ Outbound sockets enable TCP_NODELAY to match Go's net.Dialer default: small
 TLS/Reality records must not wait for Nagle/delayed-ACK interactions.
 
 Normal TLS config is cached process-wide by verification mode, fingerprint and
-effective ALPN. ServerName remains per dial. Reality config is per connection
-because it contains ephemeral authentication material. Never reuse its key/hello
-state through the ordinary TLS cache.
+effective ALPN. ServerName remains per dial. Certificate validity is judged by
+`ntp::now()`. Reality shares none of this: it does not use rustls, and every
+connection builds its own hello and keys.
 
-Read [Reality contract](../topics/reality.md) for any Reality hello, verifier,
-key-exchange, fingerprint or rustls dependency change. Authentication is inside
+Read [Reality contract](../topics/reality.md) for any Reality hello, preset,
+TLS 1.3 client, certificate or key-exchange change. Authentication is inside
 the TLS 1.3 ClientHello session ID, not an application header. An ordinary
-camouflage certificate must fail proxy authentication. Read
+camouflage certificate must fail proxy authentication. A stream may hold
+written data until flushed: relays must flush before waiting on a read. Read
 [XHTTP contract](../topics/xhttp.md) when editing XHTTP modes/options or H2
 request framing; it owns that expanded wrapper contract.
 
@@ -70,16 +71,17 @@ rule evaluation or concrete outbound types.
 ## Verification
 
 `cargo test transport` at root covers the wrappers and TLS config behavior.
-`cargo test transport::reality` verifies session-ID auth, hello key shares,
-hybrid handshake and rejection of a wrong authentication key. These do not
-prove every browser preset or remote server. Live Reality delay API checks must
-show successful authentication and a real proxied HTTP response; debug logs
-report the negotiated hybrid group. See topic for exact invariants.
+`cargo test transport::reality` verifies preset layouts, session-ID auth, full
+handshakes against a rustls server on every suite and the hybrid group, and
+rejection of a wrong authentication key. These do not prove a remote server.
+Live Reality checks must show successful authentication, a proxied download
+and a proxied upload; a hello comparison against a current mihomo binary
+guards the presets. See topic for exact invariants.
 
 ## Known Gaps
 
-Browser fingerprints are a rustls crypto/ALPN shim rather than exact uTLS
-wire presets. Edge/360/QQ and some historical preset names are unrecognized.
-QUIC/h3 transport is out of scope. Reality fallback-browser fetching is absent;
-auth errors terminate. XHTTP restrictions are documented in its topic.
+Outside Reality, browser fingerprints are a rustls crypto/ALPN shim rather
+than uTLS wire presets, and Edge/360/QQ and the historical preset names are
+unrecognized there. Reality lacks only uTLS `randomized`. QUIC/h3 transport is
+out of scope. XHTTP restrictions are documented in its topic.
 Do not claim XTLS-Vision from this layer; VLESS currently lacks its framing.

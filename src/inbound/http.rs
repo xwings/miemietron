@@ -155,6 +155,11 @@ async fn handle_http_connection(
         ),
     };
 
+    // Whatever the client sent after the header block — a request body, or
+    // the first bytes of a tunnel it did not wait to be told about — is
+    // already in the reader's buffer and has to travel with the stream.
+    let buffered = buf_reader.buffer().to_vec();
+
     if method == "CONNECT" {
         // mihomo compat: preserve client's HTTP version in CONNECT response
         let version = parts.get(2).copied().unwrap_or("HTTP/1.1");
@@ -162,8 +167,9 @@ async fn handle_http_connection(
         let mut inner = buf_reader.into_inner();
         inner.write_all(response.as_bytes()).await?;
 
+        let tunnel = crate::conn::PeekableStream::new(buffered, inner);
         conn_manager
-            .handle_tcp_with_host(peer, dst, inner, "http-connect", host_override)
+            .handle_tcp_with_host(peer, dst, tunnel, "http-connect", host_override)
             .await?;
     } else {
         // Plain HTTP proxy: reconstruct the request since we consumed
@@ -179,8 +185,10 @@ async fn handle_http_connection(
         reconstructed.push_str("\r\n");
 
         let inner = buf_reader.into_inner();
-        // Prepend the reconstructed request to the stream
-        let prefixed = crate::conn::PeekableStream::new(reconstructed.into_bytes(), inner);
+        // Prepend the reconstructed request, and the body bytes read with it.
+        let mut prefix = reconstructed.into_bytes();
+        prefix.extend_from_slice(&buffered);
+        let prefixed = crate::conn::PeekableStream::new(prefix, inner);
         conn_manager
             .handle_tcp_with_host(peer, dst, prefixed, "http-proxy", host_override)
             .await?;
@@ -279,6 +287,67 @@ fn base64_decode(input: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncReadExt;
+
+    /// Send `request` to the HTTP inbound in a single write and return what
+    /// the origin it routes to (DIRECT) receives, up to `expected_len` bytes.
+    async fn through_proxy(request: impl Fn(u16) -> Vec<u8>, expected_len: usize) -> Vec<u8> {
+        let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = origin.local_addr().unwrap().port();
+        let manager =
+            Arc::new(crate::conn::test_support::manager("rules: ['MATCH,DIRECT']\n").await);
+
+        let inbound = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = TcpStream::connect(inbound.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (accepted, peer) = inbound.accept().await.unwrap();
+        tokio::spawn(async move {
+            let _ = handle_http_connection(accepted, peer, manager, &[]).await;
+        });
+        client.write_all(&request(port)).await.unwrap();
+
+        let (mut upstream, _) = origin.accept().await.unwrap();
+        let mut received = vec![0u8; expected_len];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            upstream.read_exact(&mut received),
+        )
+        .await
+        .expect("the origin received the whole request")
+        .unwrap();
+        received
+    }
+
+    #[tokio::test]
+    async fn a_request_body_sent_with_its_headers_reaches_the_origin() {
+        let body = vec![b'x'; 6000];
+        let forwarded_head = |port: u16| {
+            format!(
+                "POST /upload HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Length: 6000\r\n\r\n"
+            )
+        };
+        let request = |port: u16| {
+            let mut request = format!(
+                "POST http://127.0.0.1:{port}/upload HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Length: 6000\r\n\r\n"
+            )
+            .into_bytes();
+            request.extend_from_slice(&body);
+            request
+        };
+        let head_len = forwarded_head(10000).len();
+        let received = through_proxy(request, head_len + body.len()).await;
+        assert!(received.starts_with(b"POST /upload HTTP/1.1\r\n"));
+        assert_eq!(&received[head_len..], body.as_slice());
+    }
+
+    #[tokio::test]
+    async fn tunnel_bytes_sent_with_the_connect_request_are_not_lost() {
+        let request = |port: u16| {
+            format!("CONNECT 127.0.0.1:{port} HTTP/1.1\r\n\r\nearly bytes").into_bytes()
+        };
+        assert_eq!(through_proxy(request, 11).await, b"early bytes");
+    }
 
     #[test]
     fn parse_host_port_domain_with_port() {

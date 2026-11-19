@@ -1,19 +1,21 @@
 use dashmap::DashMap;
-use std::net::IpAddr;
 use std::time::Instant;
+
+use super::upstream::Answer;
 
 const DEFAULT_MAX_SIZE: usize = 4096;
 
-/// A cached DNS entry with per-entry expiration.
+/// A cached DNS answer with per-entry expiration.
 struct CacheEntry {
-    ip: IpAddr,
+    answer: Answer,
     expires_at: Instant,
 }
 
 /// DNS cache using DashMap with per-entry TTL.
 ///
 /// mihomo compat: each entry has its own TTL from the upstream DNS response.
-/// Expired entries are lazily removed on access.
+/// Expired entries are lazily removed on access. Negative answers (NXDOMAIN,
+/// empty) are entries like any other (dns/util.go putMsgToCache).
 pub struct DnsCache {
     entries: DashMap<String, CacheEntry>,
     max_size: usize,
@@ -32,43 +34,35 @@ impl DnsCache {
         }
     }
 
-    /// Return IP if entry exists and is not expired; remove expired entries on access.
-    pub fn get(&self, domain: &str) -> Option<IpAddr> {
-        // DashMap supports Borrow<str> lookups — no String allocation needed.
-        if let Some(entry) = self.entries.get(domain) {
-            if Instant::now() < entry.expires_at {
-                return Some(entry.ip);
-            }
-            // Entry expired — drop the ref before removing
-            drop(entry);
-            self.entries.remove(domain);
-        }
-        None
-    }
-
-    /// Like [`Self::get`] but also returns the entry's REMAINING TTL in seconds
-    /// (at least 1), for advertising to a DNS client.
+    /// Return the answer if the entry exists and is not expired, its TTL
+    /// counted down to the REMAINING seconds (at least 1); remove expired
+    /// entries on access.
     ///
     /// mihomo compat: resolver.go ExchangeContext counts a cached answer's TTL
     /// down by `time.Until(expireTime)` (util.go updateTTL) instead of replaying
     /// the original TTL, so a client can't keep an address past its expiry.
-    pub fn get_with_ttl(&self, domain: &str) -> Option<(IpAddr, u32)> {
-        if let Some(entry) = self.entries.get(domain) {
+    pub fn get(&self, key: &str) -> Option<Answer> {
+        // DashMap supports Borrow<str> lookups — no String allocation needed.
+        if let Some(entry) = self.entries.get(key) {
             let now = Instant::now();
             if now < entry.expires_at {
                 let remaining = (entry.expires_at - now).as_secs().max(1);
-                return Some((entry.ip, remaining as u32));
+                return Some(Answer {
+                    ttl: remaining as u32,
+                    ..entry.answer.clone()
+                });
             }
+            // Entry expired — drop the ref before removing
             drop(entry);
-            self.entries.remove(domain);
+            self.entries.remove(key);
         }
         None
     }
 
-    /// Insert a DNS entry with a specific TTL in seconds.
-    /// If ttl_secs is 0, the entry is not cached (mihomo compat).
-    pub fn insert(&self, domain: String, ip: IpAddr, ttl_secs: u32) {
-        if ttl_secs == 0 {
+    /// Insert an answer for its TTL in seconds.
+    /// If the TTL is 0, the answer is not cached (mihomo compat).
+    pub fn insert(&self, key: String, answer: &Answer) {
+        if answer.ttl == 0 {
             return;
         }
 
@@ -84,10 +78,10 @@ impl DnsCache {
         }
 
         self.entries.insert(
-            domain,
+            key,
             CacheEntry {
-                ip,
-                expires_at: Instant::now() + std::time::Duration::from_secs(ttl_secs as u64),
+                answer: answer.clone(),
+                expires_at: Instant::now() + std::time::Duration::from_secs(answer.ttl as u64),
             },
         );
     }
@@ -107,14 +101,22 @@ impl DnsCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::Ipv4Addr;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    fn answer(ip: IpAddr, ttl: u32) -> Answer {
+        Answer {
+            rcode: 0,
+            ips: vec![ip],
+            ttl,
+        }
+    }
 
     #[test]
     fn insert_and_get() {
         let cache = DnsCache::new(100);
         let ip = IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4));
-        cache.insert("example.com".to_string(), ip, 300);
-        assert_eq!(cache.get("example.com"), Some(ip));
+        cache.insert("example.com".to_string(), &answer(ip, 300));
+        assert_eq!(cache.get("example.com").unwrap().ips, [ip]);
     }
 
     #[test]
@@ -127,8 +129,8 @@ mod tests {
     fn clear_empties_cache() {
         let cache = DnsCache::new(100);
         let ip = IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4));
-        cache.insert("a.com".to_string(), ip, 300);
-        cache.insert("b.com".to_string(), ip, 300);
+        cache.insert("a.com".to_string(), &answer(ip, 300));
+        cache.insert("b.com".to_string(), &answer(ip, 300));
         cache.clear();
         assert_eq!(cache.get("a.com"), None);
     }
@@ -137,7 +139,7 @@ mod tests {
     fn zero_ttl_not_cached() {
         let cache = DnsCache::new(100);
         let ip = IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4));
-        cache.insert("example.com".to_string(), ip, 0);
+        cache.insert("example.com".to_string(), &answer(ip, 0));
         assert_eq!(cache.get("example.com"), None);
     }
 
@@ -147,8 +149,26 @@ mod tests {
         let ip = IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4));
         // Insert with 1 second TTL — we can't easily test real expiration
         // without sleeping, but we can verify the entry is stored.
-        cache.insert("example.com".to_string(), ip, 1);
+        cache.insert("example.com".to_string(), &answer(ip, 1));
         // Should be retrievable immediately
-        assert_eq!(cache.get("example.com"), Some(ip));
+        assert_eq!(cache.get("example.com").unwrap().ips, [ip]);
+    }
+
+    /// mihomo compat: dns/util.go putMsgToCache caches whatever reply won,
+    /// its response code included — an NXDOMAIN is served from the cache
+    /// until the SOA's TTL runs out.
+    #[test]
+    fn negative_answer_is_cached_with_its_rcode() {
+        let cache = DnsCache::new(100);
+        let nxdomain = Answer {
+            rcode: 3,
+            ips: vec![],
+            ttl: 600,
+        };
+        cache.insert("missing.example.com".to_string(), &nxdomain);
+
+        let cached = cache.get("missing.example.com").unwrap();
+        assert_eq!((cached.rcode, cached.ips.len()), (3, 0));
+        assert!((1..=600).contains(&cached.ttl));
     }
 }

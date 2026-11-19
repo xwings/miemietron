@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tracing::{debug, error, info};
+use tracing::{debug, info, warn};
 
 use crate::common::addr::Address;
 use crate::rules::{process, Action, RuleMetadata};
@@ -53,22 +53,59 @@ impl RelayBufPool {
     }
 }
 
+/// The bytes one connection has carried. Each is added to the process totals
+/// as it passes, so `/traffic` shows a transfer while it runs.
+///
+/// mihomo compat: tunnel/statistic tracker.go — every read and write calls
+/// `manager.PushDownloaded` / `PushUploaded`.
+pub struct Traffic {
+    upload: AtomicU64,
+    download: AtomicU64,
+    totals: Arc<StatsManager>,
+}
+
+impl Traffic {
+    /// `uploaded` is what already went out before tracking began (mihomo's
+    /// `NewTCPTracker(..., uploadTotal, ...)`).
+    pub fn new(totals: Arc<StatsManager>, uploaded: u64) -> Arc<Self> {
+        totals.add_upload(uploaded);
+        Arc::new(Self {
+            upload: AtomicU64::new(uploaded),
+            download: AtomicU64::new(0),
+            totals,
+        })
+    }
+
+    pub fn uploaded(&self, bytes: u64) {
+        self.upload.fetch_add(bytes, Ordering::Relaxed);
+        self.totals.add_upload(bytes);
+    }
+
+    pub fn downloaded(&self, bytes: u64) {
+        self.download.fetch_add(bytes, Ordering::Relaxed);
+        self.totals.add_download(bytes);
+    }
+
+    pub fn upload(&self) -> u64 {
+        self.upload.load(Ordering::Relaxed)
+    }
+
+    pub fn download(&self) -> u64 {
+        self.download.load(Ordering::Relaxed)
+    }
+}
+
 pin_project! {
     pub struct CountingStream<T> {
         #[pin]
         inner: T,
-        upload: Arc<AtomicU64>,
-        download: Arc<AtomicU64>,
+        traffic: Arc<Traffic>,
     }
 }
 
 impl<T> CountingStream<T> {
-    pub fn new(inner: T, upload: Arc<AtomicU64>, download: Arc<AtomicU64>) -> Self {
-        Self {
-            inner,
-            upload,
-            download,
-        }
+    pub fn new(inner: T, traffic: Arc<Traffic>) -> Self {
+        Self { inner, traffic }
     }
 }
 
@@ -84,7 +121,7 @@ impl<T: AsyncRead> AsyncRead for CountingStream<T> {
         if let Poll::Ready(Ok(())) = &result {
             let n = buf.filled().len() - before;
             if n > 0 {
-                this.download.fetch_add(n as u64, Ordering::Relaxed);
+                this.traffic.downloaded(n as u64);
             }
         }
         result
@@ -101,7 +138,7 @@ impl<T: AsyncWrite> AsyncWrite for CountingStream<T> {
         let result = this.inner.poll_write(cx, buf);
         if let Poll::Ready(Ok(n)) = &result {
             if *n > 0 {
-                this.upload.fetch_add(*n as u64, Ordering::Relaxed);
+                this.traffic.uploaded(*n as u64);
             }
         }
         result
@@ -222,170 +259,317 @@ fn inbound_port(config: &crate::config::MiemieConfig, conn_type: &str) -> Option
     }
 }
 
-/// mihomo compat: tunnel.go match() — resolve the host to a real IP on
-/// demand when rule evaluation needs it (GEOIP / IP-CIDR / ... without
-/// no-resolve) but dst_ip was blanked for FakeIP. Resolution failure
-/// falls through to matching with dst_ip=None, exactly like mihomo.
-async fn resolve_ip_on_demand(
-    mode: &str,
-    rule_meta: &mut RuleMetadata,
-    rules: &crate::rules::RuleEngine,
+/// mihomo compat: `resolver.DefaultDNSTimeout`.
+const RULE_DNS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Resolve a host for the rule walk.
+///
+/// mihomo compat: tunnel.go resolveMetadata `helper.ResolveIP` — a failure
+/// is only logged, and the rules go on without an IP.
+async fn resolve_for_rules(
     dns: &crate::dns::DnsResolver,
-) {
-    if mode != "global"
-        && mode != "direct"
-        && rule_meta.dst_ip.is_none()
-        && rule_meta.domain.is_some()
-        && rules.needs_ip_resolution(rule_meta)
-    {
-        if let Some(host) = rule_meta.domain.clone() {
-            match dns.resolve_real_ip(&host).await {
-                Ok(ip) => rule_meta.dst_ip = Some(ip),
-                // mihomo compat: match() ignores the error and falls through
-                // with a nil dst_ip. Log it — a failure here silently disables
-                // every destination-IP rule (GEOIP / IP-CIDR / IP-SUFFIX /
-                // IP-ASN) for this connection, so domestic traffic that should
-                // hit `GEOIP,CN,DIRECT` falls to the catch-all instead.
-                Err(e) => debug!("resolve-on-demand failed for {}: {}", host, e),
-            }
+    host: String,
+) -> Option<std::net::IpAddr> {
+    match tokio::time::timeout(RULE_DNS_TIMEOUT, dns.resolve_real_ip(&host)).await {
+        Ok(Ok(ip)) => {
+            debug!("[DNS] {} --> {}", host, ip);
+            Some(ip)
+        }
+        Ok(Err(e)) => {
+            debug!("[DNS] resolve {} error: {}", host, e);
+            None
+        }
+        Err(_) => {
+            debug!("[DNS] resolve {} error: context deadline exceeded", host);
+            None
         }
     }
 }
 
-/// mihomo compat: tunnel.go retry() with a context timeout (tunnel.go:554-591,
-/// 695-716). The whole loop is bounded by DefaultTCPTimeout (5s); the 10-attempt
-/// cap is a backstop, the deadline is the real limit. Backoff is jittered —
-/// `duration = Random(min, min * factor^attempt)` via slowdown.New().
-async fn dial_with_retry(
-    handler: &Arc<dyn crate::proxy::OutboundHandler>,
-    group: Option<&Arc<dyn crate::proxy_group::ProxyGroup>>,
+/// How many of the client's first bytes may travel with a request header:
+/// mihomo peeks them through a `bufio.Reader`, whose buffer is 4096 bytes.
+const EARLY_DATA_SIZE: usize = 4096;
+
+/// mihomo compat: tunnel.go handleTCPConn gives the client 200 ms to speak.
+const EARLY_DATA_WAIT: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// The client's first bytes, which a lazily handshaking outbound sends along
+/// with its request header (see [`Handshake`]).
+///
+/// mihomo compat: tunnel.go handleTCPConn — bytes the sniffer already read
+/// are the early data; otherwise the client gets 200 ms to speak, counted
+/// from the end of sniffing and waited out while the outbound is dialed.
+struct EarlyData<S> {
+    stream: S,
+    bytes: Vec<u8>,
+    /// Until when the client may still speak; `None` once it has, or the
+    /// wait is over.
+    wait_until: Option<tokio::time::Instant>,
+}
+
+impl<S: AsyncRead + Unpin> EarlyData<S> {
+    fn new(stream: S, sniffed: Vec<u8>) -> Self {
+        let wait_until = sniffed
+            .is_empty()
+            .then(|| tokio::time::Instant::now() + EARLY_DATA_WAIT);
+        Self {
+            stream,
+            bytes: sniffed,
+            wait_until,
+        }
+    }
+
+    fn waiting(&self) -> bool {
+        self.wait_until.is_some()
+    }
+
+    /// Wait for the client's first bytes, or for its 200 ms to run out.
+    ///
+    /// Cancel-safe: nothing leaves the stream unless the read completes, and
+    /// the wait stays open until it does.
+    async fn settle(&mut self) {
+        use tokio::io::AsyncReadExt;
+
+        let Some(deadline) = self.wait_until else {
+            return;
+        };
+        let mut bytes = vec![0u8; EARLY_DATA_SIZE];
+        let read = tokio::time::timeout_at(deadline, self.stream.read(&mut bytes)).await;
+        self.wait_until = None;
+        if let Ok(Ok(len)) = read {
+            bytes.truncate(len);
+            self.bytes = bytes;
+        }
+    }
+}
+
+/// Start a dialed stream: send `early`, with at least one write even when it
+/// is empty — an empty write is what makes a lazily handshaking stream send
+/// its request header.
+async fn write_early<W>(remote: &mut W, early: &[u8]) -> std::io::Result<()>
+where
+    W: AsyncWrite + Unpin + ?Sized,
+{
+    let mut written = 0;
+    loop {
+        let len =
+            std::future::poll_fn(|cx| Pin::new(&mut *remote).poll_write(cx, &early[written..]))
+                .await?;
+        written += len;
+        if written >= early.len() {
+            break;
+        }
+        if len == 0 {
+            return Err(std::io::ErrorKind::WriteZero.into());
+        }
+    }
+    tokio::io::AsyncWriteExt::flush(remote).await
+}
+
+/// A connection an outbound opened for one client stream.
+struct Dialed {
+    remote: Box<dyn crate::proxy::ProxyStream>,
+    /// The groups and the outbound the successful attempt went through.
+    path: crate::proxy::ResolvedPath,
+    /// How many of the client's bytes went out with the request header.
+    early_sent: usize,
+}
+
+/// mihomo compat: tunnel.go `retry` — at most ten attempts inside one
+/// deadline, with slowdown.New()'s jittered backoff between them
+/// (`Random(min, min * factor^attempt)`, capped), ended early by the errors
+/// `shouldStopRetry` names.
+struct Retry {
+    deadline: tokio::time::Instant,
+    attempt: usize,
+    last_error: Option<anyhow::Error>,
+}
+
+impl Retry {
+    const ATTEMPTS: usize = 10;
+    const BACKOFF_MIN_MS: f64 = 10.0;
+    const BACKOFF_FACTOR: f64 = 2.0;
+    const BACKOFF_MAX_MS: f64 = 1000.0;
+
+    fn new(budget: std::time::Duration) -> Self {
+        Self {
+            deadline: tokio::time::Instant::now() + budget,
+            attempt: 0,
+            last_error: None,
+        }
+    }
+
+    fn time_left(&self) -> Option<std::time::Duration> {
+        let left = self
+            .deadline
+            .saturating_duration_since(tokio::time::Instant::now());
+        (!left.is_zero()).then_some(left)
+    }
+
+    /// How long the next attempt may take; `None` once the attempts or the
+    /// time are used up.
+    fn remaining(&self) -> Option<std::time::Duration> {
+        if self.attempt >= Self::ATTEMPTS {
+            return None;
+        }
+        self.time_left()
+    }
+
+    /// Record a failed attempt and wait out the backoff. False when the
+    /// error is one another attempt cannot fix, or the time is up.
+    async fn again(&mut self, error: anyhow::Error) -> bool {
+        use rand::Rng;
+
+        // mihomo compat: shouldStopRetry (tunnel.go) — ONLY resolver
+        // couldn't-find-ip, ip-version, ipv6-disabled and reject-loopback
+        // errors are terminal. Everything else (including transient
+        // DNS-server failures) is retried; each retry re-resolves.
+        let text = error.to_string();
+        let stop = text.contains("couldn't find ip")
+            || text.contains("IP not found")
+            || text.contains("ip version error")
+            || text.contains("IPv6 disabled")
+            || text.contains("reject loopback connection");
+        self.last_error = Some(error);
+        if stop {
+            return false;
+        }
+
+        let longest = (Self::BACKOFF_MIN_MS * Self::BACKOFF_FACTOR.powi(self.attempt as i32))
+            .min(Self::BACKOFF_MAX_MS);
+        let wait = rand::thread_rng().gen_range(Self::BACKOFF_MIN_MS..=longest);
+        self.attempt += 1;
+        let Some(left) = self.time_left() else {
+            return false;
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(wait as u64).min(left)).await;
+        true
+    }
+
+    /// The error to report once [`Self::remaining`] or [`Self::again`] gave up.
+    fn into_error(self) -> anyhow::Error {
+        self.last_error
+            .unwrap_or_else(|| anyhow::anyhow!("context deadline exceeded"))
+    }
+}
+
+/// mihomo compat: tunnel.go handleTCPConn's `retry(ctx, ...)` around
+/// `proxy.DialContext`, bounded by DefaultTCPTimeout (5s).
+///
+/// Every attempt dials through the rule's target again, so each group on the
+/// way selects afresh, is touched, and hears how the dial went; a url-test
+/// group that only ever sits behind select groups keeps its health check
+/// alive this way. A stream that owes the server a handshake (see
+/// [`Handshake`]) gets it inside the attempt, and a failure there is a failed
+/// dial like any other.
+async fn dial_with_retry<S: AsyncRead + Unpin>(
+    proxies: &crate::proxy::ProxyManager,
+    route: &Route,
     target: &Address,
     dns: &crate::dns::DnsResolver,
     src: SocketAddr,
-) -> Result<Box<dyn crate::proxy::ProxyStream>> {
-    // mihomo compat: retry() with context timeout (tunnel.go:554-591, 695-716).
-    // Entire retry loop bounded by DefaultTCPTimeout (5s).
-    // Max 10 iterations but the context timeout is the real limit.
-    // Backoff uses jitter: duration = Random(min, min * factor^attempt)
-    // via slowdown.New() (slowdown.go, backoff.go).
-    let proxy_name = handler.name();
-    let proxy_proto = handler.proto();
-    debug!(
-        "Connecting via [{}] {} to {}",
-        proxy_proto, proxy_name, target
-    );
-    use rand::Rng;
-    use tokio::time::{timeout, Instant};
+    early: &mut EarlyData<S>,
+) -> Result<Dialed> {
+    use crate::proxy::Handshake;
+    use tokio::time::timeout;
 
-    let retry_deadline = Instant::now() + std::time::Duration::from_secs(5); // C.DefaultTCPTimeout
-    const MAX_RETRIES: usize = 10;
-    let mut last_err = None;
-    let mut remote_conn = None;
-    let backoff_min_ms: f64 = 10.0;
-    let backoff_factor: f64 = 2.0;
-    let backoff_max_ms: f64 = 1000.0;
+    let mut retry = Retry::new(std::time::Duration::from_secs(5)); // C.DefaultTCPTimeout
+    loop {
+        let Some(remaining) = retry.remaining() else {
+            return Err(retry.into_error());
+        };
 
-    for attempt in 0..MAX_RETRIES {
-        // Check if we've exceeded the overall timeout
-        let remaining = retry_deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            break;
-        }
+        let path = proxies.resolve_action_path(&route.action)?;
+        path.touch();
+        let handler = &path.handler;
+        debug!(
+            "Connecting via [{}] {} to {}",
+            handler.proto(),
+            handler.name(),
+            target
+        );
 
-        // Dial with remaining time as timeout
-        match timeout(remaining, handler.connect_stream(target, dns)).await {
-            Ok(Ok(r)) => {
-                // mihomo compat: notify group of successful dial
-                if let Some(group) = group {
-                    group.on_dial_success();
+        let dialed = timeout(remaining, async {
+            let connect = handler.connect_stream(target, dns);
+            tokio::pin!(connect);
+            // The client's 200 ms run while the outbound is being dialed.
+            let mut remote = loop {
+                tokio::select! {
+                    result = &mut connect => break result?,
+                    _ = early.settle(), if early.waiting() => {}
                 }
-                remote_conn = Some(r);
-                break;
-            }
-            Ok(Err(e)) => {
-                let err_str = e.to_string();
-
-                // mihomo compat: shouldStopRetry (tunnel.go:698-712) — ONLY
-                // resolver couldn't-find-ip, ip-version, ipv6-disabled and
-                // reject-loopback errors are terminal. Everything else
-                // (including transient DNS-server failures) is retried;
-                // each retry re-resolves.
-                let should_stop = err_str.contains("couldn't find ip")
-                    || err_str.contains("IP not found")
-                    || err_str.contains("ip version error")
-                    || err_str.contains("IPv6 disabled")
-                    || err_str.contains("reject loopback connection");
-
-                if should_stop {
-                    last_err = Some(e);
-                    break;
+            };
+            let early_sent = match handler.handshake() {
+                Handshake::Done => 0,
+                Handshake::AtDial => {
+                    write_early(&mut remote, &[]).await?;
+                    0
                 }
-
-                if attempt < MAX_RETRIES - 1 {
-                    // mihomo compat: slowdown with jitter (slowdown.go, backoff.go)
-                    // duration = Random(min, min * factor^attempt), capped at max
-                    let max_dur =
-                        (backoff_min_ms * backoff_factor.powi(attempt as i32)).min(backoff_max_ms);
-                    let jittered = rand::thread_rng().gen_range(backoff_min_ms..=max_dur);
-                    let sleep_dur = std::time::Duration::from_millis(jittered as u64);
-
-                    debug!(
-                        "Proxy connect attempt {}/{} failed [{}] {} -> {}: {}, retrying in {}ms",
-                        attempt + 1,
-                        MAX_RETRIES,
-                        proxy_name,
-                        src,
-                        target,
-                        e,
-                        jittered as u64
-                    );
-
-                    // Context-aware sleep: don't sleep past deadline
-                    let remaining = retry_deadline.saturating_duration_since(Instant::now());
-                    if remaining.is_zero() {
-                        last_err = Some(e);
-                        break;
-                    }
-                    tokio::time::sleep(sleep_dur.min(remaining)).await;
+                Handshake::WithEarlyData => {
+                    early.settle().await;
+                    write_early(&mut remote, &early.bytes).await?;
+                    early.bytes.len()
                 }
-                last_err = Some(e);
-            }
-            Err(_timeout) => {
-                // Overall timeout expired during dial
-                last_err = Some(anyhow::anyhow!("connect timeout"));
-                break;
-            }
-        }
-    }
+            };
+            Ok::<_, anyhow::Error>((remote, early_sent))
+        })
+        .await;
 
-    match remote_conn {
-        Some(r) => Ok(r),
-        None => {
-            let e = last_err.unwrap_or_else(|| anyhow::anyhow!("connect timeout"));
-            error!(
-                "Proxy connect failed after {} attempts [{}] {} -> {}: {}",
-                MAX_RETRIES, proxy_name, src, target, e
-            );
-            // mihomo compat: notify group of failed dial
-            // This may trigger an immediate health check after repeated failures.
-            if let Some(group) = group {
-                group.on_dial_failed(proxy_proto, &e.to_string());
+        let error = match dialed {
+            Ok(Ok((remote, early_sent))) => {
+                path.on_dial_success();
+                return Ok(Dialed {
+                    remote,
+                    path,
+                    early_sent,
+                });
             }
-            Err(e)
+            Ok(Err(error)) => error,
+            Err(_elapsed) => anyhow::anyhow!("context deadline exceeded"),
+        };
+        path.on_dial_failed(&format!("{error:#}"));
+        warn!("{}", format_dial_error("TCP", route, src, target, &error));
+        if !retry.again(error).await {
+            return Err(retry.into_error());
         }
     }
 }
 
-/// The routing decision for one connection: the matched rule, the outbound
-/// handler it resolved to, and the chain reported to `/connections`.
+/// mihomo compat: tunnel.go logMetadataErr — the warning for each failed
+/// dial attempt. Split out so the wording can be asserted in tests.
+fn format_dial_error(
+    network: &str,
+    route: &Route,
+    src: impl std::fmt::Display,
+    target: impl std::fmt::Display,
+    error: &anyhow::Error,
+) -> String {
+    // mihomo's `proxy.Name()`: the adapter the rule (or mode) named.
+    let proxy = match &route.action {
+        Action::Proxy(name) => name.as_str(),
+        Action::Direct => "DIRECT",
+        Action::Reject => "REJECT",
+        Action::RejectDrop => "REJECT-DROP",
+    };
+    if !route.matched {
+        format!("[{network}] dial {proxy} {src} --> {target} error: {error:#}")
+    } else {
+        format!(
+            "[{network}] dial {proxy} (match {}/{}) {src} --> {target} error: {error:#}",
+            crate::rules::rule_type_display(&route.rule_type),
+            route.rule_payload
+        )
+    }
+}
+
+/// The routing decision for one connection: the matched rule and the adapter
+/// it names. Which outbound that adapter dials through is decided per dial
+/// attempt (see [`dial_with_retry`]).
 struct Route {
     action: Action,
-    handler: Arc<dyn crate::proxy::OutboundHandler>,
-    /// The proxy group the action named, if any — touched for lazy health checks
-    /// and notified of dial success/failure.
-    group: Option<Arc<dyn crate::proxy_group::ProxyGroup>>,
-    /// mihomo convention: innermost (final proxy) first.
-    chains: Vec<String>,
+    /// Whether a rule produced `action` (mihomo's `rule != nil`): false in
+    /// global and direct mode and when nothing matched.
+    matched: bool,
     /// Raw config rule type ("DOMAIN-SUFFIX"); empty when nothing matched.
     rule_type: String,
     rule_payload: String,
@@ -393,24 +577,17 @@ struct Route {
 
 /// mihomo compat: tunnel.go match() plus the GLOBAL/DIRECT mode short-circuits.
 ///
-/// Resolves the destination IP first if a rule needs it, matches the rule list,
-/// touches the matched group (mihomo's `GroupBase.GetProxies(touch=true)`) so
-/// lazy health checks know the group is in use, and resolves the action to an
-/// outbound handler. Errors if `Action::Proxy(name)` cannot be resolved — no
-/// silent DIRECT fallback. See ARCHITECTURE.md "Scope" and the regression tests
-/// in src/proxy/mod.rs.
+/// Resolves the destination IP first if a rule needs it, then matches the
+/// rule list.
 ///
-/// The engine/manager/resolver are passed in rather than re-read from AppState
-/// so a concurrent reload can't split one connection across two generations.
+/// The engine/resolver are passed in rather than re-read from AppState so a
+/// concurrent reload can't split one connection across two generations.
 async fn resolve_route(
     rules: &crate::rules::RuleEngine,
-    proxies: &crate::proxy::ProxyManager,
     dns: &crate::dns::DnsResolver,
     rule_meta: &mut RuleMetadata,
     mode: &str,
-) -> Result<Route> {
-    resolve_ip_on_demand(mode, rule_meta, rules, dns).await;
-
+) -> Route {
     let (action, rule_type, rule_payload) = if mode == "global" {
         (
             Action::Proxy("GLOBAL".to_string()),
@@ -420,36 +597,17 @@ async fn resolve_route(
     } else if mode == "direct" {
         (Action::Direct, "DIRECT".to_string(), String::new())
     } else {
-        rules.match_rules_detailed(rule_meta)
+        rules
+            .match_rules_resolving(rule_meta, None, |host| resolve_for_rules(dns, host))
+            .await
     };
 
-    // Group name (if routed through a proxy group), for the chain and for touch.
-    let group_name = match &action {
-        Action::Proxy(name) => Some(name.clone()),
-        _ => None,
-    };
-    let group = group_name.as_ref().and_then(|gn| proxies.get_group(gn));
-    if let Some(ref group) = group {
-        group.touch();
-    }
-
-    let handler = proxies.resolve_action(&action)?;
-    let proxy_name = handler.name();
-
-    // Build chains: [final_proxy, group_name] (mihomo convention: innermost first)
-    let chains = match group_name {
-        Some(gn) if gn != proxy_name => vec![proxy_name.to_string(), gn],
-        _ => vec![proxy_name.to_string()],
-    };
-
-    Ok(Route {
+    Route {
         action,
-        handler,
-        group,
-        chains,
+        matched: mode != "global" && mode != "direct" && !rule_type.is_empty(),
         rule_type,
         rule_payload,
-    })
+    }
 }
 
 /// mihomo compat: constant/adapters.go Chain.String() — a connection's chain
@@ -655,8 +813,7 @@ pub struct ConnectionManager {
 /// live byte counters, and the relay task's abort handle.
 struct ConnEntry {
     info: ConnectionInfo,
-    upload: Arc<AtomicU64>,
-    download: Arc<AtomicU64>,
+    traffic: Arc<Traffic>,
     abort: tokio::task::AbortHandle,
 }
 
@@ -813,8 +970,9 @@ impl ConnectionManager {
             peek_buf,
         } = sniffed;
 
-        // Wrap the stream so the peeked bytes are replayed before the rest
-        let stream = PeekableStream::new(peek_buf, stream);
+        // mihomo compat: the client's 200 ms to speak first start here, as
+        // soon as sniffing is over, and run while the outbound is dialed.
+        let mut early = EarlyData::new(stream, peek_buf);
 
         // Build the target address. Domain takes priority (always set for
         // FakeIP connections thanks to the early check above). For non-FakeIP
@@ -863,29 +1021,21 @@ impl ConnectionManager {
             ..Default::default()
         };
 
-        let route = resolve_route(&rules, &proxies, &dns, &mut rule_meta, &mode).await?;
-        let Route {
-            action,
-            handler,
-            group: group_arc,
-            chains,
-            rule_type,
-            rule_payload,
-        } = route;
+        let route = resolve_route(&rules, &dns, &mut rule_meta, &mode).await;
 
         debug!(
             "TCP {} -> {} ({}) => {:?} [{}]",
             src,
             target,
             domain.as_deref().unwrap_or(""),
-            action,
-            rule_type
+            route.action,
+            route.rule_type
         );
 
         // Determine the rule string for the connection entry.
         // mihomo compat: the /connections `rule` field uses RuleType.String()
         // display form (e.g. "DomainSuffix", "Match"), not config syntax.
-        let rule_str = crate::rules::rule_type_display(&rule_type).to_string();
+        let rule_str = crate::rules::rule_type_display(&route.rule_type).to_string();
 
         // mihomo compat: apply the hosts override (resolved once above) to the
         // dial target: if host is in DefaultHosts and the resolved IP is not a
@@ -901,7 +1051,16 @@ impl ConnectionManager {
             target
         };
 
-        let remote = dial_with_retry(&handler, group_arc.as_ref(), &target, &dns, src).await?;
+        let Dialed {
+            remote,
+            path,
+            early_sent,
+        } = dial_with_retry(&proxies, &route, &target, &dns, src, &mut early).await?;
+        let Route {
+            rule_type,
+            rule_payload,
+            ..
+        } = route;
 
         let conn_id: Arc<str> = uuid::Uuid::new_v4().to_string().into();
         let conn_info = ConnectionInfo {
@@ -925,7 +1084,7 @@ impl ConnectionManager {
             upload: 0,
             download: 0,
             start: chrono::Utc::now().to_rfc3339(),
-            chains,
+            chains: path.chains(),
             rule: rule_str,
             rule_payload,
         };
@@ -939,23 +1098,34 @@ impl ConnectionManager {
             &chain_display(&conn_info.chains),
         );
 
-        self.register_and_relay(conn_info, stream, remote).await;
+        // What went out with the request header is done with; anything else
+        // the client already sent is replayed ahead of the stream.
+        let EarlyData { stream, bytes, .. } = early;
+        let unsent = if early_sent > 0 { Vec::new() } else { bytes };
+        let local = PeekableStream::new(unsent, stream);
+        self.register_and_relay(conn_info, local, remote, early_sent as u64)
+            .await;
 
         Ok(())
     }
 
     /// Register the connection so `/connections` can see and close it, relay
-    /// both directions to completion, then flush its byte totals into the
-    /// global stats and deregister.
-    async fn register_and_relay<L, R>(&self, info: ConnectionInfo, local: L, remote: R)
-    where
+    /// both directions to completion, then deregister.
+    async fn register_and_relay<L, R>(
+        &self,
+        info: ConnectionInfo,
+        local: L,
+        remote: R,
+        early_sent: u64,
+    ) where
         L: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
         R: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
         let conn_id = info.id.clone();
-        let up_counter = Arc::new(AtomicU64::new(0));
-        let down_counter = Arc::new(AtomicU64::new(0));
-        let remote_counted = CountingStream::new(remote, up_counter.clone(), down_counter.clone());
+        // mihomo compat: NewTCPTracker starts the upload count at the bytes
+        // already written with the handshake.
+        let traffic = Traffic::new(self.app.stats.clone(), early_sent);
+        let remote_counted = CountingStream::new(remote, traffic.clone());
 
         let relay_handle = tokio::spawn(async move {
             relay_bidirectional(local, remote_counted).await;
@@ -964,8 +1134,7 @@ impl ConnectionManager {
             conn_id.clone(),
             ConnEntry {
                 info,
-                upload: up_counter.clone(),
-                download: down_counter.clone(),
+                traffic,
                 abort: relay_handle.abort_handle(),
             },
         );
@@ -975,9 +1144,6 @@ impl ConnectionManager {
         // Wait for the relay to complete (normally or via abort from close_connection)
         let _ = relay_handle.await;
 
-        // Flush totals into global stats
-        stats.add_upload(up_counter.load(Ordering::Relaxed));
-        stats.add_download(down_counter.load(Ordering::Relaxed));
         stats.remove_connection();
         self.connections.remove(&conn_id);
     }
@@ -1181,15 +1347,15 @@ impl ConnectionManager {
     /// client-supplied domain target (SOCKS5 UDP ATYP_DOMAIN) so DOMAIN rules
     /// can match; `dst` is a placeholder 0.0.0.0 in that case.
     ///
-    /// Returns the `Action` to take and the resolved domain (if any).
-    async fn resolve_udp_action(
+    /// Returns the route and what is then known of the destination.
+    async fn resolve_udp_route(
         &self,
         src: SocketAddr,
         dst: SocketAddr,
         conn_type: &'static str,
         domain: Option<String>,
         sniff_overrode: bool,
-    ) -> (Action, Option<String>) {
+    ) -> udp::UdpRoute {
         let dns = self.app.dns_resolver();
         let rules = self.app.rule_engine();
         let config = self.app.config();
@@ -1225,8 +1391,6 @@ impl ConnectionManager {
             ..Default::default()
         };
 
-        resolve_ip_on_demand(&mode, &mut rule_meta, &rules, &dns).await;
-
         // mihomo compat: global mode routes to proxies["GLOBAL"]
         let proxies = self.app.proxy_manager();
         let (action, rule_type, rule_payload) = if mode == "global" {
@@ -1253,47 +1417,24 @@ impl ConnectionManager {
                         .unwrap_or(true),
                 }
             };
-            rules.match_rules_detailed_filtered(&rule_meta, Some(&adapter_udp_ok))
+            rules
+                .match_rules_resolving(&mut rule_meta, Some(&adapter_udp_ok), |host| {
+                    resolve_for_rules(&dns, host)
+                })
+                .await
         };
 
-        // mihomo compat: UDP sessions get the same one info log per session as
-        // TCP (tunnel.go:475 logMetadata) — without it UDP activity is
-        // invisible at info level.
-        {
-            let target_str = domain
-                .as_deref()
-                .map(|d| format!("{}:{}", d, dst.port()))
-                .unwrap_or_else(|| dst.to_string());
-            // Same chain shape as the TCP path: innermost element first, so
-            // chain_display renders `group[node]`.
-            let chains = match &action {
-                Action::Direct => vec!["DIRECT".to_string()],
-                Action::Reject => vec!["REJECT".to_string()],
-                Action::RejectDrop => vec!["REJECT-DROP".to_string()],
-                Action::Proxy(name) => {
-                    let final_name = proxies
-                        .resolve(name)
-                        .map(|h| h.name().to_string())
-                        .unwrap_or_default();
-                    if final_name.is_empty() || final_name == *name {
-                        vec![name.clone()]
-                    } else {
-                        vec![final_name, name.clone()]
-                    }
-                }
-            };
-            log_metadata(
-                "UDP",
-                src,
-                &target_str,
-                &mode,
-                &rule_type,
-                &rule_payload,
-                &chain_display(&chains),
-            );
+        udp::UdpRoute {
+            route: Route {
+                action,
+                matched: mode != "global" && mode != "direct" && !rule_type.is_empty(),
+                rule_type,
+                rule_payload,
+            },
+            mode,
+            domain,
+            dst_ip: rule_meta.dst_ip,
         }
-
-        (action, domain)
     }
 
     /// Get a snapshot of all active connections (for API).
@@ -1306,8 +1447,8 @@ impl ConnectionManager {
                 let e = entry.value();
                 let mut info = e.info.clone();
                 // Read live counter values instead of the stale zeros stored at insert time
-                info.upload = e.upload.load(Ordering::Relaxed);
-                info.download = e.download.load(Ordering::Relaxed);
+                info.upload = e.traffic.upload();
+                info.download = e.traffic.download();
                 info
             })
             .collect();
@@ -1394,12 +1535,238 @@ impl StatsManager {
     }
 }
 
+/// A [`ConnectionManager`] over the components a config builds, for tests of
+/// the inbounds and the tunnel.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::{ConnectionManager, StatsManager};
+    use std::sync::Arc;
+
+    pub(crate) async fn manager(yaml: &str) -> ConnectionManager {
+        ConnectionManager::new(app_state(yaml).await)
+    }
+
+    /// The shared state a config boots into.
+    pub(crate) async fn app_state(yaml: &str) -> Arc<crate::AppState> {
+        let config = crate::MiemieConfig::parse_str(yaml).unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let state_store = Arc::new(crate::proxy_group::proxy_state::ProxyStateStore::new());
+        let (dns, rules, proxies) =
+            crate::build_components(&config, home.path(), state_store.clone())
+                .await
+                .unwrap();
+        let (restart_tx, _) = tokio::sync::mpsc::channel(1);
+        Arc::new(crate::AppState {
+            config: parking_lot::RwLock::new(Arc::new(config.clone())),
+            rule_engine: parking_lot::RwLock::new(rules),
+            proxy_manager: parking_lot::RwLock::new(Arc::new(proxies)),
+            dns_resolver: parking_lot::RwLock::new(Arc::new(dns)),
+            stats: Arc::new(StatsManager::new()),
+            runtime_config: parking_lot::RwLock::new(crate::api::RuntimeConfig {
+                mode: config.mode,
+                log_level: config.log_level,
+                allow_lan: None,
+                find_process_mode: None,
+                sniffing: None,
+                tcp_concurrent: None,
+            }),
+            home_dir: home.path().to_path_buf(),
+            config_path: parking_lot::RwLock::new(home.path().join("config.yaml")),
+            restart_tx,
+            proxy_state_store: state_store,
+            sniff_cache: Arc::new(crate::sniffer::SniffCache::new()),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicU64;
     use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const VLESS_UUID: &str = "11111111-2222-3333-4444-555555555555";
+
+    /// A manager whose every connection goes through a VLESS outbound to
+    /// `port` on loopback, over plain TCP.
+    async fn manager_via_vless(port: u16) -> ConnectionManager {
+        test_support::manager(&format!(
+            "proxies:\n  - {{name: node, type: vless, server: 127.0.0.1, port: {port}, uuid: {VLESS_UUID}, udp: false}}\nrules: ['MATCH,node']\n"
+        ))
+        .await
+    }
+
+    /// The VLESS request for TCP 10.1.2.3:25: version, UUID, addon length,
+    /// command, port, address type, address.
+    fn vless_request() -> Vec<u8> {
+        let mut request = vec![0u8];
+        request.extend_from_slice(&[0x11, 0x11, 0x11, 0x11, 0x22, 0x22, 0x33, 0x33]);
+        request.extend_from_slice(&[0x44, 0x44, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55]);
+        request.extend_from_slice(&[0, 1, 0, 25, 1, 10, 1, 2, 3]);
+        request
+    }
+
+    /// Hand `inbound` to the tunnel as a connection to 10.1.2.3:25.
+    fn relay(
+        manager: ConnectionManager,
+        inbound: tokio::io::DuplexStream,
+    ) -> tokio::task::JoinHandle<Result<()>> {
+        tokio::spawn(async move {
+            manager
+                .handle_tcp_typed(
+                    "127.0.0.1:40000".parse().unwrap(),
+                    "10.1.2.3:25".parse().unwrap(),
+                    inbound,
+                    "socks5",
+                )
+                .await
+        })
+    }
+
+    /// mihomo compat: tunnel.go handleTCPConn forces the request of a
+    /// `NeedHandshake` outbound out after its 200 ms peek, so a server that
+    /// speaks first is reached although the client says nothing.
+    #[tokio::test]
+    async fn a_server_that_speaks_first_is_reached_through_a_lazy_outbound() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let manager = manager_via_vless(listener.local_addr().unwrap().port()).await;
+        let server = tokio::spawn(async move {
+            let (mut conn, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 26];
+            conn.read_exact(&mut request).await.unwrap();
+            assert_eq!(request.as_slice(), vless_request());
+            conn.write_all(b"\x00\x00220 ready\r\n").await.unwrap();
+            let mut line = [0u8; 6];
+            conn.read_exact(&mut line).await.unwrap();
+            line
+        });
+
+        let (mut client, inbound) = tokio::io::duplex(4096);
+        let _relay = relay(manager, inbound);
+        let mut banner = [0u8; 11];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.read_exact(&mut banner),
+        )
+        .await
+        .expect("the banner arrives without the client speaking")
+        .unwrap();
+        assert_eq!(&banner, b"220 ready\r\n");
+        client.write_all(b"EHLO\r\n").await.unwrap();
+        assert_eq!(&server.await.unwrap(), b"EHLO\r\n");
+    }
+
+    /// What the client says within the peek leaves in the same write as the
+    /// request header, and is not relayed a second time.
+    #[tokio::test]
+    async fn early_client_bytes_travel_with_the_request_header() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let manager = manager_via_vless(listener.local_addr().unwrap().port()).await;
+        let server = tokio::spawn(async move {
+            let (mut conn, _) = listener.accept().await.unwrap();
+            let mut first = [0u8; 64];
+            let len = conn.read(&mut first).await.unwrap();
+            conn.write_all(b"\x00\x00").await.unwrap();
+            let mut rest = Vec::new();
+            conn.read_to_end(&mut rest).await.unwrap();
+            (first[..len].to_vec(), rest)
+        });
+
+        let (mut client, inbound) = tokio::io::duplex(4096);
+        client.write_all(b"hello").await.unwrap();
+        let _relay = relay(manager, inbound);
+        // Give the tunnel time to send the first write before saying more.
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        client.write_all(b" again").await.unwrap();
+        client.shutdown().await.unwrap();
+
+        let (first, rest) = server.await.unwrap();
+        assert_eq!(first, [vless_request().as_slice(), b"hello"].concat());
+        assert_eq!(rest, b" again");
+    }
+
+    /// mihomo compat: every group dials through its member, so a rule's
+    /// target is resolved — and reported in `chains` — through each of them.
+    #[tokio::test]
+    async fn a_rule_target_resolves_through_every_nested_group() {
+        let manager = test_support::manager(&format!(
+            "proxies:\n  - {{name: node, type: vless, server: 127.0.0.1, port: 1, uuid: {VLESS_UUID}}}\nproxy-groups:\n  - {{name: Auto, type: url-test, proxies: [node]}}\n  - {{name: Outer, type: select, proxies: [Auto]}}\nrules: ['MATCH,Outer']\n"
+        ))
+        .await;
+        let path = manager.app.proxy_manager().resolve_path("Outer").unwrap();
+        assert_eq!(path.chains(), ["node", "Auto", "Outer"]);
+        let kinds: Vec<_> = path.groups.iter().map(|group| group.group_type()).collect();
+        assert_eq!(kinds, ["Selector", "URLTest"]);
+    }
+
+    /// mihomo compat: executor.go patchSelectGroup restores what the
+    /// controller recorded for a group, and nothing else.
+    #[tokio::test]
+    async fn only_recorded_choices_are_restored() {
+        let manager = test_support::manager(&format!(
+            "proxies:\n  - {{name: a, type: vless, server: 127.0.0.1, port: 1, uuid: {VLESS_UUID}}}\n  - {{name: b, type: vless, server: 127.0.0.1, port: 2, uuid: {VLESS_UUID}}}\nproxy-groups:\n  - {{name: Auto, type: url-test, proxies: [a, b]}}\n  - {{name: Pick, type: select, proxies: [a, b]}}\n"
+        ))
+        .await;
+        let proxies = manager.app.proxy_manager();
+        let (auto, pick) = (
+            proxies.get_group("Auto").unwrap(),
+            proxies.get_group("Pick").unwrap(),
+        );
+        let recorded = |pairs: &[(&str, &str)], legacy| crate::store::Selections {
+            selected: pairs
+                .iter()
+                .map(|(group, member)| (group.to_string(), member.to_string()))
+                .collect(),
+            legacy,
+        };
+
+        // A file from before the `selected` bucket names a member for every
+        // group, chosen or not: it must not pin the url-test group.
+        proxies.apply_saved_selections(&recorded(&[("Auto", "b"), ("Pick", "b")], true));
+        assert_eq!(auto.fixed(), "");
+        assert_eq!(pick.now(), "b");
+
+        // A recorded choice pins it; an emptied one unpins it again.
+        proxies.apply_saved_selections(&recorded(&[("Auto", "b"), ("Gone", "x")], false));
+        assert_eq!(auto.fixed(), "b");
+        proxies.apply_saved_selections(&recorded(&[("Auto", "")], false));
+        assert_eq!(auto.fixed(), "");
+        // A member that no longer exists leaves the group as it was.
+        proxies.apply_saved_selections(&recorded(&[("Pick", "removed")], false));
+        assert_eq!(pick.now(), "b");
+    }
+
+    /// mihomo compat: tunnel.go logMetadataErr.
+    #[test]
+    fn dial_error_lines_match_mihomo() {
+        let error = anyhow::anyhow!("connection refused").context("127.0.0.1:443 connect error");
+        let route = |action, matched, rule_type: &str, rule_payload: &str| Route {
+            action,
+            matched,
+            rule_type: rule_type.to_string(),
+            rule_payload: rule_payload.to_string(),
+        };
+        let line = |route: &Route| {
+            format_dial_error("TCP", route, "192.168.1.2:5555", "example.com:443", &error)
+        };
+        assert_eq!(
+            line(&route(Action::Proxy("PROXY".into()), true, "DOMAIN-SUFFIX", "example.com")),
+            "[TCP] dial PROXY (match DomainSuffix/example.com) 192.168.1.2:5555 --> example.com:443 error: 127.0.0.1:443 connect error: connection refused"
+        );
+        assert_eq!(
+            line(&route(Action::Proxy("PROXY".into()), true, "MATCH", "")),
+            "[TCP] dial PROXY (match Match/) 192.168.1.2:5555 --> example.com:443 error: 127.0.0.1:443 connect error: connection refused"
+        );
+        // Global mode, direct mode and no match: there is no rule to name.
+        assert_eq!(
+            line(&route(Action::Proxy("GLOBAL".into()), false, "MATCH", "")),
+            "[TCP] dial GLOBAL 192.168.1.2:5555 --> example.com:443 error: 127.0.0.1:443 connect error: connection refused"
+        );
+        assert_eq!(
+            line(&route(Action::Direct, false, "", "")),
+            "[TCP] dial DIRECT 192.168.1.2:5555 --> example.com:443 error: 127.0.0.1:443 connect error: connection refused"
+        );
+    }
 
     /// mihomo compat: tunnel.go:633 logMetadata — OpenClash's log parser reads
     /// these lines, so the wording is pinned byte-for-byte. The TCP and UDP
@@ -1492,44 +1859,92 @@ mod tests {
         assert_eq!(&buf[..n], b"data");
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn retry_gives_up_after_ten_attempts_or_when_time_is_up() {
+        // tunnel.go retry: `for i := 0; i < 10; i++` inside one context.
+        let mut retry = Retry::new(std::time::Duration::from_secs(60));
+        let mut attempts = 0;
+        while retry.remaining().is_some() {
+            attempts += 1;
+            if !retry.again(anyhow::anyhow!("connection refused")).await {
+                break;
+            }
+        }
+        assert_eq!(attempts, 10);
+        assert_eq!(retry.into_error().to_string(), "connection refused");
+
+        let mut retry = Retry::new(std::time::Duration::from_millis(25));
+        let mut attempts = 0;
+        while retry.remaining().is_some() {
+            attempts += 1;
+            if !retry.again(anyhow::anyhow!("timeout")).await {
+                break;
+            }
+        }
+        assert!((2..10).contains(&attempts), "{attempts} attempts in 25 ms");
+
+        // Nothing was tried: the deadline is the error.
+        let retry = Retry::new(std::time::Duration::ZERO);
+        assert!(retry.remaining().is_none());
+        assert_eq!(retry.into_error().to_string(), "context deadline exceeded");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retry_stops_at_errors_another_attempt_cannot_fix() {
+        // tunnel.go shouldStopRetry.
+        for text in [
+            "couldn't find ip",
+            "ip version error",
+            "IPv6 disabled",
+            "reject loopback connection",
+        ] {
+            let mut retry = Retry::new(std::time::Duration::from_secs(5));
+            assert!(
+                !retry.again(anyhow::anyhow!("dial: {text}")).await,
+                "{text}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn counting_stream_tracks_download_bytes() {
-        let up = Arc::new(AtomicU64::new(0));
-        let down = Arc::new(AtomicU64::new(0));
+        let totals = Arc::new(StatsManager::new());
+        let traffic = Traffic::new(totals.clone(), 0);
         let inner = tokio_test::io::Builder::new().read(b"hello world").build();
-        let mut stream = CountingStream::new(inner, up.clone(), down.clone());
+        let mut stream = CountingStream::new(inner, traffic.clone());
 
         let mut buf = vec![0u8; 20];
         let n = stream.read(&mut buf).await.unwrap();
         assert_eq!(n, 11);
-        assert_eq!(down.load(Ordering::Relaxed), 11);
-        assert_eq!(up.load(Ordering::Relaxed), 0);
+        assert_eq!((traffic.upload(), traffic.download()), (0, 11));
+        // Counted for the process as it passes, not when the stream ends.
+        assert_eq!((totals.upload_total(), totals.download_total()), (0, 11));
     }
 
     #[tokio::test]
     async fn counting_stream_tracks_upload_bytes() {
-        let up = Arc::new(AtomicU64::new(0));
-        let down = Arc::new(AtomicU64::new(0));
+        let totals = Arc::new(StatsManager::new());
+        let traffic = Traffic::new(totals.clone(), 0);
         let inner = tokio_test::io::Builder::new().write(b"outgoing").build();
-        let mut stream = CountingStream::new(inner, up.clone(), down.clone());
+        let mut stream = CountingStream::new(inner, traffic.clone());
 
         let n = stream.write(b"outgoing").await.unwrap();
         assert_eq!(n, 8);
-        assert_eq!(up.load(Ordering::Relaxed), 8);
-        assert_eq!(down.load(Ordering::Relaxed), 0);
+        assert_eq!((traffic.upload(), traffic.download()), (8, 0));
+        assert_eq!((totals.upload_total(), totals.download_total()), (8, 0));
     }
 
     #[tokio::test]
     async fn counting_stream_accumulates_multiple_ops() {
-        let up = Arc::new(AtomicU64::new(0));
-        let down = Arc::new(AtomicU64::new(0));
+        let totals = Arc::new(StatsManager::new());
+        let traffic = Traffic::new(totals.clone(), 0);
         let inner = tokio_test::io::Builder::new()
             .read(b"abc")
             .read(b"defgh")
             .write(b"12")
             .write(b"3456")
             .build();
-        let mut stream = CountingStream::new(inner, up.clone(), down.clone());
+        let mut stream = CountingStream::new(inner, traffic.clone());
 
         let mut buf = vec![0u8; 10];
         assert_eq!(stream.read(&mut buf).await.unwrap(), 3);
@@ -1537,8 +1952,9 @@ mod tests {
         assert_eq!(stream.write(b"12").await.unwrap(), 2);
         assert_eq!(stream.write(b"3456").await.unwrap(), 4);
 
-        assert_eq!(down.load(Ordering::Relaxed), 8); // 3 + 5
-        assert_eq!(up.load(Ordering::Relaxed), 6); // 2 + 4
+        assert_eq!(traffic.download(), 8); // 3 + 5
+        assert_eq!(traffic.upload(), 6); // 2 + 4
+        assert_eq!((totals.upload_total(), totals.download_total()), (6, 8));
     }
 
     #[test]
@@ -1764,12 +2180,12 @@ mod tests {
         let chunk_size = 8192;
         let num_chunks = total_bytes / chunk_size;
 
-        let up = Arc::new(AtomicU64::new(0));
-        let down = Arc::new(AtomicU64::new(0));
+        let totals = Arc::new(StatsManager::new());
+        let traffic = Traffic::new(totals.clone(), 0);
 
         // Create a duplex where we write through CountingStream and read from the other end
         let (client, server) = tokio::io::duplex(65536);
-        let mut counted = CountingStream::new(client, up.clone(), down.clone());
+        let mut counted = CountingStream::new(client, traffic.clone());
 
         let reader = tokio::spawn(async move {
             let mut server = server;
@@ -1800,9 +2216,10 @@ mod tests {
             "receiver should get all {total_bytes} bytes"
         );
         assert_eq!(
-            up.load(Ordering::Relaxed) as usize,
+            traffic.upload() as usize,
             total_bytes,
             "upload counter should match {total_bytes} bytes"
         );
+        assert_eq!(totals.upload_total() as usize, total_bytes);
     }
 }

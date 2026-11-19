@@ -10,7 +10,7 @@ use tracing::{debug, warn};
 use crate::common::addr::Address;
 use crate::config::proxy::{GrpcOpts, H2Opts, ProxyConfig, WsOpts};
 use crate::dns::DnsResolver;
-use crate::proxy::{OutboundHandler, ProxyStream};
+use crate::proxy::{Handshake, OutboundHandler, ProxyStream};
 use crate::transport::stack::{self, SecuritySpec, TransportSpec};
 use crate::transport::tcp::{self, ConnectOpts};
 
@@ -191,6 +191,12 @@ impl OutboundHandler for VmessOutbound {
         // UDP relay (connect_datagram) is not yet implemented for VMess; this
         // flag only mirrors config, so requesting UDP errors at runtime.
         self.udp
+    }
+
+    fn handshake(&self) -> Handshake {
+        // mihomo compat: sing-vmess's client conn reports `NeedHandshake`
+        // until its request is written, which the tunnel forces.
+        Handshake::WithEarlyData
     }
 
     async fn connect_stream(

@@ -12,7 +12,7 @@
 //! and per-flow bookkeeping. The thread runs a `poll(2)` loop over:
 //!
 //!   * the TUN fd (POLLIN always; POLLOUT while a packet write hit EWOULDBLOCK)
-//!   * an eventfd used by `SmolTcpStream` / `UdpReplySender` to wake the loop
+//!   * an eventfd used by `SmolTcpStream` / `UdpSender` to wake the loop
 //!     when the application side queued bytes to send
 //!
 //! with a timeout derived from `Interface::poll_delay` (capped at 1s).
@@ -68,6 +68,12 @@ const UDP_META_ENTRIES: usize = 64;
 const UDP_PAYLOAD_BUF: usize = 64 * 1024;
 /// Capacity of the per-connection app<->stack mpsc channels.
 const CHAN_CAP: usize = 64;
+/// Capacity of the UDP datagram channels between the stack and the app, one
+/// per direction and shared by every client.
+const UDP_CHAN_CAP: usize = 1024;
+/// How long a UDP socket outlives the last datagram through it. Each one
+/// holds two `UDP_PAYLOAD_BUF` buffers, so they are not kept for long.
+const UDP_SOCKET_IDLE: SmolDuration = SmolDuration::from_secs(10);
 /// Abort a TCP socket when the peer stops responding for this long while we
 /// have unacknowledged data outstanding (also reaps half-open handshakes).
 /// Idle established connections are NOT affected: smoltcp only checks the
@@ -323,19 +329,36 @@ impl Drop for SmolTcpStream {
     }
 }
 
-/// Sender for reply datagrams on a UDP flow (app -> client through the stack).
+/// A UDP datagram a client sent into the TUN.
+#[derive(Debug)]
+pub struct SmolUdpPacket {
+    /// Client source address.
+    pub src: SocketAddr,
+    /// The address the client sent it to.
+    pub dst: SocketAddr,
+    pub data: Vec<u8>,
+}
+
+struct UdpOut {
+    from: SocketAddr,
+    to: SocketAddr,
+    data: Vec<u8>,
+}
+
+/// Sends UDP datagrams to clients through the stack, from any source address:
+/// a reply does not have to come from an address the client ever wrote to.
 #[derive(Clone)]
-pub struct UdpReplySender {
-    tx: mpsc::Sender<Vec<u8>>,
+pub struct UdpSender {
+    tx: mpsc::Sender<UdpOut>,
     waker: Arc<LoopWaker>,
 }
 
-impl UdpReplySender {
-    /// Queue a reply datagram without waiting. Returns false if the flow is
-    /// gone or the queue is full (datagram dropped — UDP semantics).
+impl UdpSender {
+    /// Queue a datagram without waiting. Returns false if the stack is gone
+    /// or the queue is full (datagram dropped — UDP semantics).
     #[cfg_attr(not(test), allow(dead_code))]
-    pub fn try_send(&self, datagram: Vec<u8>) -> bool {
-        match self.tx.try_send(datagram) {
+    pub fn try_send(&self, from: SocketAddr, to: SocketAddr, data: Vec<u8>) -> bool {
+        match self.tx.try_send(UdpOut { from, to, data }) {
             Ok(()) => {
                 self.waker.wake();
                 true
@@ -344,10 +367,10 @@ impl UdpReplySender {
         }
     }
 
-    /// Queue a reply datagram, waiting for channel capacity.
-    /// Returns false if the flow is gone.
-    pub async fn send(&self, datagram: Vec<u8>) -> bool {
-        if self.tx.send(datagram).await.is_ok() {
+    /// Queue a datagram, waiting for channel capacity.
+    /// Returns false if the stack is gone.
+    pub async fn send(&self, from: SocketAddr, to: SocketAddr, data: Vec<u8>) -> bool {
+        if self.tx.send(UdpOut { from, to, data }).await.is_ok() {
             self.waker.wake();
             true
         } else {
@@ -356,35 +379,17 @@ impl UdpReplySender {
     }
 }
 
-/// A UDP flow (one per (src, dst) pair), emitted once on the first datagram.
-///
-/// Subsequent datagrams of the same flow arrive on `rx` — no new flow object
-/// is emitted while the caller keeps this one alive. The flow is reaped by
-/// the stack when the caller drops both `rx` and every `reply` clone; a later
-/// datagram for the same (src, dst) then yields a fresh `SmolUdpFlow`.
-pub struct SmolUdpFlow {
-    /// Client source address.
-    pub src: SocketAddr,
-    /// Original destination address.
-    pub dst: SocketAddr,
-    /// Datagram payloads from the client (the first datagram is already
-    /// queued here when the flow is emitted).
-    pub rx: mpsc::Receiver<Vec<u8>>,
-    /// Sends reply datagrams back to the client (src) through the stack,
-    /// sourced from `dst`.
-    pub reply: UdpReplySender,
-}
-
 // ---------------------------------------------------------------------------
 // SmolStack: public entry point
 // ---------------------------------------------------------------------------
 
-/// Handle to the running stack: streams of accepted TCP connections and UDP
-/// flows. Dropping both receivers does not stop the poll thread; it exits
-/// when the TUN device is closed.
+/// Handle to the running stack: accepted TCP connections, received UDP
+/// datagrams, and the way to send UDP back. Dropping the receivers does not
+/// stop the poll thread; it exits when the TUN device is closed.
 pub struct SmolStack {
     tcp_rx: mpsc::Receiver<SmolTcpStream>,
-    udp_rx: mpsc::Receiver<SmolUdpFlow>,
+    udp_rx: mpsc::Receiver<SmolUdpPacket>,
+    udp_out: UdpSender,
 }
 
 impl SmolStack {
@@ -393,24 +398,36 @@ impl SmolStack {
     /// poll(2) directly — the fd is already O_NONBLOCK).
     pub fn start(tun: TunDevice, mtu: usize) -> Self {
         let (tcp_tx, tcp_rx) = mpsc::channel(256);
-        let (udp_tx, udp_rx) = mpsc::channel(256);
+        let (udp_tx, udp_rx) = mpsc::channel(UDP_CHAN_CAP);
+        let (out_tx, out_rx) = mpsc::channel(UDP_CHAN_CAP);
         let waker = Arc::new(LoopWaker::new().expect("eventfd creation failed"));
 
         let loop_waker = waker.clone();
         std::thread::Builder::new()
             .name("smol-stack".into())
             .spawn(move || {
-                let core = StackCore::new(mtu, tcp_tx, udp_tx, loop_waker.clone());
+                let core = StackCore::new(mtu, tcp_tx, udp_tx, out_rx, loop_waker.clone());
                 run_loop(tun, core, loop_waker);
             })
             .expect("failed to spawn smol-stack thread");
 
-        Self { tcp_rx, udp_rx }
+        Self {
+            tcp_rx,
+            udp_rx,
+            udp_out: UdpSender { tx: out_tx, waker },
+        }
     }
 
-    /// Decompose into the TCP and UDP channels for use with tokio::select!.
-    pub fn into_channels(self) -> (mpsc::Receiver<SmolTcpStream>, mpsc::Receiver<SmolUdpFlow>) {
-        (self.tcp_rx, self.udp_rx)
+    /// Decompose into the TCP and UDP channels for use with tokio::select!,
+    /// plus the sender for UDP towards clients.
+    pub fn into_channels(
+        self,
+    ) -> (
+        mpsc::Receiver<SmolTcpStream>,
+        mpsc::Receiver<SmolUdpPacket>,
+        UdpSender,
+    ) {
+        (self.tcp_rx, self.udp_rx, self.udp_out)
     }
 }
 
@@ -442,11 +459,11 @@ struct TcpConn {
     io: Option<TcpConnIo>,
 }
 
-struct UdpFlowState {
-    to_app: mpsc::Sender<Vec<u8>>,
-    from_app: mpsc::Receiver<Vec<u8>>,
-    /// All reply senders were dropped.
-    reply_gone: bool,
+/// A smoltcp socket bound to one remote endpoint: it receives what clients
+/// send there and sends what comes back from there.
+struct UdpSock {
+    handle: SocketHandle,
+    last_used: SmolInstant,
 }
 
 struct StackCore {
@@ -455,20 +472,23 @@ struct StackCore {
     sockets: SocketSet<'static>,
     tcp: HashMap<SocketHandle, TcpConn>,
     tcp_tuples: HashMap<(SocketAddr, SocketAddr), SocketHandle>,
-    /// One udp socket per destination endpoint; flows demux on (src, dst).
-    udp_socks: HashMap<SocketAddr, SocketHandle>,
-    udp_flows: HashMap<(SocketAddr, SocketAddr), UdpFlowState>,
+    /// One udp socket per remote endpoint, shared by every client.
+    udp_socks: HashMap<SocketAddr, UdpSock>,
     tcp_tx: mpsc::Sender<SmolTcpStream>,
-    udp_tx: mpsc::Sender<SmolUdpFlow>,
+    udp_tx: mpsc::Sender<SmolUdpPacket>,
+    udp_out: mpsc::Receiver<UdpOut>,
     waker: Arc<LoopWaker>,
     mtu: usize,
+    /// The time of the latest poll.
+    now: SmolInstant,
 }
 
 impl StackCore {
     fn new(
         mtu: usize,
         tcp_tx: mpsc::Sender<SmolTcpStream>,
-        udp_tx: mpsc::Sender<SmolUdpFlow>,
+        udp_tx: mpsc::Sender<SmolUdpPacket>,
+        udp_out: mpsc::Receiver<UdpOut>,
         waker: Arc<LoopWaker>,
     ) -> Self {
         let mut device = PhyDevice {
@@ -513,11 +533,12 @@ impl StackCore {
             tcp: HashMap::new(),
             tcp_tuples: HashMap::new(),
             udp_socks: HashMap::new(),
-            udp_flows: HashMap::new(),
             tcp_tx,
             udp_tx,
+            udp_out,
             waker,
             mtu,
+            now: SmolInstant::from_micros(0),
         }
     }
 
@@ -537,9 +558,10 @@ impl StackCore {
     /// Run one full stack iteration: ingress, service sockets, egress.
     /// Returns the delay until smoltcp next needs to be polled.
     fn poll(&mut self, now: SmolInstant) -> Option<SmolDuration> {
+        self.now = now;
         self.iface.poll(now, &mut self.device, &mut self.sockets);
         self.service_tcp();
-        self.service_udp();
+        self.service_udp(now);
         // Egress data the service pass moved into socket buffers.
         self.iface.poll(now, &mut self.device, &mut self.sockets);
         self.iface.poll_delay(now, &self.sockets)
@@ -625,11 +647,16 @@ impl StackCore {
             return;
         };
         let dst = SocketAddr::new(dst_ip, udp_pkt.dst_port());
-        if dst.port() == 0 || !is_unicast(dst_ip) {
-            return;
+        self.udp_socket(dst);
+    }
+
+    /// The socket bound to `endpoint`, created if there is none yet.
+    fn udp_socket(&mut self, endpoint: SocketAddr) -> Option<SocketHandle> {
+        if let Some(sock) = self.udp_socks.get(&endpoint) {
+            return Some(sock.handle);
         }
-        if self.udp_socks.contains_key(&dst) {
-            return;
+        if endpoint.port() == 0 || !is_unicast(endpoint.ip()) {
+            return None;
         }
 
         let rx = udp::PacketBuffer::new(
@@ -641,13 +668,20 @@ impl StackCore {
             vec![0u8; UDP_PAYLOAD_BUF],
         );
         let mut sock = udp::Socket::new(rx, tx);
-        if let Err(e) = sock.bind(dst) {
-            debug!("smol: udp bind {dst} failed: {e:?}");
-            return;
+        if let Err(e) = sock.bind(endpoint) {
+            debug!("smol: udp bind {endpoint} failed: {e:?}");
+            return None;
         }
         let handle = self.sockets.add(sock);
-        self.udp_socks.insert(dst, handle);
-        trace!("smol: new UDP socket for {dst}");
+        self.udp_socks.insert(
+            endpoint,
+            UdpSock {
+                handle,
+                last_used: self.now,
+            },
+        );
+        trace!("smol: new UDP socket for {endpoint}");
+        Some(handle)
     }
 
     // -- TCP servicing ------------------------------------------------------
@@ -806,88 +840,51 @@ impl StackCore {
 
     // -- UDP servicing ------------------------------------------------------
 
-    fn service_udp(&mut self) {
-        // Inbound: socket -> flow channels (emit new flows on first packet).
-        for (&dst, &handle) in self.udp_socks.iter() {
-            let sock = self.sockets.get_mut::<udp::Socket>(handle);
-            while let Ok((buf, meta)) = sock.recv() {
-                let data = buf.to_vec();
-                let src = endpoint_to_sockaddr(meta.endpoint);
-                let key = (src, dst);
-                if let Some(flow) = self.udp_flows.get(&key) {
-                    // Full or closed: drop the datagram (UDP semantics; a
-                    // closed flow is reaped in the GC pass below).
-                    let _ = flow.to_app.try_send(data);
-                } else {
-                    let (to_app, app_rx) = mpsc::channel(CHAN_CAP);
-                    let (reply_tx, from_app) = mpsc::channel(CHAN_CAP);
-                    let _ = to_app.try_send(data);
-                    let flow = SmolUdpFlow {
-                        src,
-                        dst,
-                        rx: app_rx,
-                        reply: UdpReplySender {
-                            tx: reply_tx,
-                            waker: self.waker.clone(),
-                        },
-                    };
-                    if self.udp_tx.try_send(flow).is_ok() {
-                        trace!("smol: new UDP flow {} -> {}", src, dst);
-                        self.udp_flows.insert(
-                            key,
-                            UdpFlowState {
-                                to_app,
-                                from_app,
-                                reply_gone: false,
-                            },
-                        );
-                    }
-                    // else: caller can't keep up; datagram dropped, the next
-                    // one will retry emitting a flow.
-                }
+    fn service_udp(&mut self, now: SmolInstant) {
+        // Inbound: socket -> app. A full channel drops the datagram.
+        for (&dst, sock) in self.udp_socks.iter_mut() {
+            let socket = self.sockets.get_mut::<udp::Socket>(sock.handle);
+            while let Ok((buf, meta)) = socket.recv() {
+                sock.last_used = now;
+                let _ = self.udp_tx.try_send(SmolUdpPacket {
+                    src: endpoint_to_sockaddr(meta.endpoint),
+                    dst,
+                    data: buf.to_vec(),
+                });
             }
         }
 
-        // Outbound: reply channels -> sockets.
-        for ((src, dst), flow) in self.udp_flows.iter_mut() {
-            let Some(&handle) = self.udp_socks.get(dst) else {
+        // Outbound: app -> the socket bound to the datagram's source.
+        while let Ok(out) = self.udp_out.try_recv() {
+            let Some(handle) = self.udp_socket(out.from) else {
+                debug!(
+                    "smol: udp from {} to {} dropped: unusable source",
+                    out.from, out.to
+                );
                 continue;
             };
-            let sock = self.sockets.get_mut::<udp::Socket>(handle);
-            loop {
-                match flow.from_app.try_recv() {
-                    Ok(datagram) => {
-                        if let Err(e) = sock.send_slice(&datagram, IpEndpoint::from(*src)) {
-                            debug!("smol: udp reply to {src} dropped: {e:?}");
-                        }
-                    }
-                    Err(mpsc::error::TryRecvError::Empty) => break,
-                    Err(mpsc::error::TryRecvError::Disconnected) => {
-                        flow.reply_gone = true;
-                        break;
-                    }
-                }
+            if let Some(sock) = self.udp_socks.get_mut(&out.from) {
+                sock.last_used = now;
+            }
+            let socket = self.sockets.get_mut::<udp::Socket>(handle);
+            if let Err(e) = socket.send_slice(&out.data, IpEndpoint::from(out.to)) {
+                debug!("smol: udp from {} to {} dropped: {e:?}", out.from, out.to);
             }
         }
 
-        // GC: a flow dies once the caller dropped BOTH its rx receiver and
-        // every reply sender.
-        self.udp_flows
-            .retain(|_, f| !(f.reply_gone && f.to_app.is_closed()));
-
-        // GC sockets that have no flows and no queued data.
-        let live_dsts: std::collections::HashSet<SocketAddr> =
-            self.udp_flows.keys().map(|&(_, d)| d).collect();
+        // A socket nothing has passed through for a while is closed; the
+        // next datagram for its endpoint makes a new one.
         let sockets = &mut self.sockets;
-        self.udp_socks.retain(|dst, handle| {
-            if live_dsts.contains(dst) {
+        self.udp_socks.retain(|endpoint, sock| {
+            let socket = sockets.get::<udp::Socket>(sock.handle);
+            if now - sock.last_used < UDP_SOCKET_IDLE
+                || socket.can_recv()
+                || socket.send_queue() > 0
+            {
                 return true;
             }
-            if sockets.get::<udp::Socket>(*handle).can_recv() {
-                return true; // undelivered inbound data; keep one more round
-            }
-            trace!("smol: UDP socket for {dst} reaped");
-            sockets.remove(*handle);
+            trace!("smol: UDP socket for {endpoint} reaped");
+            sockets.remove(sock.handle);
             false
         });
     }
@@ -1032,12 +1029,51 @@ mod tests {
     fn test_core() -> (
         StackCore,
         mpsc::Receiver<SmolTcpStream>,
-        mpsc::Receiver<SmolUdpFlow>,
+        mpsc::Receiver<SmolUdpPacket>,
+    ) {
+        let (core, tcp_rx, udp_rx, _) = test_core_with_udp_out();
+        (core, tcp_rx, udp_rx)
+    }
+
+    fn test_core_with_udp_out() -> (
+        StackCore,
+        mpsc::Receiver<SmolTcpStream>,
+        mpsc::Receiver<SmolUdpPacket>,
+        UdpSender,
     ) {
         let (tcp_tx, tcp_rx) = mpsc::channel(16);
         let (udp_tx, udp_rx) = mpsc::channel(16);
+        let (out_tx, out_rx) = mpsc::channel(16);
         let waker = Arc::new(LoopWaker::new().unwrap());
-        (StackCore::new(1500, tcp_tx, udp_tx, waker), tcp_rx, udp_rx)
+        let sender = UdpSender {
+            tx: out_tx,
+            waker: waker.clone(),
+        };
+        (
+            StackCore::new(1500, tcp_tx, udp_tx, out_rx, waker),
+            tcp_rx,
+            udp_rx,
+            sender,
+        )
+    }
+
+    /// The UDP datagrams the stack put on the wire: (source, destination, payload).
+    fn udp_on_wire(core: &mut StackCore) -> Vec<(SocketAddr, SocketAddr, Vec<u8>)> {
+        drain_tx(core)
+            .iter()
+            .filter_map(|p| {
+                let ip = Ipv4Packet::new_checked(&p[..]).ok()?;
+                if ip.next_header() != IpProtocol::Udp {
+                    return None;
+                }
+                let u = UdpPacket::new_checked(ip.payload()).ok()?;
+                Some((
+                    SocketAddr::new(Ipv4Addr::from(ip.src_addr()).into(), u.src_port()),
+                    SocketAddr::new(Ipv4Addr::from(ip.dst_addr()).into(), u.dst_port()),
+                    u.payload().to_vec(),
+                ))
+            })
+            .collect()
     }
 
     /// Craft an IPv4+TCP packet with valid checksums.
@@ -1322,82 +1358,73 @@ mod tests {
     }
 
     #[test]
-    fn udp_flow_demux_and_reply() {
-        let (mut core, _tcp_rx, mut udp_rx) = test_core();
+    fn udp_datagrams_carry_both_addresses_and_replies_reach_the_wire() {
+        let (mut core, _tcp_rx, mut udp_rx, out) = test_core_with_udp_out();
         let mut now = SmolInstant::from_millis(0);
-        let client = (Ipv4Addr::new(192, 168, 1, 100), 50000);
-        let dns = (Ipv4Addr::new(8, 8, 8, 8), 53);
+        let client = SocketAddr::from(([192, 168, 1, 100], 50000));
+        let dns = SocketAddr::from(([8, 8, 8, 8], 53));
+        let v4 = |addr: SocketAddr| match addr {
+            SocketAddr::V4(a) => (*a.ip(), a.port()),
+            SocketAddr::V6(_) => unreachable!(),
+        };
 
-        // First datagram -> flow emitted with the datagram queued.
-        core.push_rx(udp4(client, dns, b"query"));
+        core.push_rx(udp4(v4(client), v4(dns), b"query"));
         core.poll(now);
-        let mut flow = udp_rx.try_recv().expect("no UDP flow emitted");
-        assert_eq!(flow.src, SocketAddr::new(client.0.into(), client.1));
-        assert_eq!(flow.dst, SocketAddr::new(dns.0.into(), dns.1));
-        assert_eq!(flow.rx.try_recv().unwrap(), b"query");
+        let packet = udp_rx.try_recv().expect("no UDP datagram delivered");
+        assert_eq!((packet.src, packet.dst), (client, dns));
+        assert_eq!(packet.data, b"query");
 
-        // Second datagram on the same flow -> same channel, no new flow.
         now += SmolDuration::from_millis(5);
-        core.push_rx(udp4(client, dns, b"again"));
+        core.push_rx(udp4(v4(client), v4(dns), b"again"));
         core.poll(now);
-        assert!(udp_rx.try_recv().is_err(), "flow must not be re-emitted");
-        assert_eq!(flow.rx.try_recv().unwrap(), b"again");
+        assert_eq!(udp_rx.try_recv().unwrap().data, b"again");
 
-        // Reply goes back through the stack as a UDP packet to the client,
-        // sourced from the original destination.
-        assert!(flow.reply.try_send(b"answer".to_vec()));
-        now += SmolDuration::from_millis(5);
-        core.poll(now);
-        let tx = drain_tx(&mut core);
-        let reply = tx
-            .iter()
-            .find_map(|p| {
-                let ip = Ipv4Packet::new_checked(&p[..]).ok()?;
-                if ip.next_header() != IpProtocol::Udp {
-                    return None;
-                }
-                let u = UdpPacket::new_checked(ip.payload()).ok()?;
-                Some((
-                    ip.src_addr(),
-                    ip.dst_addr(),
-                    u.src_port(),
-                    u.dst_port(),
-                    u.payload().to_vec(),
-                ))
-            })
-            .expect("reply datagram did not reach the wire");
-        assert_eq!(reply.0, dns.0);
-        assert_eq!(reply.1, client.0);
-        assert_eq!(reply.2, dns.1);
-        assert_eq!(reply.3, client.1);
-        assert_eq!(reply.4, b"answer");
-
-        // Dropping the flow reaps flow state and (with no queued data) the socket.
-        drop(flow);
+        // The answer goes back through the stack, sourced from the address
+        // the client wrote to.
+        assert!(out.try_send(dns, client, b"answer".to_vec()));
         now += SmolDuration::from_millis(5);
         core.poll(now);
-        assert!(core.udp_flows.is_empty(), "dropped flow must be reaped");
-        assert!(
-            core.udp_socks.is_empty(),
-            "orphan UDP socket must be reaped"
+        assert_eq!(
+            udp_on_wire(&mut core),
+            vec![(dns, client, b"answer".to_vec())]
+        );
+
+        // An idle socket is closed.
+        assert_eq!(core.udp_socks.len(), 1);
+        now += UDP_SOCKET_IDLE;
+        core.poll(now);
+        assert!(core.udp_socks.is_empty(), "idle UDP socket must be reaped");
+    }
+
+    #[test]
+    fn udp_can_be_sent_from_an_address_the_client_never_wrote_to() {
+        // Full cone: once a client socket has an outbound, any peer's
+        // datagram is delivered to it, from that peer's own address.
+        let (mut core, _tcp_rx, _udp_rx, out) = test_core_with_udp_out();
+        let client = SocketAddr::from(([192, 168, 1, 100], 50000));
+        let peer = SocketAddr::from(([203, 0, 113, 7], 40000));
+
+        assert!(out.try_send(peer, client, b"unsolicited".to_vec()));
+        core.poll(SmolInstant::from_millis(0));
+        assert_eq!(
+            udp_on_wire(&mut core),
+            vec![(peer, client, b"unsolicited".to_vec())]
         );
     }
 
     #[test]
-    fn udp_two_sources_same_destination_get_separate_flows() {
+    fn udp_two_sources_same_destination_share_a_socket() {
         let (mut core, _tcp_rx, mut udp_rx) = test_core();
         let now = SmolInstant::from_millis(0);
         let dns = (Ipv4Addr::new(8, 8, 8, 8), 53);
         core.push_rx(udp4((Ipv4Addr::new(192, 168, 1, 100), 50000), dns, b"a"));
         core.push_rx(udp4((Ipv4Addr::new(192, 168, 1, 101), 50001), dns, b"b"));
         core.poll(now);
-        let mut f1 = udp_rx.try_recv().expect("flow 1");
-        let mut f2 = udp_rx.try_recv().expect("flow 2");
-        assert_ne!(f1.src, f2.src);
-        assert_eq!(f1.rx.try_recv().unwrap(), b"a");
-        assert_eq!(f2.rx.try_recv().unwrap(), b"b");
-        // One shared socket for the destination, two flows.
+        let p1 = udp_rx.try_recv().expect("datagram 1");
+        let p2 = udp_rx.try_recv().expect("datagram 2");
+        assert_ne!(p1.src, p2.src);
+        assert_eq!(p1.data, b"a");
+        assert_eq!(p2.data, b"b");
         assert_eq!(core.udp_socks.len(), 1);
-        assert_eq!(core.udp_flows.len(), 2);
     }
 }

@@ -35,7 +35,7 @@ use hmac::Mac as HmacMac;
 use md5::{Digest as _, Md5};
 use rand::Rng;
 use sha2::Sha256;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::UNIX_EPOCH;
 
 type HmacSha256 = hmac::Hmac<Sha256>;
 
@@ -383,7 +383,8 @@ pub fn encode_request_header(
 ) -> VmessHeaderResult {
     let mut rng = rand::thread_rng();
 
-    let timestamp = SystemTime::now()
+    // mihomo compat: `vmess.ClientWithTimeFunc(ntp.Now)` (vmess.go).
+    let timestamp = crate::ntp::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64;

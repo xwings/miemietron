@@ -555,6 +555,12 @@ impl<T: AsyncRead + AsyncWrite + Unpin> AsyncWrite for VmessStream<T> {
             return Poll::Ready(Ok(plaintext_len));
         }
 
+        // An empty write sends the request header and nothing else: a
+        // zero-length chunk is VMess's end-of-stream marker.
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+
         // Encrypt the data chunk exactly once into a persistent buffer, then
         // drain it. Nonce counters advance here and only here per chunk.
         let chunk_size = buf.len().min(MAX_CHUNK_SIZE);

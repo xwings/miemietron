@@ -67,15 +67,17 @@ impl Header {
     }
 }
 
-/// mihomo util.StringMap serialization: `key=value\n...`. Ordering is not
-/// specified by the protocol.
+/// mihomo util.StringMap.ToBytes: `key=value` lines joined by `\n`, with no
+/// trailing newline. Ordering is not specified by the protocol.
 pub fn encode_string_map(entries: &[(&str, &str)]) -> Vec<u8> {
     let mut out = Vec::with_capacity(64);
-    for (k, v) in entries {
+    for (i, (k, v)) in entries.iter().enumerate() {
+        if i > 0 {
+            out.push(b'\n');
+        }
         out.extend_from_slice(k.as_bytes());
         out.push(b'=');
         out.extend_from_slice(v.as_bytes());
-        out.push(b'\n');
     }
     out
 }
@@ -187,6 +189,8 @@ mod tests {
     #[test]
     fn string_map_roundtrip() {
         let enc = encode_string_map(&[("v", "2"), ("padding-md5", "abcd")]);
+        // util/string_map.go ToBytes: strings.Join(lines, "\n").
+        assert_eq!(enc, b"v=2\npadding-md5=abcd");
         let dec = decode_string_map(&enc);
         assert_eq!(dec.get("v").unwrap(), "2");
         assert_eq!(dec.get("padding-md5").unwrap(), "abcd");

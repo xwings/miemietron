@@ -6,20 +6,17 @@
 
 use anyhow::{anyhow, Result};
 use dashmap::DashMap;
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tracing::{debug, warn};
 
-use crate::common::addr::Address;
 use crate::conn::{
-    udp::{self, UdpInbound},
+    udp::{self, UdpInbound, UdpPacket},
     ConnectionManager,
 };
 use tokio::sync::mpsc;
-use tokio_util::sync::CancellationToken;
 
 // SOCKS5 constants
 const SOCKS5_VERSION: u8 = 0x05;
@@ -41,6 +38,7 @@ pub async fn run_socks_proxy(
     auth: Arc<Vec<String>>,
 ) -> Result<()> {
     let listener = TcpListener::bind(addr).await?;
+    let _udp = UdpListener::start(addr, conn_manager.clone()).await?;
     tracing::info!("SOCKS5 proxy listening on {}", addr);
 
     loop {
@@ -157,153 +155,26 @@ async fn handle_socks5(
         ),
     };
 
+    // mihomo compat: transport/socks5 ServerHandshake — BND.ADDR is the
+    // address this connection was accepted on, for CONNECT and for UDP
+    // ASSOCIATE alike. The UDP relay listens on the same port.
+    let bound = stream.local_addr()?;
+    let bound = SocketAddr::new(bound.ip().to_canonical(), bound.port());
+
     match cmd {
         CMD_CONNECT => {
-            // Send success reply
-            send_reply(&mut stream, REP_SUCCESS, &dst).await?;
+            send_reply(&mut stream, REP_SUCCESS, &bound).await?;
 
             conn_manager
                 .handle_tcp_with_host(peer, dst, stream, "socks5", host_override)
                 .await?;
         }
         CMD_UDP_ASSOCIATE => {
-            // Bind a UDP socket for the SOCKS5 UDP relay
-            let udp_socket = Arc::new(tokio::net::UdpSocket::bind("0.0.0.0:0").await?);
-            let bound_addr = udp_socket.local_addr()?;
-            debug!("SOCKS5 UDP ASSOCIATE: bound to {}", bound_addr);
-
-            // Report the bound address to the client
-            send_reply(&mut stream, REP_SUCCESS, &bound_addr).await?;
-
-            // Per-session NAT table: keyed by (client_addr, target) to reuse
-            // OutboundPacketConn across datagrams to the same destination.
-            let nat_table: Arc<DashMap<(SocketAddr, Address), mpsc::Sender<Vec<u8>>>> =
-                Arc::new(DashMap::new());
-            let timeout_dur = Duration::from_secs(60);
-
-            let cancelled = CancellationToken::new();
-            let relay_cancelled = cancelled.clone();
-
-            // Spawn the main UDP relay task
-            let cm = conn_manager.clone();
-            let relay_handle = tokio::spawn(async move {
-                let mut buf = [0u8; 65535];
-                loop {
-                    let (n, src) = match udp_socket.recv_from(&mut buf).await {
-                        Ok(v) => v,
-                        Err(_) => break,
-                    };
-                    if n < 10 {
-                        continue; // Too short for SOCKS5 UDP header
-                    }
-
-                    // Parse SOCKS5 UDP request header (RFC 1928 section 7):
-                    // RSV(2) + FRAG(1) + ATYP(1) + DST.ADDR(variable) + DST.PORT(2) + DATA
-                    let _rsv = u16::from_be_bytes([buf[0], buf[1]]);
-                    let frag = buf[2];
-                    if frag != 0 {
-                        continue; // Fragmentation not supported
-                    }
-
-                    // Parse the header once into the target Address plus the
-                    // SocketAddr used for rule-engine resolution (UNSPECIFIED
-                    // placeholder for domain targets).
-                    let atyp = buf[3];
-                    let (target, dst_sockaddr, data_offset) = match atyp {
-                        ATYP_IPV4 if n >= 10 => {
-                            let ip = Ipv4Addr::new(buf[4], buf[5], buf[6], buf[7]);
-                            let port = u16::from_be_bytes([buf[8], buf[9]]);
-                            let sa = SocketAddr::new(ip.into(), port);
-                            (Address::ip(sa), sa, 10)
-                        }
-                        ATYP_DOMAIN if n > 5 => {
-                            let dlen = buf[4] as usize;
-                            if n < 5 + dlen + 2 {
-                                continue;
-                            }
-                            let host = String::from_utf8_lossy(&buf[5..5 + dlen]).to_string();
-                            let port = u16::from_be_bytes([buf[5 + dlen], buf[6 + dlen]]);
-                            (
-                                Address::Domain(host, port),
-                                SocketAddr::new(std::net::IpAddr::V4(Ipv4Addr::UNSPECIFIED), port),
-                                7 + dlen,
-                            )
-                        }
-                        ATYP_IPV6 if n >= 22 => {
-                            let ip = Ipv6Addr::from([
-                                buf[4], buf[5], buf[6], buf[7], buf[8], buf[9], buf[10], buf[11],
-                                buf[12], buf[13], buf[14], buf[15], buf[16], buf[17], buf[18],
-                                buf[19],
-                            ]);
-                            let port = u16::from_be_bytes([buf[20], buf[21]]);
-                            let sa = SocketAddr::new(ip.into(), port);
-                            (Address::ip(sa), sa, 22)
-                        }
-                        _ => continue,
-                    };
-
-                    let data = buf[data_offset..n].to_vec();
-
-                    debug!(
-                        "SOCKS5 UDP relay: {} -> {} ({} bytes)",
-                        src,
-                        target,
-                        data.len()
-                    );
-
-                    let nat_key = (src, target.clone());
-
-                    // Register the queue before spawning the worker. All
-                    // fragments of a handshake must reach the same sniffer.
-                    let Some((tx, rx)) = udp::enqueue(&nat_table, nat_key.clone(), data) else {
-                        continue;
-                    };
-                    let cm = cm.clone();
-                    let nat = nat_table.clone();
-                    let socket = udp_socket.clone();
-                    let cancel = relay_cancelled.clone();
-                    let header = buf[3..data_offset].to_vec();
-                    let domain = match target {
-                        Address::Domain(host, _) => Some(host),
-                        Address::Ip(_) => None,
-                    };
-                    tokio::spawn(async move {
-                        let relay = cm.handle_udp(
-                            UdpInbound {
-                                src,
-                                dst: dst_sockaddr,
-                                conn_type: "socks5",
-                                domain,
-                            },
-                            rx,
-                            timeout_dur,
-                            |data| {
-                                let socket = socket.clone();
-                                let mut response =
-                                    Vec::with_capacity(3 + header.len() + data.len());
-                                response.extend_from_slice(&[0, 0, 0]);
-                                response.extend_from_slice(&header);
-                                response.extend_from_slice(&data);
-                                async move {
-                                    socket.send_to(&response, src).await?;
-                                    Ok(())
-                                }
-                            },
-                        );
-                        tokio::select! {
-                            result = relay => if let Err(error) = result { debug!("SOCKS5 UDP session {} error: {}", src, error); },
-                            _ = cancel.cancelled() => {},
-                        }
-                        nat.remove_if(&nat_key, |_, existing| existing.same_channel(&tx));
-                    });
-                }
-            });
-
-            // Keep TCP control connection alive; when it closes, abort the relay
-            let mut ctrl_buf = [0u8; 1];
-            let _ = stream.read(&mut ctrl_buf).await;
-            relay_handle.abort();
-            cancelled.cancel();
+            send_reply(&mut stream, REP_SUCCESS, &bound).await?;
+            // mihomo compat: listener/socks/tcp.go — the connection is only
+            // held open until the client closes it. The UDP sessions do not
+            // depend on it; they end when they go idle.
+            let _ = tokio::io::copy(&mut stream, &mut tokio::io::sink()).await;
         }
         _ => {
             send_reply(&mut stream, REP_CMD_NOT_SUPPORTED, &dst).await?;
@@ -312,6 +183,136 @@ async fn handle_socks5(
     }
 
     Ok(())
+}
+
+/// The UDP side of a SOCKS5 or mixed listener.
+///
+/// mihomo compat: listener/socks/udp.go — one socket on the listener's own
+/// address serves every client. A session belongs to the address a client
+/// sends from (the NAT key), not to the TCP connection that asked for the
+/// association.
+pub struct UdpListener {
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for UdpListener {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+impl UdpListener {
+    pub async fn start(addr: SocketAddr, conn_manager: Arc<ConnectionManager>) -> Result<Self> {
+        let socket = Arc::new(UdpSocket::bind(addr).await?);
+        Ok(Self {
+            task: tokio::spawn(relay_udp(socket, conn_manager)),
+        })
+    }
+}
+
+async fn relay_udp(socket: Arc<UdpSocket>, conn_manager: Arc<ConnectionManager>) {
+    let nat_table: Arc<DashMap<SocketAddr, mpsc::Sender<UdpPacket>>> = Arc::new(DashMap::new());
+    let mut buf = vec![0u8; 65535];
+    loop {
+        let (n, src) = match socket.recv_from(&mut buf).await {
+            Ok(v) => v,
+            Err(e) => {
+                debug!("SOCKS5 UDP receive error: {}", e);
+                continue;
+            }
+        };
+        let src = SocketAddr::new(src.ip().to_canonical(), src.port());
+        let Some(packet) = decode_udp_packet(&buf[..n]) else {
+            continue;
+        };
+        let Some((tx, rx)) = udp::enqueue(&nat_table, src, packet) else {
+            continue;
+        };
+        let cm = conn_manager.clone();
+        let nat = nat_table.clone();
+        let socket = socket.clone();
+        tokio::spawn(async move {
+            let session = cm.handle_udp(
+                UdpInbound {
+                    src,
+                    conn_type: "socks5",
+                },
+                rx,
+                |data, from| {
+                    let socket = &socket;
+                    async move {
+                        socket.send_to(&encode_udp_packet(from, &data), src).await?;
+                        Ok(())
+                    }
+                },
+            );
+            if let Err(error) = session.await {
+                debug!("SOCKS5 UDP session {} error: {}", src, error);
+            }
+            nat.remove_if(&src, |_, existing| existing.same_channel(&tx));
+        });
+    }
+}
+
+/// mihomo compat: transport/socks5 `DecodeUDPPacket` — RSV(2) FRAG(1)
+/// ATYP(1) DST.ADDR DST.PORT(2) DATA. Reserved bytes must be zero and
+/// fragments are discarded.
+fn decode_udp_packet(packet: &[u8]) -> Option<UdpPacket> {
+    if packet.len() < 5 || packet[..3] != [0, 0, 0] {
+        return None;
+    }
+    let body = &packet[3..];
+    let port_at = match body[0] {
+        ATYP_IPV4 => 1 + 4,
+        ATYP_DOMAIN => 1 + 1 + body[1] as usize,
+        ATYP_IPV6 => 1 + 16,
+        _ => return None,
+    };
+    let port = u16::from_be_bytes(body.get(port_at..port_at + 2)?.try_into().ok()?);
+    let (ip, host) = match body[0] {
+        ATYP_IPV4 => {
+            let octets: [u8; 4] = body[1..5].try_into().ok()?;
+            (IpAddr::from(octets), None)
+        }
+        ATYP_IPV6 => {
+            let octets: [u8; 16] = body[1..17].try_into().ok()?;
+            (IpAddr::from(octets), None)
+        }
+        _ => {
+            let host = String::from_utf8_lossy(&body[2..port_at]).to_string();
+            match host.parse::<IpAddr>() {
+                // mihomo compat: tunnel.go fixMetadata — an address written
+                // as a name is an address.
+                Ok(ip) => (ip, None),
+                Err(_) => (IpAddr::V4(Ipv4Addr::UNSPECIFIED), Some(host)),
+            }
+        }
+    };
+    Some(UdpPacket {
+        dst: SocketAddr::new(ip.to_canonical(), port),
+        host,
+        data: body[port_at + 2..].to_vec(),
+    })
+}
+
+/// mihomo compat: listener/socks/utils.go `WriteBack` — the header names the
+/// address the datagram came from.
+fn encode_udp_packet(from: SocketAddr, data: &[u8]) -> Vec<u8> {
+    let mut packet = Vec::with_capacity(3 + 19 + data.len());
+    packet.extend_from_slice(&[0, 0, 0]);
+    match from.ip() {
+        IpAddr::V4(ip) => {
+            packet.push(ATYP_IPV4);
+            packet.extend_from_slice(&ip.octets());
+        }
+        IpAddr::V6(ip) => {
+            packet.push(ATYP_IPV6);
+            packet.extend_from_slice(&ip.octets());
+        }
+    }
+    packet.extend_from_slice(&from.port().to_be_bytes());
+    packet.extend_from_slice(data);
+    packet
 }
 
 /// Read a SOCKS5 address (ATYP + addr + port).
@@ -420,6 +421,150 @@ mod tests {
         assert_eq!(buf[3], ATYP_IPV4);
         assert_eq!(&buf[4..8], &[127, 0, 0, 1]);
         assert_eq!(u16::from_be_bytes([buf[8], buf[9]]), 1080);
+    }
+
+    #[test]
+    fn udp_packets_are_decoded_like_mihomo() {
+        // transport/socks5 DecodeUDPPacket.
+        let v4 = [0, 0, 0, ATYP_IPV4, 8, 8, 4, 4, 0, 53, b'h', b'i'];
+        assert_eq!(
+            decode_udp_packet(&v4),
+            Some(UdpPacket::new(
+                "8.8.4.4:53".parse().unwrap(),
+                b"hi".to_vec()
+            ))
+        );
+
+        let mut v6 = vec![0, 0, 0, ATYP_IPV6];
+        v6.extend_from_slice(&Ipv6Addr::LOCALHOST.octets());
+        v6.extend_from_slice(&[0x01, 0xbb, 1, 2, 3]);
+        assert_eq!(
+            decode_udp_packet(&v6),
+            Some(UdpPacket::new("[::1]:443".parse().unwrap(), vec![1, 2, 3]))
+        );
+
+        let mut named = vec![0, 0, 0, ATYP_DOMAIN, 11];
+        named.extend_from_slice(b"example.com");
+        named.extend_from_slice(&[0, 80]);
+        assert_eq!(
+            decode_udp_packet(&named),
+            Some(UdpPacket {
+                dst: "0.0.0.0:80".parse().unwrap(),
+                host: Some("example.com".to_string()),
+                data: Vec::new(),
+            })
+        );
+
+        // tunnel.go fixMetadata: an address spelled as a name is an address.
+        let mut literal = vec![0, 0, 0, ATYP_DOMAIN, 7];
+        literal.extend_from_slice(b"1.2.3.4");
+        literal.extend_from_slice(&[0, 80, 9]);
+        assert_eq!(
+            decode_udp_packet(&literal),
+            Some(UdpPacket::new("1.2.3.4:80".parse().unwrap(), vec![9]))
+        );
+
+        // Reserved bytes must be zero, fragments are discarded, and a header
+        // that does not fit is no packet.
+        assert_eq!(
+            decode_udp_packet(&[0, 1, 0, ATYP_IPV4, 8, 8, 4, 4, 0, 53]),
+            None
+        );
+        assert_eq!(
+            decode_udp_packet(&[0, 0, 1, ATYP_IPV4, 8, 8, 4, 4, 0, 53]),
+            None
+        );
+        assert_eq!(
+            decode_udp_packet(&[0, 0, 0, ATYP_IPV4, 8, 8, 4, 4, 0]),
+            None
+        );
+        assert_eq!(decode_udp_packet(&[0, 0, 0, 9, 8, 8, 4, 4, 0, 53]), None);
+        assert_eq!(
+            decode_udp_packet(&[0, 0, 0, ATYP_DOMAIN, 200, b'a', 0, 53]),
+            None
+        );
+    }
+
+    /// Run the SOCKS5 greeting and a UDP ASSOCIATE on `control`, returning
+    /// BND.ADDR:BND.PORT.
+    async fn associate(control: &mut TcpStream) -> SocketAddr {
+        control.write_all(&[5, 1, 0]).await.unwrap();
+        let mut choice = [0u8; 2];
+        control.read_exact(&mut choice).await.unwrap();
+        assert_eq!(choice, [5, 0]);
+        control
+            .write_all(&[5, CMD_UDP_ASSOCIATE, 0, ATYP_IPV4, 0, 0, 0, 0, 0, 0])
+            .await
+            .unwrap();
+        let mut reply = [0u8; 10];
+        control.read_exact(&mut reply).await.unwrap();
+        assert_eq!(&reply[..4], &[5, REP_SUCCESS, 0, ATYP_IPV4]);
+        SocketAddr::from((
+            [reply[4], reply[5], reply[6], reply[7]],
+            u16::from_be_bytes([reply[8], reply[9]]),
+        ))
+    }
+
+    #[tokio::test]
+    async fn udp_associate_relays_on_the_listener_port_with_real_reply_sources() {
+        // mihomo: `socks.NewUDP` on the listener's address; BND is the TCP
+        // connection's local address; replies name where they came from; the
+        // association outlives nothing but itself.
+        let reserve = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listen = reserve.local_addr().unwrap();
+        drop(reserve);
+        let cm = Arc::new(crate::conn::test_support::manager("rules: ['MATCH,DIRECT']\n").await);
+        let server = tokio::spawn(run_socks_proxy(listen, cm, Arc::new(Vec::new())));
+
+        let mut control = loop {
+            match TcpStream::connect(listen).await {
+                Ok(stream) => break stream,
+                Err(_) => tokio::task::yield_now().await,
+            }
+        };
+        assert_eq!(associate(&mut control).await, listen);
+
+        let echo_a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let echo_b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut buf = [0u8; 256];
+        let mut outbound = None;
+        for (echo, by_name) in [(&echo_a, false), (&echo_b, true)] {
+            let target = echo.local_addr().unwrap();
+            let mut request = vec![0, 0, 0];
+            if by_name {
+                request.extend_from_slice(&[ATYP_DOMAIN, 9]);
+                request.extend_from_slice(b"localhost");
+            } else {
+                request.extend_from_slice(&[ATYP_IPV4, 127, 0, 0, 1]);
+            }
+            request.extend_from_slice(&target.port().to_be_bytes());
+            request.extend_from_slice(b"ping");
+            client.send_to(&request, listen).await.unwrap();
+
+            let (n, from) =
+                tokio::time::timeout(std::time::Duration::from_secs(5), echo.recv_from(&mut buf))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(&buf[..n], b"ping");
+            // One outbound socket for the client, whatever it sends to.
+            assert_eq!(*outbound.get_or_insert(from), from);
+
+            echo.send_to(b"pong", from).await.unwrap();
+            let (n, relay) = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                client.recv_from(&mut buf),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(relay, listen);
+            // The reply names the address it came from, also when the
+            // request named a host.
+            assert_eq!(&buf[..n], encode_udp_packet(target, b"pong"));
+        }
+        server.abort();
     }
 
     #[tokio::test]

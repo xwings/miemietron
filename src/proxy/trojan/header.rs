@@ -112,9 +112,9 @@ impl<T: AsyncRead + AsyncWrite + Unpin> AsyncWrite for TrojanStream<T> {
                 this.inner.poll_write(cx, buf)
             }
             WriteState::NeedHeader(ref mut header) => {
-                // Combine header + first payload into a single write.
-                // This is important: Trojan expects header + payload in one segment
-                // to avoid detection by DPI.
+                // The tunnel sends the header on its own right after the
+                // dial (`Handshake::AtDial`), as mihomo does; a caller that
+                // writes first gets it in front of its payload.
                 let mut combined = std::mem::take(header);
                 let header_len = combined.len();
                 combined.extend_from_slice(buf);

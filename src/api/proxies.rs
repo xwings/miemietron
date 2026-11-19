@@ -218,22 +218,32 @@ fn ordered_group_names(
     group_names
 }
 
-/// Persist current group selections to cache.db when `store-selected` is on.
-/// `action` names the operation in the failure log.
-fn persist_selections_if_enabled(state: &ApiState, action: &str) {
+/// Record what was chosen for `group` — nothing when it was unpinned — in
+/// cache.db, when `store-selected` is on (the default).
+///
+/// mihomo compat: `cachefile.Cache().SetSelected(proxy.Name(), name)` in
+/// hub/route/proxies.go and groups.go: only the group that was set is
+/// written, never what the other groups happen to be using.
+fn persist_selection(state: &ApiState, group: &str, selected: &str) {
     let store_selected = state
         .app
         .config()
         .profile
         .as_ref()
         .map(|p| p.store_selected)
-        .unwrap_or(false);
-    if store_selected {
-        let selections = state.app.proxy_manager().get_all_selections();
-        let home_dir = &state.app.home_dir;
-        if let Err(e) = crate::store::save_selected(home_dir, &selections) {
-            tracing::warn!("Failed to persist {}: {}", action, e);
-        }
+        .unwrap_or(true);
+    if !store_selected {
+        return;
+    }
+    let proxies = state.app.proxy_manager();
+    let is_selector = |name: &str| {
+        proxies
+            .get_group(name)
+            .is_some_and(|group| group.group_type() == "Selector")
+    };
+    if let Err(e) = crate::store::set_selected(&state.app.home_dir, group, selected, is_selector)
+    {
+        tracing::warn!("Failed to persist the selection of {}: {}", group, e);
     }
 }
 
@@ -475,8 +485,7 @@ pub async fn put_proxy(
     if group.select(&body.name) {
         tracing::info!("Selected proxy '{}' in group '{}'", body.name, group_name);
 
-        // Persist selection if store-selected is enabled
-        persist_selections_if_enabled(&state, "proxy selection");
+        persist_selection(&state, &group_name, &body.name);
 
         StatusCode::NO_CONTENT.into_response()
     } else {
@@ -534,8 +543,7 @@ pub async fn delete_proxy(
     group.clear_selection();
     tracing::info!("Cleared forced selection for group '{}'", name);
 
-    // Persist the reset selection if store-selected is enabled
-    persist_selections_if_enabled(&state, "proxy selection reset");
+    persist_selection(&state, &name, "");
 
     StatusCode::NO_CONTENT.into_response()
 }
@@ -588,10 +596,12 @@ pub async fn get_group_delay(
         }
     };
 
-    // mihomo compat: clear force-pinned selection on non-Selector groups
-    // before running group delay test (groups.go:62-65).
-    if group.group_type() != "Selector" {
+    // mihomo compat: a group delay test unpins a SelectAble non-Selector
+    // group and records that (groups.go:62-65). LoadBalance is not
+    // SelectAble.
+    if matches!(group.group_type(), "URLTest" | "Fallback") {
         group.clear_selection();
+        persist_selection(&state, &name, "");
     }
     let proxy_names = group.all();
 

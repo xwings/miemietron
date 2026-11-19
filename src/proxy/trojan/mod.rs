@@ -9,8 +9,7 @@ use tracing::debug;
 use crate::common::addr::Address;
 use crate::config::proxy::{GrpcOpts, H2Opts, ProxyConfig, RealityOpts, WsOpts};
 use crate::dns::DnsResolver;
-use crate::proxy::{OutboundHandler, ProxyStream};
-use crate::transport::fingerprint::TlsFingerprint;
+use crate::proxy::{Handshake, OutboundHandler, ProxyStream};
 use crate::transport::reality::RealityConfig;
 use crate::transport::stack::{self, SecuritySpec, TransportSpec};
 use crate::transport::tcp::{self, ConnectOpts};
@@ -107,23 +106,16 @@ impl TrojanOutbound {
             .as_deref()
             .context("Trojan Reality: missing 'public-key'")?;
         let short_id = opts.short_id.as_deref().unwrap_or("");
-        let fp = TlsFingerprint::from_str_opt(self.fingerprint.as_deref());
-        let alpn = match self.network.as_str() {
-            "ws" => vec!["http/1.1".to_string()],
-            "grpc" | "h2" => vec!["h2".to_string()],
-            _ if self.alpn.is_empty() => crate::transport::fingerprint::default_alpn_for(fp),
-            _ => self.alpn.clone(),
-        };
 
+        // mihomo compat: `GetRealityConn` takes no ALPN — the hello carries
+        // the uTLS preset's own list whatever the transport or `alpn` say.
         let config = RealityConfig::from_opts(
             public_key,
             short_id,
             self.sni.clone(),
-            fp,
-            alpn,
+            self.fingerprint.as_deref(),
             opts.support_x25519mlkem768,
-        )
-        .context("Trojan Reality: invalid configuration")?;
+        )?;
 
         Ok(Some(config))
     }
@@ -187,6 +179,12 @@ impl OutboundHandler for TrojanOutbound {
         // UDP relay (connect_datagram) is not yet implemented for Trojan; this
         // flag only mirrors config, so requesting UDP errors at runtime.
         self.udp
+    }
+
+    fn handshake(&self) -> Handshake {
+        // mihomo compat: trojan.go StreamConnContext calls
+        // `trojan.WriteHeader` while dialing, ahead of any payload.
+        Handshake::AtDial
     }
 
     async fn connect_stream(

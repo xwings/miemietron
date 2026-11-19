@@ -37,10 +37,13 @@ Apply configured inbound keepalive. Do not add SO_MARK to accepted sockets;
 OpenClash outbound bypass uses process GID. Redir reads original destination;
 TPROXY uses transparent listener/local address, requiring Linux privileges.
 
-SOCKS5 UDP ASSOCIATE installs a bounded per-target queue before spawning shared
-conn UDP handling. Replay datagrams unchanged, preserve original SOCKS address
-header on replies and cancel workers when the control TCP connection closes.
-Its fixed activity timeout is 60 seconds.
+A SOCKS5 or mixed listener also binds UDP on its own address (`UdpListener`);
+failing to bind it fails the listener. CONNECT and UDP ASSOCIATE both answer
+with the address the TCP connection was accepted on. A UDP session belongs to
+the address a client sends from, not to the TCP connection, which is only held
+open until the client closes it. Datagrams with nonzero reserved bytes or a
+fragment number are dropped; replies carry the address they came from. Session
+lifetime and queueing belong to [conn](conn.md).
 
 Listeners are driven by top-level port fields. Nonempty custom `listeners:` is
 outside scope and rejected at config load.
@@ -57,7 +60,7 @@ come from [common](common.md); inbounds do not choose outbounds themselves.
 | Change trigger | Inspect / extend | Required docs / checks |
 | --- | --- | --- |
 | HTTP/SOCKS wire/auth | Owning parser and socket tests | `cargo test inbound`; root live proxy smoke |
-| UDP associate/lifecycle | Queue install and control connection cancellation | Conn UDP + SOCKS datagram tests |
+| UDP associate/lifecycle | `UdpListener`, packet codec, queue install | Conn UDP + SOCKS datagram tests |
 | Transparent acceptance | Original-dst and socket options | Linux CAP_NET_ADMIN integration |
 
 ## Verification

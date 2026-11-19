@@ -33,9 +33,13 @@ precedence. Only install routes for auto-route. If disabled, an external manager
 owns routes. This userspace TUN path installs no iptables/nftables redirects.
 
 Every stack selector maps to the same smoltcp engine here. TCP flows feed
-ConnectionManager, UDP flows install bounded shared queues then use conn's
-QUIC-sniff/route/duplex relay, and replies write back through the stack.
-Standalone TPROXY UDP uses IP_TRANSPARENT helpers and the same queued relay.
+ConnectionManager. UDP datagrams are queued per client socket for conn's
+session (see [conn](conn.md)), and replies are written back through the stack
+from the address they came from. Standalone TPROXY UDP does the same; a reply
+leaves through a socket bound transparently to its source and connected to the
+client, kept for the session, read as well (the kernel hands it the client's
+later datagrams for that address), and never marked: OpenClash routes its own
+mark to `lo`.
 
 DNS hijack strips tcp/udp scheme, normalizes `any` to 0.0.0.0 and matches exact
 target or unspecified address plus destination port 53. Both TCP and UDP feed

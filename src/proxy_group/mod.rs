@@ -257,8 +257,9 @@ impl GroupBase {
             _ => {}
         }
 
-        // mihomo compat: "connection refused" triggers immediate health check
-        if err.contains("connection refused") {
+        // mihomo compat: "connection refused" triggers immediate health check.
+        // Go spells the OS error in lower case, Rust capitalises it.
+        if err.to_ascii_lowercase().contains("connection refused") {
             trigger();
             return;
         }

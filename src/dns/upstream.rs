@@ -2,14 +2,57 @@ use anyhow::Result;
 use base64::Engine;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
-use tracing::{debug, warn};
+use tracing::debug;
 
 use crate::config::DnsConfig;
 use crate::rules::geoip::GeoIpMatcher;
 use crate::transport::tls::{wrap_tls, TlsOptions};
+
+const TYPE_A: u16 = 1;
+const TYPE_AAAA: u16 = 28;
+const TYPE_OPT: u16 = 41;
+
+const RCODE_SERVER_FAILURE: u8 = 2;
+const RCODE_REFUSED: u8 = 5;
+
+/// What a nameserver said about an A/AAAA question.
+///
+/// mihomo compat: mihomo hands the whole `*D.Msg` around; these are the parts
+/// of it our replies and lookups are built from. An NXDOMAIN or empty reply is
+/// an answer like any other — only SERVFAIL and REFUSED count as a failed
+/// exchange (dns/util.go batchExchange).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Answer {
+    /// The response code, relayed to the client as is.
+    pub rcode: u8,
+    /// The addresses of the requested type, in reply order.
+    pub ips: Vec<IpAddr>,
+    /// Seconds the reply may be cached for: the smallest TTL among its records
+    /// (dns/util.go putMsgToCache), 0 for a reply that carries none.
+    pub ttl: u32,
+}
+
+impl Answer {
+    /// A successful reply without records (mihomo handleMsgWithEmptyAnswer).
+    pub fn empty() -> Self {
+        Self {
+            rcode: 0,
+            ips: Vec::new(),
+            ttl: 0,
+        }
+    }
+
+    /// The first address, or mihomo's `resolver.ErrIPNotFound`.
+    pub fn first_ip(&self, domain: &str) -> Result<IpAddr> {
+        self.ips
+            .first()
+            .copied()
+            .ok_or_else(|| anyhow::anyhow!("couldn't find ip: {domain}"))
+    }
+}
 
 /// Global lazy GeoIP matcher for DNS fallback filtering.
 ///
@@ -27,28 +70,19 @@ static DNS_GEOIP: std::sync::LazyLock<GeoIpMatcher> = std::sync::LazyLock::new(|
     GeoIpMatcher::new(&home_dir)
 });
 
-/// Shared scaffolding for racing multiple DNS servers concurrently
-/// (mihomo batchExchange): one query task per server, first result accepted
-/// by `filter` wins. `filter` receives a display label for the answering
-/// server (empty in the single-server path, " <server>" otherwise) so error
-/// messages can name it. Errors are optionally warned and the last one is
-/// returned if every server fails.
-async fn batch_resolve_inner<T, F>(
-    domain: &str,
-    servers: &[String],
-    qtype: u16,
-    warn_errors: bool,
-    filter: F,
-) -> Result<T>
-where
-    F: Fn(&str, IpAddr, u32) -> Result<T>,
-{
+/// Race the nameservers concurrently; the first usable reply wins.
+///
+/// mihomo compat: dns/util.go batchExchange — a SERVFAIL or REFUSED reply
+/// counts as that server failing (see `query_server`); any other reply,
+/// NXDOMAIN and empty answers included, is the result.
+async fn batch_resolve(domain: &str, servers: &[String], qtype: u16) -> Result<Answer> {
     if servers.is_empty() {
         return Err(anyhow::anyhow!("no DNS servers configured"));
     }
     if servers.len() == 1 {
-        let (ip, ttl) = query_server(domain, &servers[0], qtype).await?;
-        return filter("", ip, ttl);
+        return query_server(domain, &servers[0], qtype)
+            .await
+            .map_err(|e| all_failed(Some(e)));
     }
 
     let (tx, mut rx) = tokio::sync::mpsc::channel(servers.len());
@@ -57,149 +91,30 @@ where
         let domain = domain.to_string();
         let server = server.clone();
         tokio::spawn(async move {
-            let result = query_server(&domain, &server, qtype).await;
-            let _ = tx.send((server, result)).await;
+            let _ = tx.send(query_server(&domain, &server, qtype).await).await;
         });
     }
     drop(tx);
 
-    let mut last_err = anyhow::anyhow!("all DNS servers failed for {domain}");
-    while let Some((server, result)) = rx.recv().await {
-        match result.and_then(|(ip, ttl)| filter(&format!(" {server}"), ip, ttl)) {
-            Ok(v) => return Ok(v),
+    let mut first_err = None;
+    while let Some(result) = rx.recv().await {
+        match result {
+            Ok(answer) => return Ok(answer),
             Err(e) => {
-                if warn_errors {
-                    warn!("{}", e);
-                }
-                last_err = e;
+                first_err.get_or_insert(e);
             }
         }
     }
-    Err(last_err)
+    Err(all_failed(first_err))
 }
 
-/// Race multiple DNS servers concurrently, return first successful result.
-/// Matches mihomo's batchExchange() pattern. Returns (IP, TTL).
-async fn batch_resolve(domain: &str, servers: &[String], qtype: u16) -> Result<(IpAddr, u32)> {
-    batch_resolve_inner(domain, servers, qtype, false, |_server, ip, ttl| {
-        Ok((ip, ttl))
-    })
-    .await
-}
-
-/// Race multiple DNS servers concurrently, rejecting FakeIP results.
-/// Returns the first successful non-FakeIP result.
-async fn batch_resolve_reject_fakeip(
-    domain: &str,
-    servers: &[String],
-    fake_ip_range: &str,
-    source_label: &str,
-) -> Result<IpAddr> {
-    batch_resolve_inner(domain, servers, 1, true, |server, ip, _ttl| {
-        if is_in_fakeip_range(&ip, fake_ip_range) {
-            Err(anyhow::anyhow!(
-                "DNS {source_label}{server} returned FakeIP {ip} for proxy server {domain}, rejecting"
-            ))
-        } else {
-            Ok(ip)
-        }
-    })
-    .await
-}
-
-/// Resolve a proxy server hostname using only direct/bootstrap DNS.
-///
-/// Uses `proxy-server-nameserver` if configured, otherwise falls back to
-/// `default-nameserver`. These are typically plain UDP servers (e.g.
-/// 114.114.114.114) set by OpenClash, avoiding the circular dependency
-/// where DoH/DoT nameservers need a proxy but the proxy needs DNS first.
-///
-/// Within each tier, all servers are raced concurrently (mihomo batchExchange).
-pub async fn resolve_proxy_server(domain: &str, config: &DnsConfig) -> Result<IpAddr> {
-    // 0. Check nameserver-policy first (e.g. "+.oix_nodes.com": "124.221.68.73:1053")
-    if let Some(server) = match_nameserver_policy(domain, &config.nameserver_policy) {
-        match query_server(domain, &server, 1).await {
-            Ok((ip, _ttl)) => {
-                if is_in_fakeip_range(&ip, &config.fake_ip_range) {
-                    warn!(
-                        "DNS nameserver-policy {} returned FakeIP {} for proxy server {}, rejecting",
-                        server, ip, domain
-                    );
-                } else {
-                    debug!(
-                        "DNS nameserver-policy resolved {} -> {} via {}",
-                        domain, ip, server
-                    );
-                    return Ok(ip);
-                }
-            }
-            Err(e) => {
-                warn!(
-                    "DNS nameserver-policy {} failed for {}: {}",
-                    server, domain, e
-                );
-            }
-        }
-    } else {
-        debug!(
-            "DNS no nameserver-policy match for {} (policies: {:?})",
-            domain,
-            config.nameserver_policy.keys().collect::<Vec<_>>()
-        );
+/// mihomo compat: dns/util.go batchExchange — the error once every server of
+/// a race has failed.
+fn all_failed(first_err: Option<anyhow::Error>) -> anyhow::Error {
+    match first_err {
+        Some(e) => anyhow::anyhow!("all DNS requests failed, first error: {e}"),
+        None => anyhow::anyhow!("all DNS requests failed"),
     }
-
-    // 1. Use proxy-server-nameserver if configured — race all concurrently
-    if !config.proxy_server_nameserver.is_empty() {
-        match batch_resolve_reject_fakeip(
-            domain,
-            &config.proxy_server_nameserver,
-            &config.fake_ip_range,
-            "proxy-server-nameserver",
-        )
-        .await
-        {
-            Ok(ip) => {
-                debug!("DNS proxy-server-nameserver resolved {} -> {}", domain, ip);
-                return Ok(ip);
-            }
-            Err(e) => {
-                warn!(
-                    "DNS proxy-server-nameserver all failed for {}: {}",
-                    domain, e
-                );
-            }
-        }
-    }
-
-    // 2. Fall back to default-nameserver (bootstrap DNS) — race all concurrently
-    if !config.default_nameserver.is_empty() {
-        match batch_resolve_reject_fakeip(
-            domain,
-            &config.default_nameserver,
-            &config.fake_ip_range,
-            "default-nameserver",
-        )
-        .await
-        {
-            Ok(ip) => {
-                debug!("DNS default-nameserver resolved {} -> {}", domain, ip);
-                return Ok(ip);
-            }
-            Err(e) => {
-                warn!("DNS default-nameserver all failed for {}: {}", domain, e);
-            }
-        }
-    }
-
-    // mihomo compat: NO system resolver fallback for proxy server hostnames.
-    // On routers, /etc/resolv.conf typically points to the local DNS server
-    // (127.0.0.1 or FakeIP hijack address), which would cause a circular
-    // dependency: proxy needs DNS → DNS server → resolve() → FakeIP allocated
-    // → proxy connects to FakeIP → timeout.
-    Err(anyhow::anyhow!(
-        "all DNS servers failed for proxy server '{domain}' \
-         (nameserver-policy, proxy-server-nameserver, and default-nameserver all failed)"
-    ))
 }
 
 /// Resolve a domain by querying upstream DNS servers.
@@ -208,19 +123,19 @@ pub async fn resolve_proxy_server(domain: &str, config: &DnsConfig) -> Result<Ip
 /// (mihomo batchExchange), and if the result looks suspicious (private IP
 /// for a public domain, or an IP in the fake-ip range), races all fallback
 /// servers concurrently.
-pub async fn resolve(domain: &str, config: &DnsConfig) -> Result<(IpAddr, u32)> {
-    resolve_qtype(domain, config, 1).await
+pub async fn resolve(domain: &str, config: &DnsConfig) -> Result<Answer> {
+    resolve_qtype(domain, config, TYPE_A).await
 }
 
 /// Race a specific server list (nameserver-policy hit) — no fallback logic.
 /// mihomo compat: resolver.go matchPolicy results are used directly.
-pub async fn resolve_via(domain: &str, servers: &[String], qtype: u16) -> Result<(IpAddr, u32)> {
+pub async fn resolve_via(domain: &str, servers: &[String], qtype: u16) -> Result<Answer> {
     batch_resolve(domain, servers, qtype).await
 }
 
 /// The first configured main nameserver usable for raw passthrough (plain
 /// "ip" / "ip:port" UDP entries only).
-pub fn plain_udp_server(config: &DnsConfig) -> Option<String> {
+pub fn plain_udp_server(config: &DnsConfig) -> Option<SocketAddr> {
     config
         .nameserver
         .iter()
@@ -229,17 +144,13 @@ pub fn plain_udp_server(config: &DnsConfig) -> Option<String> {
             if s.contains("://") || s == "system" {
                 return None;
             }
-            if s.parse::<std::net::SocketAddr>().is_ok() {
-                return Some(s.clone());
-            }
-            s.parse::<IpAddr>().ok().map(|ip| match ip {
-                IpAddr::V4(_) => format!("{ip}:53"),
-                IpAddr::V6(_) => format!("[{ip}]:53"),
-            })
+            s.parse::<SocketAddr>()
+                .ok()
+                .or_else(|| s.parse::<IpAddr>().ok().map(|ip| SocketAddr::new(ip, 53)))
         })
 }
 
-pub async fn resolve_qtype(domain: &str, config: &DnsConfig, qtype: u16) -> Result<(IpAddr, u32)> {
+pub async fn resolve_qtype(domain: &str, config: &DnsConfig, qtype: u16) -> Result<Answer> {
     // Determine primary nameserver list
     let servers = if !config.nameserver.is_empty() {
         &config.nameserver
@@ -253,39 +164,44 @@ pub async fn resolve_qtype(domain: &str, config: &DnsConfig, qtype: u16) -> Resu
     // Race all primary nameservers concurrently
     let primary_result = batch_resolve(domain, servers, qtype).await;
 
-    // If we got a result, check if it needs fallback
-    if let Ok((ip, ttl)) = primary_result {
-        if should_use_fallback(&ip, domain, config) && !config.fallback.is_empty() {
-            debug!(
-                "DNS primary returned {} for {}, trying fallback servers",
-                ip, domain
-            );
-            // Race all fallback nameservers concurrently
-            match batch_resolve(domain, &config.fallback, qtype).await {
-                Ok((fallback_ip, fallback_ttl)) => {
-                    debug!(
-                        "DNS fallback returned {} for {} (primary was {})",
-                        fallback_ip, domain, ip
-                    );
-                    return Ok((fallback_ip, fallback_ttl));
-                }
-                Err(_) => {
-                    // All fallbacks failed, return the primary result anyway
-                    return Ok((ip, ttl));
-                }
-            }
+    // mihomo compat: resolver.go ipExchange — "directly return if no fallback
+    // servers are available". The fallback filters, and the GeoIP database
+    // behind them, only exist for a config that has fallback servers.
+    if config.fallback.is_empty() {
+        return primary_result;
+    }
+
+    // mihomo compat: ipExchange — the main answer stands when it carries
+    // addresses and none of them trips a fallback filter.
+    if let Ok(answer) = primary_result {
+        if !answer.ips.is_empty()
+            && !answer
+                .ips
+                .iter()
+                .any(|ip| should_use_fallback(ip, domain, config))
+        {
+            return Ok(answer);
         }
-        return Ok((ip, ttl));
+        debug!(
+            "DNS primary returned {:?} for {}, trying fallback servers",
+            answer.ips, domain
+        );
+        // Race all fallback nameservers concurrently
+        return match batch_resolve(domain, &config.fallback, qtype).await {
+            Ok(fallback) => {
+                debug!(
+                    "DNS fallback returned {:?} for {} (primary was {:?})",
+                    fallback.ips, domain, answer.ips
+                );
+                Ok(fallback)
+            }
+            // All fallbacks failed, return the primary result anyway
+            Err(_) => Ok(answer),
+        };
     }
 
     // Primary failed entirely, try fallback servers concurrently
-    if !config.fallback.is_empty() {
-        if let Ok(result) = batch_resolve(domain, &config.fallback, qtype).await {
-            return Ok(result);
-        }
-    }
-
-    Err(anyhow::anyhow!("all DNS servers failed for {domain}"))
+    batch_resolve(domain, &config.fallback, qtype).await
 }
 
 /// Check whether the primary DNS result looks suspicious and fallback should
@@ -369,25 +285,6 @@ fn should_use_fallback(ip: &IpAddr, domain: &str, config: &DnsConfig) -> bool {
     false
 }
 
-/// Check whether an IP falls within the configured fake-ip CIDR range.
-fn is_in_fakeip_range(ip: &IpAddr, fake_ip_range: &str) -> bool {
-    if fake_ip_range.is_empty() {
-        return false;
-    }
-    if let IpAddr::V4(v4) = ip {
-        if let Ok((base, prefix_len)) = parse_cidr_simple(fake_ip_range) {
-            let mask = if prefix_len >= 32 {
-                0xFFFF_FFFFu32
-            } else {
-                !((1u32 << (32 - prefix_len)) - 1)
-            };
-            let ip_u32 = u32::from(*v4);
-            return ip_u32 & mask == base & mask;
-        }
-    }
-    false
-}
-
 /// Check whether an IP is in a private/reserved range.
 fn is_private_ip(ip: &IpAddr) -> bool {
     match ip {
@@ -435,12 +332,14 @@ fn parse_cidr_simple(cidr: &str) -> Result<(u32, u32)> {
 }
 
 /// Route a DNS query to the appropriate upstream based on the server URL scheme.
-/// Returns (IP, TTL).
-async fn query_server(domain: &str, server: &str, qtype: u16) -> Result<(IpAddr, u32)> {
+///
+/// mihomo compat: dns/util.go batchExchange — a SERVFAIL or REFUSED reply is a
+/// failed exchange ("server failure: SERVFAIL"), not an answer.
+async fn query_server(domain: &str, server: &str, qtype: u16) -> Result<Answer> {
     // Strip quotes that OpenClash sometimes leaves (e.g. dhcp://"eth1")
     let server = server.trim_matches('"').trim_matches('\'');
 
-    if server.starts_with("https://") {
+    let answer = if server.starts_with("https://") {
         resolve_doh(domain, server, qtype).await
     } else if server.starts_with("tls://") {
         resolve_dot(domain, server, qtype).await
@@ -468,26 +367,58 @@ async fn query_server(domain: &str, server: &str, qtype: u16) -> Result<(IpAddr,
             format!("{server}:53")
         };
         resolve_udp(domain, &addr, qtype).await
+    }?;
+
+    match answer.rcode {
+        RCODE_SERVER_FAILURE => Err(anyhow::anyhow!("server failure: SERVFAIL")),
+        RCODE_REFUSED => Err(anyhow::anyhow!("server failure: REFUSED")),
+        _ => Ok(answer),
     }
 }
 
 /// System DNS resolver fallback via tokio's lookup_host.
-/// Returns a default TTL of 60s since the system resolver doesn't expose TTL.
-async fn resolve_system(domain: &str) -> Result<(IpAddr, u32)> {
+/// Reports a default TTL of 60s since the system resolver doesn't expose TTL.
+async fn resolve_system(domain: &str) -> Result<Answer> {
     let host = format!("{domain}:0");
-    let addrs: Vec<SocketAddr> = tokio::net::lookup_host(&host).await?.collect();
-    addrs
-        .first()
-        .map(|a| (a.ip(), 60)) // System resolver doesn't expose TTL; use 60s default
-        .ok_or_else(|| anyhow::anyhow!("system resolver returned no results for {domain}"))
+    let ips: Vec<IpAddr> = tokio::net::lookup_host(&host)
+        .await?
+        .map(|addr| addr.ip())
+        .collect();
+    if ips.is_empty() {
+        return Err(anyhow::anyhow!(
+            "system resolver returned no results for {domain}"
+        ));
+    }
+    Ok(Answer {
+        rcode: 0,
+        ips,
+        ttl: 60,
+    })
 }
 
-/// Resolve via plain UDP DNS. Returns (IP, TTL).
-async fn resolve_udp(domain: &str, server: &str, qtype: u16) -> Result<(IpAddr, u32)> {
+/// Resolve via plain UDP DNS.
+async fn resolve_udp(domain: &str, server: &str, qtype: u16) -> Result<Answer> {
     let addr: SocketAddr = server
         .parse()
         .map_err(|e| anyhow::anyhow!("invalid DNS server address {server}: {e}"))?;
 
+    let query = build_dns_query(domain, qtype);
+    let mut response = exchange_udp(addr, &query).await?;
+    // mihomo compat: dns/client.go — "Resolvers MUST resend queries over TCP
+    // if they receive a truncated UDP response (with TC=1 set)!"
+    if is_truncated(&response) {
+        debug!(
+            "[DNS] Truncated reply from {} for {} over UDP, retrying over TCP",
+            addr, domain
+        );
+        response = exchange_tcp(addr, &query).await?;
+    }
+
+    parse_dns_response(&response, qtype)
+}
+
+/// Exchange one DNS message with a nameserver over UDP.
+pub(super) async fn exchange_udp(server: SocketAddr, query: &[u8]) -> Result<Vec<u8>> {
     // mihomo compat: DNS sockets go through the dialer, which binds them to
     // DefaultInterface (dialer.go:183-189) and applies DefaultRoutingMark
     // (SO_MARK) only when routing-mark is configured. When routing-mark is not
@@ -496,18 +427,30 @@ async fn resolve_udp(domain: &str, server: &str, qtype: u16) -> Result<(IpAddr, 
     // bypass on some OpenClash configurations.
     let socket = crate::transport::tcp::bind_udp_default_interface()?;
 
-    socket.connect(addr).await?;
-
-    let query = build_dns_query(domain, qtype);
-    socket.send(&query).await?;
+    socket.connect(server).await?;
+    socket.send(query).await?;
 
     let mut buf = vec![0u8; 4096];
     let timeout = tokio::time::timeout(std::time::Duration::from_secs(5), socket.recv(&mut buf));
 
     let n = timeout.await??;
-    let response = &buf[..n];
+    buf.truncate(n);
+    Ok(buf)
+}
 
-    parse_dns_response(response, qtype)
+/// Exchange one DNS message with a nameserver over TCP.
+pub(super) async fn exchange_tcp(server: SocketAddr, query: &[u8]) -> Result<Vec<u8>> {
+    let mut stream = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        crate::transport::tcp::connect(server, &crate::transport::tcp::ConnectOpts::default()),
+    )
+    .await??;
+    exchange_on_stream(&mut stream, query).await
+}
+
+/// Whether a DNS message has the TC (truncated) bit set.
+pub(super) fn is_truncated(message: &[u8]) -> bool {
+    message.get(2).is_some_and(|flags| flags & 0x02 != 0)
 }
 
 /// Shared HTTP client for DoH queries — built once so TCP+TLS connections
@@ -519,8 +462,8 @@ static DOH_CLIENT: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::n
         .expect("failed to build DoH HTTP client")
 });
 
-/// Resolve via DNS-over-HTTPS (RFC 8484). Returns (IP, TTL).
-async fn resolve_doh(domain: &str, url: &str, qtype: u16) -> Result<(IpAddr, u32)> {
+/// Resolve via DNS-over-HTTPS (RFC 8484).
+async fn resolve_doh(domain: &str, url: &str, qtype: u16) -> Result<Answer> {
     let query = build_dns_query(domain, qtype);
     let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&query);
 
@@ -547,12 +490,12 @@ type DotPool = Mutex<
 static DOT_POOL: std::sync::LazyLock<DotPool> =
     std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
 
-/// Resolve via DNS-over-TLS (RFC 7858). Returns (IP, TTL).
+/// Resolve via DNS-over-TLS (RFC 7858).
 ///
 /// Connects to the server on port 853, wraps the TCP connection in TLS,
 /// and sends/receives DNS messages with 2-byte length prefix framing.
 /// Connections are pooled for reuse.
-async fn resolve_dot(domain: &str, server: &str, qtype: u16) -> Result<(IpAddr, u32)> {
+async fn resolve_dot(domain: &str, server: &str, qtype: u16) -> Result<Answer> {
     let addr_str = server.trim_start_matches("tls://");
     let (host, port_str) = if let Some(idx) = addr_str.rfind(':') {
         // Check if this is an IPv6 address in brackets
@@ -588,12 +531,14 @@ async fn resolve_dot(domain: &str, server: &str, qtype: u16) -> Result<(IpAddr, 
             .clone()
     };
 
+    let query = build_dns_query(domain, qtype);
+
     // Try the pooled connection first
     {
         let mut slot = conn_slot.lock().await;
         if let Some(ref mut tls_stream) = *slot {
-            match dot_query_on_stream(tls_stream, domain, qtype).await {
-                Ok(ip) => return Ok(ip),
+            match exchange_on_stream(tls_stream, &query).await {
+                Ok(response) => return parse_dns_response(&response, qtype),
                 Err(_) => {
                     // Connection is stale, drop it and create a new one
                     *slot = None;
@@ -624,7 +569,7 @@ async fn resolve_dot(domain: &str, server: &str, qtype: u16) -> Result<(IpAddr, 
     };
 
     let mut tls_stream = wrap_tls(tcp_stream, &tls_opts).await?;
-    let ip = dot_query_on_stream(&mut tls_stream, domain, qtype).await?;
+    let response = exchange_on_stream(&mut tls_stream, &query).await?;
 
     // Pool the connection for reuse
     {
@@ -632,21 +577,19 @@ async fn resolve_dot(domain: &str, server: &str, qtype: u16) -> Result<(IpAddr, 
         *slot = Some(tls_stream);
     }
 
-    Ok(ip)
+    parse_dns_response(&response, qtype)
 }
 
-/// Send a DNS query on an existing DoT TLS stream and read the response. Returns (IP, TTL).
-async fn dot_query_on_stream(
-    stream: &mut tokio_rustls::client::TlsStream<TcpStream>,
-    domain: &str,
-    qtype: u16,
-) -> Result<(IpAddr, u32)> {
-    let query = build_dns_query(domain, qtype);
-
+/// Send a DNS message on a stream transport (TCP, TLS) and read the reply:
+/// 2-byte length prefix framing, RFC 1035 section 4.2.2.
+async fn exchange_on_stream<S>(stream: &mut S, query: &[u8]) -> Result<Vec<u8>>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     // Write 2-byte length prefix + query
     let len_prefix = (query.len() as u16).to_be_bytes();
     stream.write_all(&len_prefix).await?;
-    stream.write_all(&query).await?;
+    stream.write_all(query).await?;
     stream.flush().await?;
 
     // Read 2-byte length prefix
@@ -659,7 +602,7 @@ async fn dot_query_on_stream(
 
     let resp_len = u16::from_be_bytes(resp_len_buf) as usize;
     if resp_len == 0 {
-        return Err(anyhow::anyhow!("invalid DoT response length: {resp_len}"));
+        return Err(anyhow::anyhow!("invalid DNS response length: {resp_len}"));
     }
 
     // Read the DNS response
@@ -670,11 +613,11 @@ async fn dot_query_on_stream(
     )
     .await??;
 
-    parse_dns_response(&resp_buf, qtype)
+    Ok(resp_buf)
 }
 
 /// Build a DNS query packet for the given domain and record type.
-fn build_dns_query(domain: &str, qtype: u16) -> Vec<u8> {
+pub(super) fn build_dns_query(domain: &str, qtype: u16) -> Vec<u8> {
     let mut query = Vec::with_capacity(64);
 
     // Header
@@ -699,23 +642,22 @@ fn build_dns_query(domain: &str, qtype: u16) -> Vec<u8> {
     query
 }
 
-/// Parse a DNS response and extract the first A record IP and the minimum TTL
-/// from all answer records.
+/// Parse a DNS response into the answer the resolver works with: its response
+/// code, the addresses of the requested type and its cache TTL.
 ///
-/// mihomo compat: returns (ip, min_ttl) where min_ttl is the smallest TTL
-/// across all answer records (see dns/util.go minimalTTL).
-fn parse_dns_response(data: &[u8], qtype: u16) -> Result<(IpAddr, u32)> {
+/// mihomo compat: the TTL is the smallest one among the answer, authority and
+/// additional records, OPT excluded (dns/util.go putMsgToCache → minimalTTL):
+/// for an NXDOMAIN or empty reply that is the SOA in the authority section.
+fn parse_dns_response(data: &[u8], qtype: u16) -> Result<Answer> {
     if data.len() < 12 {
         return Err(anyhow::anyhow!("DNS response too short"));
     }
 
-    let _flags = u16::from_be_bytes([data[2], data[3]]);
+    let rcode = data[3] & 0x0F;
     let qdcount = u16::from_be_bytes([data[4], data[5]]);
-    let ancount = u16::from_be_bytes([data[6], data[7]]);
-
-    if ancount == 0 {
-        return Err(anyhow::anyhow!("no answers in DNS response"));
-    }
+    let ancount = u16::from_be_bytes([data[6], data[7]]) as usize;
+    let nscount = u16::from_be_bytes([data[8], data[9]]) as usize;
+    let arcount = u16::from_be_bytes([data[10], data[11]]) as usize;
 
     // Skip question section
     let mut pos = 12;
@@ -725,11 +667,10 @@ fn parse_dns_response(data: &[u8], qtype: u16) -> Result<(IpAddr, u32)> {
         pos += 4; // Skip type + class
     }
 
-    // Parse answer section — extract first A record IP and minimum TTL
-    let mut result_ip: Option<IpAddr> = None;
-    let mut min_ttl: u32 = u32::MAX;
+    let mut ips = Vec::new();
+    let mut min_ttl: Option<u32> = None;
 
-    for _ in 0..ancount {
+    for index in 0..ancount + nscount + arcount {
         pos = skip_dns_name(data, pos)?;
 
         if pos + 10 > data.len() {
@@ -741,42 +682,36 @@ fn parse_dns_response(data: &[u8], qtype: u16) -> Result<(IpAddr, u32)> {
         let rdlength = u16::from_be_bytes([data[pos + 8], data[pos + 9]]) as usize;
         pos += 10;
 
-        // Track minimum TTL across all answer records (mihomo compat)
-        if ttl < min_ttl {
-            min_ttl = ttl;
+        // The TTL field of an OPT record holds flags, not a lifetime.
+        if rtype != TYPE_OPT {
+            min_ttl = Some(min_ttl.map_or(ttl, |min| min.min(ttl)));
         }
 
-        if rtype == 1 && qtype == 1 && rdlength == 4 && pos + 4 <= data.len() && result_ip.is_none()
-        {
-            // A record — take the first one
-            result_ip = Some(IpAddr::V4(Ipv4Addr::new(
-                data[pos],
-                data[pos + 1],
-                data[pos + 2],
-                data[pos + 3],
-            )));
-        } else if rtype == 28
-            && qtype == 28
-            && rdlength == 16
-            && pos + 16 <= data.len()
-            && result_ip.is_none()
-        {
-            // AAAA record — take the first one
-            let mut octets = [0u8; 16];
-            octets.copy_from_slice(&data[pos..pos + 16]);
-            result_ip = Some(IpAddr::V6(std::net::Ipv6Addr::from(octets)));
+        // Addresses come from the answer section only.
+        if index < ancount && rtype == qtype && pos + rdlength <= data.len() {
+            let rdata = &data[pos..pos + rdlength];
+            if rtype == TYPE_A && rdlength == 4 {
+                ips.push(IpAddr::V4(Ipv4Addr::new(
+                    rdata[0], rdata[1], rdata[2], rdata[3],
+                )));
+            } else if rtype == TYPE_AAAA && rdlength == 16 {
+                let mut octets = [0u8; 16];
+                octets.copy_from_slice(rdata);
+                ips.push(IpAddr::V6(std::net::Ipv6Addr::from(octets)));
+            }
         }
 
         pos += rdlength;
     }
 
-    match result_ip {
-        Some(ip) => Ok((ip, if min_ttl == u32::MAX { 0 } else { min_ttl })),
-        None => Err(anyhow::anyhow!("no matching record found in DNS response")),
-    }
+    Ok(Answer {
+        rcode,
+        ips,
+        ttl: min_ttl.unwrap_or(0),
+    })
 }
 
-fn skip_dns_name(data: &[u8], mut pos: usize) -> Result<usize> {
+pub(super) fn skip_dns_name(data: &[u8], mut pos: usize) -> Result<usize> {
     loop {
         if pos >= data.len() {
             return Err(anyhow::anyhow!("truncated DNS name"));
@@ -851,26 +786,6 @@ where
     }
 
     None
-}
-
-/// Match a domain against nameserver-policy entries, returning the first
-/// server of the matched entry.
-///
-/// Policy keys can be:
-/// - `"+.domain.com"` — matches domain.com and all subdomains
-/// - `"domain.com"` — exact match
-/// - `"geosite:xxx"` / `"rule-set:xxx"` — skipped: they need the rule engine,
-///   which is not available in the proxy-server bootstrap path; the
-///   resolver-level policy handles them
-///   (DnsResolver::nameserver_policy_servers).
-fn match_nameserver_policy(domain: &str, policy: &serde_yaml::Mapping) -> Option<String> {
-    find_nameserver_policy(domain, policy, |pattern, domain| {
-        if pattern.starts_with("geosite:") || pattern.starts_with("rule-set:") {
-            return false;
-        }
-        domain_pattern_match(pattern, domain)
-    })
-    .and_then(|servers| servers.into_iter().next())
 }
 
 fn rand_u16() -> u16 {
@@ -1070,44 +985,251 @@ mod tests {
     }
 
     #[test]
-    fn fakeip_range_match() {
-        let range = "198.18.0.0/15";
-        assert!(is_in_fakeip_range(
-            &IpAddr::V4(Ipv4Addr::new(198, 18, 0, 1)),
-            range
-        ));
-        assert!(is_in_fakeip_range(
-            &IpAddr::V4(Ipv4Addr::new(198, 19, 255, 255)),
-            range
-        ));
-        assert!(!is_in_fakeip_range(
-            &IpAddr::V4(Ipv4Addr::new(198, 20, 0, 1)),
-            range
-        ));
-        assert!(!is_in_fakeip_range(
-            &IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
-            range
-        ));
-    }
-
-    #[test]
-    fn fakeip_range_empty() {
-        assert!(!is_in_fakeip_range(
-            &IpAddr::V4(Ipv4Addr::new(198, 18, 0, 1)),
-            ""
-        ));
-    }
-
-    #[test]
     fn parse_dns_response_too_short() {
         assert!(parse_dns_response(&[0u8; 5], 1).is_err());
     }
 
+    /// mihomo compat: a reply without answers is an answer, not a failure —
+    /// dns/util.go batchExchange only fails a reply for SERVFAIL / REFUSED.
+    /// (This asserted an error before; the error made the server reply
+    /// SERVFAIL to every NODATA.)
     #[test]
     fn parse_dns_response_no_answers() {
         // Minimal DNS response header with 0 answers.
         let data = vec![0u8; 12];
         // ancount = 0 (bytes 6-7 already zero).
-        assert!(parse_dns_response(&data, 1).is_err());
+        assert_eq!(
+            parse_dns_response(&data, 1).unwrap(),
+            Answer {
+                rcode: 0,
+                ips: vec![],
+                ttl: 0
+            }
+        );
+    }
+
+    /// mihomo compat: dns/util.go putMsgToCache — a negative reply is cached
+    /// for the smallest TTL among its records, i.e. the SOA in the authority
+    /// section; the OPT record's TTL field is flags and does not count.
+    #[test]
+    fn parse_dns_response_negative_answer_keeps_rcode_and_soa_ttl() {
+        let query = build_dns_query("nxdomain.example.com", TYPE_A);
+        let soa = (6, 900, vec![0u8; 22]);
+        let mut data = test_support::reply(&query, 3, &[], &[soa]);
+        data[11] = 1; // one additional record: OPT, root name, TTL field 0
+        data.extend_from_slice(&[0, 0, 41, 0x04, 0xd0, 0, 0, 0, 0, 0, 0]);
+
+        assert_eq!(
+            parse_dns_response(&data, TYPE_A).unwrap(),
+            Answer {
+                rcode: 3,
+                ips: vec![],
+                ttl: 900
+            }
+        );
+    }
+
+    /// Every address of the answer is kept, in order, with the smallest TTL
+    /// of the reply (dns/util.go minimalTTL) — the CNAME's included.
+    #[test]
+    fn parse_dns_response_collects_every_address() {
+        let query = build_dns_query("www.example.com", TYPE_A);
+        let data = test_support::reply(
+            &query,
+            0,
+            &[
+                (5, 300, vec![0xc0, 0x0c]),
+                (TYPE_A, 60, vec![203, 0, 113, 1]),
+                (TYPE_A, 120, vec![203, 0, 113, 2]),
+            ],
+            &[],
+        );
+
+        assert_eq!(
+            parse_dns_response(&data, TYPE_A).unwrap(),
+            Answer {
+                rcode: 0,
+                ips: vec![
+                    "203.0.113.1".parse().unwrap(),
+                    "203.0.113.2".parse().unwrap()
+                ],
+                ttl: 60
+            }
+        );
+    }
+
+    /// mihomo compat: dns/util.go batchExchange — SERVFAIL and REFUSED fail
+    /// the server that sent them; an NXDOMAIN from another one wins the race.
+    #[tokio::test]
+    async fn race_relays_nxdomain_and_fails_on_servfail_and_refused() {
+        let servfail = test_support::nameserver(|q| test_support::reply(q, 2, &[], &[])).await;
+        let refused = test_support::nameserver(|q| test_support::reply(q, 5, &[], &[])).await;
+        let nxdomain = test_support::nameserver(|q| {
+            test_support::reply(q, 3, &[], &[(6, 600, vec![0u8; 22])])
+        })
+        .await;
+
+        let answer = batch_resolve(
+            "missing.example.com",
+            &[servfail.clone(), refused.clone(), nxdomain],
+            TYPE_A,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            answer,
+            Answer {
+                rcode: 3,
+                ips: vec![],
+                ttl: 600
+            }
+        );
+
+        let err = batch_resolve("missing.example.com", &[servfail], TYPE_A)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "all DNS requests failed, first error: server failure: SERVFAIL"
+        );
+        let err = batch_resolve("missing.example.com", &[refused], TYPE_A)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "all DNS requests failed, first error: server failure: REFUSED"
+        );
+    }
+
+    /// mihomo compat: resolver.go ipExchange — without fallback servers the
+    /// main answer is returned directly; the fallback filters are not
+    /// consulted, so nothing is "triggered" for a public non-CN address.
+    #[tokio::test]
+    async fn no_fallback_servers_means_no_fallback_filtering() {
+        #[derive(Clone, Default)]
+        struct Logs(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Logs {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let logs = Logs::default();
+        let writer = logs.clone();
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::DEBUG)
+                .with_writer(move || writer.clone())
+                .finish(),
+        );
+
+        let main = test_support::nameserver(|q| {
+            test_support::reply(q, 0, &[(TYPE_A, 60, vec![8, 8, 8, 8])], &[])
+        })
+        .await;
+        let config = DnsConfig {
+            nameserver: vec![main],
+            ..Default::default()
+        };
+        let answer = resolve_qtype("example.com", &config, TYPE_A).await.unwrap();
+        assert_eq!(answer.ips, ["8.8.8.8".parse::<IpAddr>().unwrap()]);
+
+        let logs = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+        assert!(!logs.contains("fallback"), "unexpected log: {logs}");
+    }
+
+    /// mihomo compat: dns/client.go — a truncated UDP reply (TC=1) is asked
+    /// again over TCP, and the TCP reply is the answer.
+    #[tokio::test]
+    async fn truncated_udp_reply_is_retried_over_tcp() {
+        let server = test_support::truncating_nameserver(|q| {
+            test_support::reply(q, 0, &[(TYPE_A, 60, vec![203, 0, 113, 9])], &[])
+        })
+        .await;
+
+        let answer = resolve_udp("big.example.com", &server, TYPE_A)
+            .await
+            .unwrap();
+        assert_eq!(answer.ips, ["203.0.113.9".parse::<IpAddr>().unwrap()]);
+    }
+}
+
+/// Canned nameservers for the resolver tests.
+#[cfg(test)]
+pub(super) mod test_support {
+    /// A record owned by the question name: (type, TTL, RDATA).
+    pub type Record = (u16, u32, Vec<u8>);
+
+    /// The reply to `query` with the given header flags (the response code is
+    /// their low nibble), answer records and authority records.
+    pub fn reply(query: &[u8], flags: u16, answers: &[Record], authority: &[Record]) -> Vec<u8> {
+        let question_end = super::skip_dns_name(query, 12).unwrap() + 4;
+        let mut message = query[..2].to_vec();
+        message.extend_from_slice(&(0x8000 | flags).to_be_bytes());
+        message.extend_from_slice(&[0, 1]);
+        message.extend_from_slice(&(answers.len() as u16).to_be_bytes());
+        message.extend_from_slice(&(authority.len() as u16).to_be_bytes());
+        message.extend_from_slice(&[0, 0]);
+        message.extend_from_slice(&query[12..question_end]);
+        for (rtype, ttl, rdata) in answers.iter().chain(authority) {
+            message.extend_from_slice(&[0xc0, 0x0c]);
+            message.extend_from_slice(&rtype.to_be_bytes());
+            message.extend_from_slice(&[0, 1]);
+            message.extend_from_slice(&ttl.to_be_bytes());
+            message.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+            message.extend_from_slice(rdata);
+        }
+        message
+    }
+
+    /// Start a loopback UDP nameserver answering each query with
+    /// `answer(query)`; returns its `ip:port`.
+    pub async fn nameserver(answer: impl Fn(&[u8]) -> Vec<u8> + Send + 'static) -> String {
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = socket.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            while let Ok((n, peer)) = socket.recv_from(&mut buf).await {
+                let _ = socket.send_to(&answer(&buf[..n]), peer).await;
+            }
+        });
+        addr
+    }
+
+    /// Start a loopback nameserver that truncates over UDP — its reply there
+    /// is the TC bit and nothing else — and answers a query over TCP with
+    /// `answer(query)`; returns its `ip:port`.
+    pub async fn truncating_nameserver(
+        answer: impl Fn(&[u8]) -> Vec<u8> + Send + 'static,
+    ) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = tcp.local_addr().unwrap();
+        let udp = tokio::net::UdpSocket::bind(addr).await.unwrap();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            while let Ok((n, peer)) = udp.recv_from(&mut buf).await {
+                let _ = udp.send_to(&reply(&buf[..n], 0x0200, &[], &[]), peer).await;
+            }
+        });
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = tcp.accept().await {
+                let mut len = [0u8; 2];
+                stream.read_exact(&mut len).await.unwrap();
+                let mut query = vec![0u8; u16::from_be_bytes(len) as usize];
+                stream.read_exact(&mut query).await.unwrap();
+                let reply = answer(&query);
+                stream
+                    .write_all(&(reply.len() as u16).to_be_bytes())
+                    .await
+                    .unwrap();
+                stream.write_all(&reply).await.unwrap();
+            }
+        });
+        addr.to_string()
     }
 }
